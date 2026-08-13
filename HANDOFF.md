@@ -1353,3 +1353,50 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 toward OpenClaw feature switch wiring and conversation-integrated vibe coding after CI is green.
+
+## 2026-08-13 P3 OpenClaw Feature Switch
+
+Current state:
+
+- OpenClaw is now represented as a system-level feature switch, not a workflow.
+- The switch is named `openclaw_enabled` and defaults to `false`.
+- The frontend settings page exposes an "OpenClaw 长时间电脑操作开关" checkbox and status card.
+- The current runtime capability gateway does not yet contain an OpenClaw computer-control executor, so this slice intentionally does not register a nonfunctional tool.
+
+Changes made:
+
+- Added `openclaw_enabled` to admin system settings API request/response models.
+- Added frontend API schema support for `openclaw_enabled` with backward-compatible defaulting.
+- Added Config page UI for the OpenClaw long-running computer operation switch.
+- Added tests for default-disabled API behavior and frontend save payload behavior.
+
+Local verification:
+
+- TDD red checks were added first:
+  - backend failed because `SystemSettingsResponse` had no `openclaw_enabled`;
+  - frontend failed because `openclaw-toggle` did not exist.
+- `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 53 passed.
+- `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx` -> 45 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-switch.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Verified deployed Python files compile with `py_compile`.
+- Ran `/tmp/openclaw_settings_check.py` with `PYTHONPATH=src`; it passed default-disabled and enabled settings serialization checks.
+- Verified deployed `web/dist` contains the OpenClaw switch UI and `openclaw_enabled` field.
+
+Next:
+
+- Commit this P3 slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 toward OpenClaw executor integration and conversation-integrated vibe coding after CI is green.

@@ -23,6 +23,7 @@ from agent_hub.api.routers.admin import (
     RunDetailResponse,
     RunEventResponse,
     SecretCreateRequest,
+    SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
     _mode_error_log_from_run,
@@ -129,6 +130,13 @@ class FakeModelTransport:
             text="agent-hub-model-check-ok",
             usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
         )
+
+
+def test_system_settings_default_openclaw_is_disabled() -> None:
+    settings = SystemSettingsResponse()
+
+    assert settings.openclaw_enabled is False
+    assert settings.model_dump()["openclaw_enabled"] is False
 
 
 def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint() -> None:

@@ -538,6 +538,7 @@ class SystemSettingsRequest(BaseModel):
     allow_main_agent_override: bool = False
     allow_temporary_agents: bool = False
     multimedia_generation_enabled: bool = False
+    openclaw_enabled: bool = False
     temporary_agent_policy: str = Field(
         default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
         max_length=10_000,

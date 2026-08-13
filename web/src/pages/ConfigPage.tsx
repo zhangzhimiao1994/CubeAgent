@@ -177,6 +177,10 @@ export function ConfigPage() {
           <span>多媒体生成</span>
           <p>{settings.multimedia_generation_enabled ? "已允许图片和视频处理/生成。" : "已关闭图片和视频处理/生成。"}</p>
         </article>
+        <article className="status-card">
+          <span>OpenClaw</span>
+          <p>{settings.openclaw_enabled ? "已允许长时间电脑操作能力。" : "已关闭长时间电脑操作能力。"}</p>
+        </article>
       </div>
 
       <div className="settings-shortcuts">
@@ -285,6 +289,15 @@ export function ConfigPage() {
               onChange={(event) => updateSettings({ multimedia_generation_enabled: event.target.checked })}
             />
             多媒体生成开关
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              data-testid="openclaw-toggle"
+              checked={settings.openclaw_enabled}
+              onChange={(event) => updateSettings({ openclaw_enabled: event.target.checked })}
+            />
+            OpenClaw 长时间电脑操作开关
           </label>
         </fieldset>
 
