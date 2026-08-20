@@ -392,6 +392,31 @@ class RunService:
                 operator_selection=operator_selection,
             )
         if mode is TaskMode.AUTO:
+            continuation_mode = await self._conversation_continuation_mode(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                conversation_id=effective_conversation_id,
+                message=message,
+            )
+            if continuation_mode is not None:
+                routing_payload = {
+                    "reason": "conversation_mode_continuation",
+                    "main_agent_selected_mode": continuation_mode.value,
+                    "mode_source": "previous_conversation_run",
+                    **operator_selection,
+                }
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=continuation_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+        if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
                 decision = await _safe_route(
@@ -837,6 +862,34 @@ class RunService:
             version=record.version,
             operator_note=operator_note,
         )
+
+    async def _conversation_continuation_mode(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        message: str,
+    ) -> TaskMode | None:
+        if not _looks_like_conversation_continuation(message):
+            return None
+        getter = getattr(self._repository, "latest_resolved_mode_for_conversation", None)
+        if not callable(getter):
+            return None
+        try:
+            mode = await getter(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "conversation_mode_lookup_failed tenant_id=%s conversation_id=%s",
+                tenant_id,
+                conversation_id,
+            )
+            return None
+        return mode if type(mode) is TaskMode and mode is not TaskMode.AUTO else None
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.get(tenant_id, run_id)
@@ -1709,6 +1762,47 @@ def _schedule_weekday(message: str) -> int:
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
 
+
+def _looks_like_conversation_continuation(message: str) -> bool:
+    normalized = re.sub(r"\s+", " ", message).strip().casefold()
+    if not normalized:
+        return False
+    chinese_markers = (
+        "继续",
+        "接着",
+        "刚刚",
+        "上面",
+        "前面",
+        "这个",
+        "这些",
+        "那个",
+        "这块",
+        "这里",
+        "上一轮",
+        "后续",
+        "再把",
+        "改一下",
+        "修一下",
+        "处理一下",
+        "展开",
+        "也一样",
+    )
+    if any(marker in message for marker in chinese_markers):
+        return True
+    english_markers = (
+        "continue",
+        "keep going",
+        "same task",
+        "previous",
+        "earlier",
+        "above",
+        "that plan",
+        "this plan",
+        "follow up",
+        "next step",
+        "do the same",
+    )
+    return any(marker in normalized for marker in english_markers)
 
 def _channel_mode_choices(decision: RouteDecision | None) -> list[dict[str, object]]:
     options = _channel_mode_options(decision)
