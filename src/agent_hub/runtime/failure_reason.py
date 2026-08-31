@@ -42,6 +42,8 @@ SAFE_MODEL_GATEWAY_FAILURES = frozenset(
         "model outcome recording failed",
         "model capacity release failed",
         "model gateway completed without a response",
+        "model response text is empty",
+        "model response is empty",
     }
 )
 
@@ -136,7 +138,11 @@ def runtime_failure_diagnostic_from_reason(
         )
         diagnostic["step_id"] = crew_timeout.group("step")
         diagnostic["actor"] = crew_timeout.group("actor")
-    elif "model gateway failed" in lowered:
+    elif (
+        "model gateway failed" in lowered
+        or "model response text is empty" in lowered
+        or "model response is empty" in lowered
+    ):
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
     elif lowered.startswith("capability failed:"):
         diagnostic = _base_diagnostic(
@@ -201,6 +207,16 @@ def _model_gateway_diagnostic(
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic:
     lowered = reason.lower()
+    if "model response text is empty" in lowered or "model response is empty" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_gateway",
+            error_category="empty_response",
+            error_code="model.empty_response",
+            retryable=True,
+            suggested_action="模型返回了空内容；系统可重试、切换备用模型，或压缩上下文后重新执行该步骤。",
+            status_code=status_code,
+        )
     if "no capable deployment" in lowered:
         return _base_diagnostic(
             reason,

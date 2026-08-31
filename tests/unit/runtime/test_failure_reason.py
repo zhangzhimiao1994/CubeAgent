@@ -107,6 +107,26 @@ def test_safe_runtime_failure_diagnostic_classifies_capacity_timeout() -> None:
     assert "password" not in str(diagnostic)
 
 
+def test_safe_runtime_failure_reason_preserves_empty_model_response() -> None:
+    assert (
+        safe_runtime_failure_reason(ModelGatewayError("model response text is empty"))
+        == "model gateway failed: model response text is empty"
+    )
+
+
+def test_runtime_failure_diagnostic_classifies_prefixed_empty_model_response() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "hybrid dispatch failed: model response text is empty"
+    )
+
+    assert diagnostic["error_summary"] == "hybrid dispatch failed: model response text is empty"
+    assert diagnostic["error_stage"] == "model_gateway"
+    assert diagnostic["error_category"] == "empty_response"
+    assert diagnostic["error_code"] == "model.empty_response"
+    assert diagnostic["retryable"] is True
+    assert "空" in str(diagnostic["suggested_action"])
+
+
 def test_runtime_failure_diagnostic_from_reason_redacts_sensitive_unknown_reason() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("Authorization: Bearer sk-secret failed")
 

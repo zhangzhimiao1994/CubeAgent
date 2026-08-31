@@ -166,6 +166,22 @@ def test_compose_caddy_requires_explicit_public_url_without_localhost_default() 
     assert "{$AGENT_HUB_PUBLIC_URL:localhost}" not in caddyfile
 
 
+def test_native_caddy_prevents_stale_spa_entrypoints_while_caching_hashed_assets() -> None:
+    caddyfile = read("deploy/native/Caddyfile")
+    installer = read("scripts/lib/install_native.sh")
+
+    assert "handle /assets/*" in caddyfile
+    assert 'Cache-Control "public, max-age=31536000, immutable"' in caddyfile
+    assert 'Cache-Control "no-store, no-cache, must-revalidate"' in caddyfile
+    assert 'Pragma "no-cache"' in caddyfile
+    assert 'Expires "0"' in caddyfile
+    assert "handle /assets/*" in installer
+    assert 'Cache-Control "public, max-age=31536000, immutable"' in installer
+    assert 'Cache-Control "no-store, no-cache, must-revalidate"' in installer
+    assert 'Pragma "no-cache"' in installer
+    assert 'Expires "0"' in installer
+
+
 def test_compose_env_example_uses_prefixed_application_environment() -> None:
     example = read("deploy/compose/.env.example")
 

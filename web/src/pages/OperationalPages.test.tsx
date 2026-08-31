@@ -3067,6 +3067,54 @@ describe("operational management pages", () => {
     expect(screen.getByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
   });
 
+  it("keeps an open process drawer synced when routing decisions change without new events", async () => {
+    const user = userEvent.setup();
+    const firstSnapshot: RunDetail = {
+      ...runDetail,
+      routing_decision: null,
+    };
+    const refreshedSnapshot: RunDetail = {
+      ...firstSnapshot,
+      routing_decision: {
+        hermes: {
+          injected_memories: [
+            {
+              id: "memory-live-routing",
+              summary: "用户偏好先给摘要卡片，再点开查看完整过程。",
+              memory_type: "conversation",
+              target: "main-agent",
+              score: 0.88,
+              reason: "与当前调度卡片展示方式直接相关。",
+            },
+          ],
+          skipped_memories: [],
+        },
+      },
+    };
+    visibleRunDetail = firstSnapshot;
+    visibleConversationRuns = [firstSnapshot];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).queryByRole("button", { name: /Hermes\+ 记忆/ })).toBeNull();
+
+    visibleRunDetail = refreshedSnapshot;
+    visibleConversationRuns = [refreshedSnapshot];
+
+    await waitFor(
+      () =>
+        expect(
+          within(drawer).getByRole("button", { name: /Hermes\+ 记忆：已注入 1 条，未注入 0 条/ }),
+        ).not.toBeNull(),
+      { timeout: 2500 },
+    );
+  });
+
   it("hides the Hermes memory row when no memories were injected or skipped", async () => {
     const user = userEvent.setup();
     const hermesRunDetail: RunDetail = {

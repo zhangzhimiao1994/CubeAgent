@@ -77,6 +77,23 @@ class ReviewAwareGateway:
         )
 
 
+class EmptyThenSuccessGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls += 1
+        text = "" if self.calls == 1 else "recovered answer"
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class FailingGeneration:
     async def execute(
         self,
@@ -536,6 +553,25 @@ async def test_dispatch_step_timeout_recovery_keeps_each_attempt_on_step_deadlin
     assert factory.generation.calls == 2
     retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
     assert retry.payload["timeout_policy"] == "use_remaining_step_budget"
+
+
+async def test_dispatch_step_empty_model_response_retries_before_failing() -> None:
+    gateway = EmptyThenSuccessGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "model returned empty response; retrying with explicit output request"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    assert retry.payload["error_code"] == "model.empty_response"
 
 
 async def test_dispatch_step_retry_is_suppressed_when_runtime_budget_is_exhausted() -> None:

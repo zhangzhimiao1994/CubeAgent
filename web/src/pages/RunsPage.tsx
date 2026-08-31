@@ -1060,6 +1060,14 @@ function sameRunSnapshot(left: RunDetail, right: RunDetail) {
     left.status === right.status &&
     left.mode === right.mode &&
     left.request === right.request &&
+    stablePayloadFingerprint(left.explicit_details) === stablePayloadFingerprint(right.explicit_details) &&
+    stablePayloadFingerprint(left.routing_decision ?? null) === stablePayloadFingerprint(right.routing_decision ?? null) &&
+    stablePayloadFingerprint(left.temporary_agent_proposal ?? null) ===
+      stablePayloadFingerprint(right.temporary_agent_proposal ?? null) &&
+    stablePayloadFingerprint(left.schedule_proposal ?? null) === stablePayloadFingerprint(right.schedule_proposal ?? null) &&
+    stablePayloadFingerprint(left.evolution_proposal ?? null) === stablePayloadFingerprint(right.evolution_proposal ?? null) &&
+    stablePayloadFingerprint(left.openclaw_proposal ?? null) === stablePayloadFingerprint(right.openclaw_proposal ?? null) &&
+    (left.decision_token ?? "") === (right.decision_token ?? "") &&
     left.events.length === right.events.length &&
     left.artifacts.length === right.artifacts.length &&
     left.events.every((event, index) => eventFingerprint(event) === eventFingerprint(right.events[index])) &&

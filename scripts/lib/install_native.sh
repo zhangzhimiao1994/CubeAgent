@@ -630,9 +630,18 @@ $tls_directive
     reverse_proxy 127.0.0.1:$api_port
   }
 
+  handle /assets/* {
+    root * $web_root
+    header Cache-Control "public, max-age=31536000, immutable"
+    file_server
+  }
+
   handle {
     root * $web_root
     try_files {path} /index.html
+    header Cache-Control "no-store, no-cache, must-revalidate"
+    header Pragma "no-cache"
+    header Expires "0"
     file_server
   }
 }

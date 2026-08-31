@@ -73,6 +73,7 @@ _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _STEP_TIMEOUT_RECOVERY_RETRIES = 1
+_EMPTY_RESPONSE_RECOVERY_RETRIES = 1
 _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
 _COMPACT_RETRY_SOURCE_PREVIEW_BYTES = 360
 _MAX_AUDITED_TOKENS = 100_000_000
@@ -2277,6 +2278,7 @@ class CrewDispatchRuntime:
         messages = list(self._normalize_crewai_messages(crew_messages))
         tool_mapping = _tool_name_mapping(step.tools)
         request_tools = _tool_definitions(step.tools)
+        empty_response_retries = 0
         required_capabilities = frozenset(
             {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
             if request_tools
@@ -2357,6 +2359,68 @@ class CrewDispatchRuntime:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         completion = await self._gateway.complete_with_context(request)
                     completion = _map_completion_tool_names(completion, tool_mapping)
+                    if (
+                        empty_response_retries < _EMPTY_RESPONSE_RECOVERY_RETRIES
+                        and self._is_empty_text_response(completion)
+                    ):
+                        model_artifact = self._model_artifact(
+                            completion,
+                            agent.id,
+                            self._ordered_artifacts((*input_sources, *evidence)),
+                        )
+                        succeeded = dict(running)
+                        succeeded.update(
+                            status="succeeded",
+                            artifact_id=str(model_artifact.id),
+                            sha256=model_artifact.content_sha256,
+                            provenance={
+                                "logical_model": completion.logical_model,
+                                "deployment_id": completion.deployment_id,
+                                "provider_id": completion.provider_id,
+                                "provider_model": completion.provider_model,
+                            },
+                        )
+                        await self._run_commit(
+                            usage_boundary(
+                                completion,
+                                step.agent,
+                                step.id,
+                                key,
+                                succeeded,
+                                model_artifact,
+                            ),
+                            run_state,
+                        )
+                        evidence.append(model_artifact)
+                        empty_response_retries += 1
+                        diagnostic = runtime_failure_diagnostic_from_reason(
+                            "model response text is empty"
+                        )
+                        await emit(
+                            kind=EventKind.STEP_RETRYING,
+                            step_id=step.id,
+                            actor=agent.id,
+                            reason="model returned empty response; retrying with explicit output request",
+                            payload={
+                                "attempt": retries + 1,
+                                "model_attempt": call_index + 2,
+                                "strategy": "empty_response_retry",
+                                "fallback_policy": "retry_once_then_fail",
+                                "warning": "model response text is empty",
+                                **diagnostic,
+                            },
+                        )
+                        messages.append(
+                            ModelMessage(
+                                role="user",
+                                content=(
+                                    "The previous model response was empty. Return a non-empty, "
+                                    "directly usable answer for the task. If the task cannot be "
+                                    "completed, state the concrete blocker in one short paragraph."
+                                ),
+                            )
+                        )
+                        continue
                     response = self._valid_response(completion)
                 except asyncio.CancelledError:
                     raise
@@ -3054,6 +3118,15 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint review artifact lineage is invalid")
             evidence.append(model_artifact)
         return evidence
+
+    @staticmethod
+    def _is_empty_text_response(completion: GatewayCompletion) -> bool:
+        if not isinstance(completion, GatewayCompletion):
+            return False
+        response = completion.response
+        if not isinstance(response, ModelResponse):
+            return False
+        return response.text is not None and not response.text.strip() and not response.tool_calls
 
     @staticmethod
     def _valid_response(completion: GatewayCompletion) -> ModelResponse:
