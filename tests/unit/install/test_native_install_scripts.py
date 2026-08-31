@@ -147,6 +147,8 @@ def test_native_installer_creates_runtime_dirs_and_migrates_before_services() ->
     assert tmpfiles < start
     assert database < migrations
     assert migrations < start
+    assert ".venv/bin/python -m alembic upgrade head" in script
+    assert ".venv/bin/alembic upgrade head" not in script
     assert "d /var/lib/agent-hub/generated-artifacts 0750 agent-hub agent-hub -" in tmpfiles_config
 
 
