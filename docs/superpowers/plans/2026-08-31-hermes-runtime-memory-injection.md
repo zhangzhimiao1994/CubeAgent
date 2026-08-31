@@ -1094,15 +1094,15 @@ Run:
 git push origin main
 ```
 
-Expected: push succeeds to `ssh://git@ssh.github.com:443/zhangzhimiao1994/Cube-agent.git`.
+Expected: push succeeds to the original Hermes+ repository, `ssh://git@ssh.github.com:443/zhangzhimiao1994/CubeAgent.git`.
 
 - [ ] **Step 5: Check GitHub Actions**
 
 Run:
 
 ```powershell
-gh run list --repo zhangzhimiao1994/Cube-agent --branch main --limit 5
-gh run watch --repo zhangzhimiao1994/Cube-agent --exit-status
+gh run list --repo zhangzhimiao1994/CubeAgent --branch main --limit 5
+gh run watch --repo zhangzhimiao1994/CubeAgent --exit-status
 ```
 
 Expected: latest quality/check run succeeds. If it fails, fetch logs, fix, verify locally, commit, push, and repeat.
