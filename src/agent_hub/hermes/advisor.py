@@ -157,59 +157,8 @@ class PersistentHermesRunAdvisor:
             return
         if not await self._enabled(outcome.tenant_id):
             return
-        mode = "unknown" if outcome.mode is None else outcome.mode.value
-        workflow = outcome.workflow_id or "no-workflow"
-        conversation_id = outcome.conversation_id or "unknown-conversation"
-        status = outcome.status.value
         lesson_id = f"hermes_run_{uuid4().hex}"
-        scheduler_notices = _safe_scheduler_notices(outcome.scheduler_notices)
-        if scheduler_notices:
-            lesson = _scheduler_notice_lesson(
-                status=status,
-                mode=mode,
-                workflow=workflow,
-                notices=scheduler_notices,
-            )
-            tags = _unique_tags(
-                [
-                    status,
-                    mode,
-                    workflow,
-                    *outcome.agent_ids[:8],
-                    *_scheduler_notice_tags(scheduler_notices),
-                ]
-            )
-            weight = min(10, 5 + len(scheduler_notices))
-            summary = (
-                f"调度观察：Hermes learned from conversation {conversation_id}: "
-                f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
-            )
-            user_summary = f"本次调度观察提醒：{_runtime_lesson_summary(lesson)}"
-        else:
-            lesson = f"Run {status} with mode={mode}, workflow={workflow}."
-            tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
-            weight = 4 if outcome.status is RunStatus.COMPLETED else 2
-            summary = (
-                f"Hermes learned from conversation {conversation_id}: "
-                f"{lesson} Tags: {status}, {mode}, {workflow}. "
-                f"Weight: {weight}."
-            )
-            label = "成功经验" if outcome.status is RunStatus.COMPLETED else "失败教训"
-            user_summary = f"本次调度学习记录了一个{label}：{_runtime_lesson_summary(lesson)}"
-        payload: dict[str, object] = {
-            "id": lesson_id,
-            "category": "scheduler",
-            "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
-            "lesson": lesson,
-            "summary": summary,
-            "user_summary": user_summary,
-            "tags": tags,
-            "weight": weight,
-            "created_at": datetime.now(UTC).isoformat(),
-            "run_id": str(outcome.run_id),
-            "conversation_id": outcome.conversation_id,
-            "confirmed_at": None,
-        }
+        payload = _outcome_learning_payload(outcome, lesson_id=lesson_id)
         await self._upsert(outcome.tenant_id, lesson_id, payload)
 
     async def _enabled(self, tenant_id: UUID) -> bool:
@@ -282,6 +231,80 @@ class PersistentHermesRunAdvisor:
 def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:
     category = lesson.get("category")
     return category in {None, "conversation"}
+
+
+def _outcome_learning_payload(
+    outcome: HermesRunOutcome,
+    *,
+    lesson_id: str,
+) -> dict[str, object]:
+    mode = "unknown" if outcome.mode is None else outcome.mode.value
+    workflow = outcome.workflow_id or "no-workflow"
+    conversation_id = outcome.conversation_id or "unknown-conversation"
+    status = outcome.status.value
+    scheduler_notices = _safe_scheduler_notices(outcome.scheduler_notices)
+    if scheduler_notices:
+        lesson = _scheduler_notice_lesson(
+            status=status,
+            mode=mode,
+            workflow=workflow,
+            notices=scheduler_notices,
+        )
+        tags = _unique_tags(
+            [
+                status,
+                mode,
+                workflow,
+                *outcome.agent_ids[:8],
+                *_scheduler_notice_tags(scheduler_notices),
+            ]
+        )
+        weight = min(10, 5 + len(scheduler_notices))
+        summary = (
+            f"调度观察：Hermes learned from conversation {conversation_id}: "
+            f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
+        )
+        user_summary = f"本次调度观察提醒：{_runtime_lesson_summary(lesson)}"
+        category = "scheduler"
+        memory_type = "scheduler_observation"
+        target = "scheduler"
+        confidence = 0.65
+        noise_risk = 0.25
+    else:
+        lesson = f"Run {status} with mode={mode}, workflow={workflow}."
+        tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
+        weight = 4 if outcome.status is RunStatus.COMPLETED else 2
+        summary = (
+            f"Hermes learned from conversation {conversation_id}: "
+            f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
+        )
+        label = "成功经验" if outcome.status is RunStatus.COMPLETED else "失败教训"
+        user_summary = f"本次对话学习记录了一个{label}：{_runtime_lesson_summary(lesson)}"
+        category = "conversation"
+        memory_type = "conversation_advice"
+        target = "main_agent"
+        confidence = 0.6 if outcome.status is RunStatus.COMPLETED else 0.45
+        noise_risk = 0.35 if outcome.status is RunStatus.COMPLETED else 0.55
+    return {
+        "id": lesson_id,
+        "category": category,
+        "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
+        "lesson": lesson,
+        "summary": summary,
+        "user_summary": user_summary,
+        "tags": tags,
+        "weight": weight,
+        "source_mode": mode,
+        "applies_to_modes": [] if mode == "unknown" else [mode],
+        "memory_type": memory_type,
+        "target": target,
+        "confidence": confidence,
+        "noise_risk": noise_risk,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": str(outcome.run_id),
+        "conversation_id": outcome.conversation_id,
+        "confirmed_at": None,
+    }
 
 
 def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id: str | None) -> bool:

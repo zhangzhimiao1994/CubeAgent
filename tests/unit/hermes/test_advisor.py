@@ -7,8 +7,13 @@ from uuid import uuid4
 
 import pytest
 
-from agent_hub.domain.runs import TaskMode
-from agent_hub.hermes.advisor import PersistentHermesRunAdvisor, _runtime_lesson_summary
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.hermes.advisor import (
+    PersistentHermesRunAdvisor,
+    _outcome_learning_payload,
+    _runtime_lesson_summary,
+)
+from agent_hub.runs.service import HermesRunOutcome
 
 
 @dataclass(slots=True)
@@ -259,4 +264,61 @@ def test_runtime_lesson_summary_localizes_scheduler_outcomes_for_users() -> None
             "Scheduler notices: trigger=model_capacity_pressure."
         )
         == "short-video-dispatch 工作流以 dispatch 模式成功完成。 已记录调度告警。"
+    )
+
+
+def test_runtime_outcome_without_scheduler_notice_creates_conversation_learning() -> None:
+    run_id = uuid4()
+    payload = _outcome_learning_payload(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.HYBRID,
+            workflow_id=None,
+            conversation_id="conv-dialog",
+            agent_ids=("moderator", "domain_expert"),
+        ),
+        lesson_id="hermes_run_unit",
+    )
+
+    assert payload["category"] == "conversation"
+    assert payload["memory_type"] == "conversation_advice"
+    assert payload["target"] == "main_agent"
+    assert payload["conversation_id"] == "conv-dialog"
+    assert payload["run_id"] == str(run_id)
+    assert payload["confirmed_at"] is None
+    assert payload["user_summary"] == (
+        "本次对话学习记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
+    )
+
+
+def test_runtime_outcome_with_scheduler_notice_creates_scheduler_observation() -> None:
+    payload = _outcome_learning_payload(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=uuid4(),
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            workflow_id="short-video-dispatch",
+            conversation_id="conv-scheduler",
+            agent_ids=("planner",),
+            scheduler_notices=(
+                {
+                    "trigger": "model_capacity_pressure",
+                    "action": "reschedule_or_reassign_model",
+                    "severity": "warning",
+                    "source_kind": "step.failed",
+                    "actor": "planner",
+                },
+            ),
+        ),
+        lesson_id="hermes_run_notice",
+    )
+
+    assert payload["category"] == "scheduler"
+    assert str(payload["user_summary"]).startswith(
+        "本次调度观察提醒：short-video-dispatch 工作流以 dispatch 模式运行失败"
     )

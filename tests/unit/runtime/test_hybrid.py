@@ -279,13 +279,14 @@ async def test_hybrid_runtime_preserves_dispatch_child_failure_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_after_dispatch() -> None:
+async def test_hybrid_runtime_synthesizes_when_discussion_gateway_fails_after_dispatch() -> None:
     run_id = uuid4()
     dispatch_output = artifact("planner", "dispatch result")
+    final_output = artifact("main", "answer")
     runtime = HybridRuntime(
         MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
         FailingRuntime(TaskMode.DISCUSS, "model gateway failed: model transport failed"),
-        UnusedRuntime(TaskMode.DIRECT, "unused"),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
     )
 
     events = [
@@ -304,8 +305,86 @@ async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_af
         event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
         for event in events
     )
+    assert any(
+        event.kind is EventKind.STEP_FAILED
+        and event.reason == "hybrid discuss failed: model gateway failed: model transport failed"
+        for event in events
+    )
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == final_output
+        for event in events
+    )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[-1].reason == "partial_hybrid_after_discussion_failure"
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_synthesizes_when_discussion_fails_with_only_history_context() -> None:
+    run_id = uuid4()
+    history = artifact("conversation_history", "上一轮已经给过两个风格。")
+    final_output = artifact("main", "这里是根据上下文生成的最终回答。")
+    runtime = HybridRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, "unused"),
+        FailingRuntime(TaskMode.DISCUSS, "model gateway failed: model response text is empty"),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="这两个风格都给我生成对应的提示词",
+                artifacts=(history,),
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_FAILED
+        and event.reason == "hybrid discuss failed: model gateway failed: model response text is empty"
+        for event in events
+    )
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == final_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_fails_when_history_only_discussion_and_synthesis_fail() -> None:
+    run_id = uuid4()
+    history = artifact("conversation_history", "上一轮已经给过两个风格。")
+    runtime = HybridRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, "unused"),
+        FailingRuntime(TaskMode.DISCUSS, "model gateway failed: model response text is empty"),
+        FailingRuntime(TaskMode.DIRECT, "model gateway failed: model response text is empty"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="这两个风格都给我生成对应的提示词",
+                artifacts=(history,),
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_FAILED
+        and event.reason == "hybrid discuss failed: model gateway failed: model response text is empty"
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "hybrid direct failed: model gateway failed: model response text is empty"
 
 
 @pytest.mark.asyncio

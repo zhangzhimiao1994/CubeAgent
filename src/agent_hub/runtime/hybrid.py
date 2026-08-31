@@ -119,6 +119,7 @@ class HybridRuntime:
         self._active_task = cast(asyncio.Task[object], task)
         sequence = 1
         artifacts = list(context.artifacts)
+        input_artifact_ids = {artifact.id for artifact in artifacts}
         known = {artifact.id for artifact in artifacts}
         try:
             restored = self._restored
@@ -164,15 +165,31 @@ class HybridRuntime:
                     if is_discussion
                     else self._run_child(child, context, mode, tuple(artifacts), sequence)
                 )
-                async for event in child_events:
-                    sequence = event.sequence + 1
-                    if event.artifact is not None and event.artifact.id not in known:
-                        await self._repository.put(
-                            context.tenant_id, context.run_id, event.artifact
+                try:
+                    async for event in child_events:
+                        sequence = event.sequence + 1
+                        if event.artifact is not None and event.artifact.id not in known:
+                            await self._repository.put(
+                                context.tenant_id, context.run_id, event.artifact
+                            )
+                            artifacts.append(event.artifact)
+                            known.add(event.artifact.id)
+                        yield event
+                except RuntimeExecutionError as error:
+                    failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
+                    if is_discussion and _has_later_synthesis_stage(stages, stage_index):
+                        yield RunEvent(
+                            kind=EventKind.STEP_FAILED,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor="hybrid",
+                            step_id="hybrid_discussion_fallback",
+                            reason=failure_reason,
+                            payload=runtime_failure_diagnostic_from_reason(failure_reason),
                         )
-                        artifacts.append(event.artifact)
-                        known.add(event.artifact.id)
-                    yield event
+                        sequence += 1
+                        continue
+                    raise
                 stage_checkpoint = self._checkpoint(
                     context,
                     artifacts=tuple(artifacts),
@@ -220,7 +237,11 @@ class HybridRuntime:
             raise
         except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
             failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
-            partial_reason = _partial_hybrid_completion_reason(artifacts, failure_reason)
+            partial_reason = _partial_hybrid_completion_reason(
+                artifacts,
+                failure_reason,
+                input_artifact_ids=input_artifact_ids,
+            )
             if partial_reason is not None:
                 checkpoint = self._checkpoint(
                     context,
@@ -525,14 +546,23 @@ def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Arti
 def _partial_hybrid_completion_reason(
     artifacts: list[Artifact],
     failure_reason: str,
+    *,
+    input_artifact_ids: set[UUID],
 ) -> str | None:
-    if not artifacts:
+    if not any(artifact.id not in input_artifact_ids for artifact in artifacts):
         return None
     if failure_reason.startswith("hybrid discuss failed: model gateway failed"):
         return "partial_hybrid_after_discussion_failure"
     if failure_reason.startswith("hybrid direct failed: model gateway failed"):
         return "partial_hybrid_after_synthesis_failure"
     return None
+
+
+def _has_later_synthesis_stage(
+    stages: tuple[tuple[ChildRuntime, TaskMode, bool], ...],
+    stage_index: int,
+) -> bool:
+    return any(mode is TaskMode.DIRECT for _, mode, _ in stages[stage_index + 1 :])
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]
