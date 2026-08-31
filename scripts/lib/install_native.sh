@@ -672,7 +672,7 @@ run_native_migrations() {
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"
     set +a
-    .venv/bin/alembic upgrade head
+    .venv/bin/python -m alembic upgrade head
   )
 }
 

@@ -150,6 +150,13 @@ def test_native_litellm_proxy_uses_isolated_verified_virtualenv() -> None:
     assert "proxy_server module is missing" in native_installer
 
 
+def test_native_migrations_run_through_current_release_python() -> None:
+    native_installer = read("scripts/lib/install_native.sh")
+
+    assert ".venv/bin/python -m alembic upgrade head" in native_installer
+    assert ".venv/bin/alembic upgrade head" not in native_installer
+
+
 def test_compose_litellm_is_health_checked_and_can_reach_provider_apis() -> None:
     compose = read("deploy/compose/docker-compose.yml")
 
