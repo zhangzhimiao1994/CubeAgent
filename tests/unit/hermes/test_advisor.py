@@ -212,6 +212,126 @@ async def test_runtime_advice_skips_same_mode_low_quality_noise() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_advice_ignores_confirmed_runtime_observations() -> None:
+    runtime_observation = {
+        "id": "hermes_run_observation",
+        "category": "scheduler",
+        "outcome": "success",
+        "lesson": "Run completed with mode=hybrid, workflow=no-workflow.",
+        "user_summary": "本次运行观察记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。",
+        "tags": ["completed", "hybrid", "no-workflow"],
+        "weight": 10,
+        "source_mode": "hybrid",
+        "memory_type": "runtime_observation",
+        "target": "scheduler",
+        "confidence": 0.9,
+        "noise_risk": 0.1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(runtime_observation)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="继续用 hybrid 模式处理 no-workflow 任务",
+        mode=TaskMode.HYBRID,
+        agent_ids=(),
+        workflow_id="no-workflow",
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_ignores_legacy_conversation_shaped_runtime_observations() -> None:
+    legacy_runtime_observation = {
+        "id": "legacy_runtime_observation",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Run completed with mode=hybrid, workflow=no-workflow.",
+        "tags": ["completed", "hybrid", "no-workflow"],
+        "weight": 10,
+        "source_mode": "hybrid",
+        "memory_type": "conversation_advice",
+        "target": "main_agent",
+        "confidence": 0.9,
+        "noise_risk": 0.1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(legacy_runtime_observation)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="继续用 hybrid 模式处理 no-workflow 任务",
+        mode=TaskMode.HYBRID,
+        agent_ids=(),
+        workflow_id="no-workflow",
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_ignores_legacy_scheduler_notice_observations() -> None:
+    legacy_scheduler_observation = {
+        "id": "hermes_run_notice_legacy",
+        "category": "conversation",
+        "outcome": "failure",
+        "lesson": (
+            "Run failed with mode=hybrid, workflow=quality-review. "
+            "Scheduler notices: trigger=model_capacity_pressure."
+        ),
+        "user_summary": "本次对话学习记录了一个失败教训：quality-review 工作流以 hybrid 模式运行失败。",
+        "tags": ["failed", "hybrid", "quality-review", "model_capacity_pressure"],
+        "weight": 10,
+        "source_mode": "hybrid",
+        "memory_type": "conversation_advice",
+        "target": "main_agent",
+        "confidence": 0.8,
+        "noise_risk": 0.2,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": str(uuid4()),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(legacy_scheduler_observation)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="quality-review 又出现 model capacity pressure，继续处理",
+        mode=TaskMode.HYBRID,
+        agent_ids=(),
+        workflow_id="quality-review",
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
 async def test_runtime_advice_records_conflicting_memory_as_skipped() -> None:
     lesson = {
         "id": "hermes_hybrid_preference",
@@ -267,7 +387,7 @@ def test_runtime_lesson_summary_localizes_scheduler_outcomes_for_users() -> None
     )
 
 
-def test_runtime_outcome_without_scheduler_notice_creates_conversation_learning() -> None:
+def test_runtime_outcome_without_scheduler_notice_creates_scheduler_observation() -> None:
     run_id = uuid4()
     payload = _outcome_learning_payload(
         HermesRunOutcome(
@@ -283,14 +403,14 @@ def test_runtime_outcome_without_scheduler_notice_creates_conversation_learning(
         lesson_id="hermes_run_unit",
     )
 
-    assert payload["category"] == "conversation"
-    assert payload["memory_type"] == "conversation_advice"
-    assert payload["target"] == "main_agent"
+    assert payload["category"] == "scheduler"
+    assert payload["memory_type"] == "runtime_observation"
+    assert payload["target"] == "scheduler"
     assert payload["conversation_id"] == "conv-dialog"
     assert payload["run_id"] == str(run_id)
     assert payload["confirmed_at"] is None
     assert payload["user_summary"] == (
-        "本次对话学习记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
+        "本次运行观察记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
     )
 
 

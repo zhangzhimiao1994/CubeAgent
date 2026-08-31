@@ -606,7 +606,7 @@ async def test_completed_run_records_bounded_hermes_outcome(
     ]
 
 
-async def test_persistent_hermes_runtime_outcome_creates_conversation_learning(
+async def test_persistent_hermes_runtime_outcome_creates_scheduler_observation(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = uuid4()
@@ -637,14 +637,14 @@ async def test_persistent_hermes_runtime_outcome_creates_conversation_learning(
         ).scalar_one()
 
     payload = dict(row.payload)
-    assert payload["category"] == "conversation"
-    assert payload["memory_type"] == "conversation_advice"
-    assert payload["target"] == "main_agent"
+    assert payload["category"] == "scheduler"
+    assert payload["memory_type"] == "runtime_observation"
+    assert payload["target"] == "scheduler"
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
     assert payload["confirmed_at"] is None
     assert payload["user_summary"] == (
-        "本次对话学习记录了一个失败教训：quality-review 工作流以 hybrid 模式运行失败。"
+        "本次运行观察记录了一个失败教训：quality-review 工作流以 hybrid 模式运行失败。"
     )
 
 

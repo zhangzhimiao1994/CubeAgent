@@ -34,6 +34,7 @@ from agent_hub.api.routers.admin import (
     SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
+    _hermes_response_from_payload,
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
@@ -4514,7 +4515,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
             "weight": 5,
         },
     )
-    recommendation = api.post(
+    unconfirmed_recommendation = api.post(
         "/api/v1/admin/hermes/recommend",
         headers=headers(),
         json={
@@ -4540,15 +4541,29 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
     detail = api.get(f"/api/v1/admin/hermes/{insight_id}", headers=headers())
     confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
-    assert recommendation.status_code == 200
     assert detail.status_code == 200
     assert detail.json()["id"] == insight_id
     assert detail.json()["conversation_id"] == "conv-architecture-1"
     assert detail.json()["user_summary"] == (
         "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。"
     )
+    assert unconfirmed_recommendation.status_code == 200
+    assert unconfirmed_recommendation.json()["recommended_mode"] == "group_chat"
+    assert unconfirmed_recommendation.json()["confidence"] == 0.35
+    assert unconfirmed_recommendation.json()["requires_approval"] is True
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed_at"] is not None
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Run a debate review for this architecture.",
+            "mode_candidates": ["dispatch", "group_chat"],
+            "model_candidates": ["deepseek-chat", "gpt-4o"],
+            "skill_candidates": ["architecture-review", "safe-shell"],
+        },
+    )
+    assert recommendation.status_code == 200
     assert recommendation.json()["recommended_mode"] == "group_chat"
     assert recommendation.json()["recommended_model"] == "deepseek-chat"
     assert recommendation.json()["confidence"] > 0.45
@@ -4560,6 +4575,105 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
         and insight["category"] == "conversation"
         for insight in insights.json()
     )
+
+
+def test_hermes_recommendation_ignores_scheduler_observations() -> None:
+    api = client()
+
+    feedback = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "category": "scheduler",
+            "outcome": "success",
+            "lesson": "Run completed with mode=hybrid, workflow=no-workflow.",
+            "conversation_id": "conv-runtime-observe",
+            "tags": ["hybrid", "no-workflow"],
+            "weight": 10,
+        },
+    )
+    insight_id = feedback.json()["id"]
+    confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Please use hybrid mode for this no-workflow task.",
+            "mode_candidates": ["dispatch", "group_chat"],
+            "model_candidates": ["deepseek-chat"],
+            "skill_candidates": ["safe-shell"],
+        },
+    )
+
+    assert feedback.status_code == 200
+    assert confirmed.status_code == 200
+    assert recommendation.status_code == 200
+    assert recommendation.json()["confidence"] == 0.35
+    assert recommendation.json()["reasons"] == [
+        "No matching confirmed Hermes conversation lesson was found in persistent memory."
+    ]
+
+
+def test_hermes_payload_reader_reclassifies_legacy_runtime_conversation() -> None:
+    response = _hermes_response_from_payload(
+        {
+            "id": "legacy_runtime_observation",
+            "category": "conversation",
+            "outcome": "success",
+            "lesson": "Run completed with mode=hybrid, workflow=no-workflow.",
+            "tags": ["completed", "hybrid", "no-workflow"],
+            "weight": 10,
+            "source_mode": "hybrid",
+            "memory_type": "conversation_advice",
+            "target": "main_agent",
+            "confidence": 0.9,
+            "noise_risk": 0.1,
+            "created_at": datetime.now(UTC).isoformat(),
+            "confirmed_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+    assert response.category == "scheduler"
+    assert response.user_summary == (
+        "本次运行观察记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
+    )
+
+
+def test_hermes_feedback_reclassifies_runtime_shaped_conversation() -> None:
+    api = client()
+
+    feedback = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Run completed with mode=hybrid, workflow=no-workflow.",
+            "conversation_id": "conv-runtime-feedback",
+            "tags": ["hybrid", "no-workflow"],
+            "weight": 10,
+        },
+    )
+    insight_id = feedback.json()["id"]
+    confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Please use hybrid mode for this no-workflow task.",
+            "mode_candidates": ["dispatch", "group_chat"],
+            "model_candidates": ["deepseek-chat"],
+            "skill_candidates": ["safe-shell"],
+        },
+    )
+
+    assert feedback.status_code == 200
+    assert feedback.json()["category"] == "scheduler"
+    assert feedback.json()["user_summary"] == (
+        "本次运行观察记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
+    )
+    assert confirmed.status_code == 200
+    assert recommendation.status_code == 200
+    assert recommendation.json()["confidence"] == 0.35
 
 
 def test_hermes_bulk_confirm_confirms_multiple_learning_records() -> None:

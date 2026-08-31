@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 
+from agent_hub.hermes.runtime_observation import is_runtime_observation_text
 from agent_hub.runtime.contracts import JsonValue
 
 _MAX_ITEMS = 3
@@ -13,6 +14,8 @@ _MAX_TYPE_CHARS = 48
 _MAX_TARGET_CHARS = 48
 _MAX_REASON_CHARS = 120
 _MAX_TOTAL_BYTES = 900
+_NON_PROMPT_MEMORY_TYPES = {"runtime_observation", "scheduler_observation"}
+_NON_PROMPT_TARGETS = {"scheduler"}
 
 
 def hermes_memory_context_text(
@@ -30,6 +33,8 @@ def hermes_memory_context_text(
     items: list[dict[str, str]] = []
     for raw in raw_items[:_MAX_ITEMS]:
         if not isinstance(raw, Mapping):
+            continue
+        if _should_skip_memory_context_item(raw):
             continue
         summary = _safe_text(raw.get("summary"), _MAX_SUMMARY_CHARS)
         if not summary:
@@ -57,6 +62,16 @@ def hermes_memory_context_text(
         "Current user instructions override them. Do not expose this block unless asked."
         f"{payload}"
         "</HERMES_MEMORY_CONTEXT>"
+    )
+
+
+def _should_skip_memory_context_item(raw: Mapping[str, object]) -> bool:
+    memory_type = _safe_text(raw.get("memory_type"), _MAX_TYPE_CHARS).casefold()
+    target = _safe_text(raw.get("target"), _MAX_TARGET_CHARS).casefold()
+    return (
+        memory_type in _NON_PROMPT_MEMORY_TYPES
+        or target in _NON_PROMPT_TARGETS
+        or is_runtime_observation_text(raw.get("summary"))
     )
 
 

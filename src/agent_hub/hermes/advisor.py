@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.hermes.runtime_observation import is_runtime_observation_lesson
 from agent_hub.runs.service import (
     HermesMemoryInjection,
     HermesRunAdvice,
@@ -230,7 +231,11 @@ class PersistentHermesRunAdvisor:
 
 def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:
     category = lesson.get("category")
-    return category in {None, "conversation"}
+    return category in {None, "conversation"} and not _lesson_is_runtime_observation(lesson)
+
+
+def _lesson_is_runtime_observation(lesson: dict[str, object]) -> bool:
+    return is_runtime_observation_lesson(lesson.get("lesson"))
 
 
 def _outcome_learning_payload(
@@ -279,10 +284,10 @@ def _outcome_learning_payload(
             f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
         )
         label = "成功经验" if outcome.status is RunStatus.COMPLETED else "失败教训"
-        user_summary = f"本次对话学习记录了一个{label}：{_runtime_lesson_summary(lesson)}"
-        category = "conversation"
-        memory_type = "conversation_advice"
-        target = "main_agent"
+        user_summary = f"本次运行观察记录了一个{label}：{_runtime_lesson_summary(lesson)}"
+        category = "scheduler"
+        memory_type = "runtime_observation"
+        target = "scheduler"
         confidence = 0.6 if outcome.status is RunStatus.COMPLETED else 0.45
         noise_risk = 0.35 if outcome.status is RunStatus.COMPLETED else 0.55
     return {

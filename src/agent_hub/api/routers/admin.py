@@ -52,6 +52,7 @@ from agent_hub.files.generated import (
     GeneratedFileStore,
     safe_generated_filename,
 )
+from agent_hub.hermes.runtime_observation import is_runtime_observation_lesson
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.capacity import safe_operational_limit
 from agent_hub.models.gateway import ModelTransport
@@ -3702,7 +3703,7 @@ class InMemoryAdminResourceService:
             raise ValueError("sensitive content")
         insight = HermesInsightResponse(
             id=f"hermes-{uuid4().hex}",
-            category=request.category,
+            category=_normalized_hermes_feedback_category(request.category, request.lesson),
             outcome=request.outcome,
             lesson=request.lesson,
             summary=_hermes_feedback_summary(
@@ -3711,7 +3712,7 @@ class InMemoryAdminResourceService:
                 tags=request.tags,
                 weight=request.weight,
             ),
-            user_summary=_hermes_user_summary(
+            user_summary=_normalized_hermes_feedback_user_summary(
                 category=request.category,
                 outcome=request.outcome,
                 lesson=request.lesson,
@@ -3753,14 +3754,23 @@ class InMemoryAdminResourceService:
         matching_insights = [
             insight
             for insight in self.hermes_insights.values()
-            if any(tag.lower() in normalized_task for tag in insight.tags)
+            if _is_confirmed_conversation_hermes_insight(insight)
+            and any(tag.lower() in normalized_task for tag in insight.tags)
         ]
-        if matching_insights:
-            strongest = max(matching_insights, key=lambda insight: insight.weight)
-            reasons.append(f"Matched prior Hermes lesson: {strongest.lesson}")
+        if not matching_insights:
+            return HermesRecommendationResponse(
+                recommended_mode=recommended_mode,
+                recommended_model=recommended_model,
+                recommended_skills=recommended_skills,
+                confidence=0.35,
+                reasons=[
+                    "No matching confirmed Hermes conversation lesson was found in persistent memory."
+                ],
+                requires_approval=True,
+            )
 
-        if not reasons:
-            reasons.append("No strong prior pattern matched; using conservative defaults.")
+        strongest = max(matching_insights, key=lambda insight: insight.weight)
+        reasons.append(f"Matched prior Hermes lesson: {strongest.lesson}")
 
         confidence = min(0.9, 0.45 + 0.1 * len(matching_insights) + 0.05 * len(recommended_skills))
         return HermesRecommendationResponse(
@@ -5352,9 +5362,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
             raise ValueError("sensitive content")
         insight_id = f"hermes_{uuid4().hex}"
+        category = _normalized_hermes_feedback_category(request.category, request.lesson)
         response = HermesInsightResponse(
             id=insight_id,
-            category=request.category,
+            category=category,
             outcome=request.outcome,
             lesson=request.lesson,
             summary=_hermes_feedback_summary(
@@ -5363,8 +5374,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 tags=request.tags,
                 weight=request.weight,
             ),
-            user_summary=_hermes_user_summary(
-                category=request.category,
+            user_summary=_normalized_hermes_feedback_user_summary(
+                category=category,
                 outcome=request.outcome,
                 lesson=request.lesson,
             ),
@@ -5389,24 +5400,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().recommend_with_hermes(request)
         previous = await self.list_hermes_insights()
         lowered_task = request.task.lower()
-        matched = [
-            insight
-            for insight in previous
-            if any(tag.lower() in lowered_task for tag in insight.tags)
-            or any(word in lowered_task for word in insight.lesson.lower().split())
-        ]
-        if not matched:
-            return HermesRecommendationResponse(
-                recommended_mode=request.mode_candidates[0]
-                if request.mode_candidates
-                else "dispatch",
-                recommended_model=request.model_candidates[0] if request.model_candidates else None,
-                recommended_skills=request.skill_candidates[:2],
-                confidence=0.35,
-                reasons=["No matching Hermes lesson was found in persistent memory."],
-                requires_approval=True,
-            )
-        best = max(matched, key=lambda insight: insight.weight)
         recommended_mode = (
             "group_chat"
             if "debate" in lowered_task or "review" in lowered_task
@@ -5414,6 +5407,27 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         if recommended_mode not in request.mode_candidates and request.mode_candidates:
             recommended_mode = request.mode_candidates[0]
+        matched = [
+            insight
+            for insight in previous
+            if _is_confirmed_conversation_hermes_insight(insight)
+            and (
+                any(tag.lower() in lowered_task for tag in insight.tags)
+                or any(word in lowered_task for word in insight.lesson.lower().split())
+            )
+        ]
+        if not matched:
+            return HermesRecommendationResponse(
+                recommended_mode=recommended_mode,
+                recommended_model=request.model_candidates[0] if request.model_candidates else None,
+                recommended_skills=request.skill_candidates[:2],
+                confidence=0.35,
+                reasons=[
+                    "No matching confirmed Hermes conversation lesson was found in persistent memory."
+                ],
+                requires_approval=True,
+            )
+        best = max(matched, key=lambda insight: insight.weight)
         return HermesRecommendationResponse(
             recommended_mode=recommended_mode,
             recommended_model=request.model_candidates[0] if request.model_candidates else None,
@@ -6563,8 +6577,15 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     weight = raw_weight if type(raw_weight) is int else 1
     outcome = str(payload.get("outcome", "neutral"))
     raw_category = payload.get("category", "conversation")
-    category = str(raw_category) if raw_category in {"conversation", "scheduler"} else "conversation"
     lesson = str(payload.get("lesson", ""))
+    legacy_runtime_observation = _is_legacy_runtime_observation_payload(payload, lesson)
+    category = (
+        "scheduler"
+        if legacy_runtime_observation
+        else str(raw_category)
+        if raw_category in {"conversation", "scheduler"}
+        else "conversation"
+    )
     raw_summary = payload.get("summary")
     raw_user_summary = payload.get("user_summary")
     run_id = _uuid_from_json(payload.get("run_id"))
@@ -6583,7 +6604,13 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
             tags=normalized_tags,
             weight=weight,
         ),
-        user_summary=raw_user_summary
+        user_summary=_hermes_runtime_observation_user_summary(
+            raw_user_summary=raw_user_summary,
+            outcome=outcome,
+            lesson=lesson,
+        )
+        if legacy_runtime_observation
+        else raw_user_summary
         if isinstance(raw_user_summary, str) and raw_user_summary.strip()
         else _hermes_user_summary(category=category, outcome=outcome, lesson=lesson),
         run_id=run_id,
@@ -6593,6 +6620,59 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         weight=weight,
         created_at=_datetime_from_json(payload.get("created_at")),
     )
+
+
+def _is_confirmed_conversation_hermes_insight(insight: HermesInsightResponse) -> bool:
+    return insight.category == "conversation" and insight.confirmed_at is not None
+
+
+def _is_runtime_observation_lesson(lesson: str) -> bool:
+    return is_runtime_observation_lesson(lesson)
+
+
+def _normalized_hermes_feedback_category(category: str, lesson: str) -> str:
+    if _is_runtime_observation_lesson(lesson):
+        return "scheduler"
+    return category
+
+
+def _normalized_hermes_feedback_user_summary(
+    *,
+    category: str,
+    outcome: str,
+    lesson: str,
+) -> str:
+    if _is_runtime_observation_lesson(lesson):
+        return _hermes_runtime_observation_user_summary(
+            raw_user_summary=None,
+            outcome=outcome,
+            lesson=lesson,
+        )
+    return _hermes_user_summary(category=category, outcome=outcome, lesson=lesson)
+
+
+def _is_legacy_runtime_observation_payload(
+    payload: Mapping[str, object],
+    lesson: str,
+) -> bool:
+    del payload
+    return _is_runtime_observation_lesson(lesson)
+
+
+def _hermes_runtime_observation_user_summary(
+    *,
+    raw_user_summary: object,
+    outcome: str,
+    lesson: str,
+) -> str:
+    if isinstance(raw_user_summary, str) and raw_user_summary.startswith("本次对话学习记录了一个"):
+        return raw_user_summary.replace("本次对话学习记录", "本次运行观察记录", 1)
+    label = {
+        "success": "成功经验",
+        "failure": "失败教训",
+        "neutral": "中性观察",
+    }.get(outcome, "运行观察")
+    return f"本次运行观察记录了一个{label}：{_localized_hermes_lesson(lesson)}"
 
 
 def _hermes_feedback_summary(
