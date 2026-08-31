@@ -156,17 +156,31 @@ def test_native_installer_fails_fast_when_core_services_do_not_become_active() -
     script = read("scripts/lib/install_native.sh")
 
     assert "require_native_service_active" in script
+    assert "require_native_http_ready" in script
     assert "systemctl status \"$unit\" --no-pager -l" in script
     assert "journalctl -u \"$unit\" -n 120 --no-pager" in script
     assert "did not become active after install" in script
+    assert "did not become ready at $url after install" in script
+    assert "for attempt in {1..60}; do" in script
+    assert "curl -fsS \"$url\"" in script
     assert "require_native_service_active caddy.service" in script
     assert "require_native_service_active agent-hub-api.service" in script
     assert "require_native_service_active agent-hub-worker.service" in script
     assert "require_native_service_active agent-hub-litellm.service" in script
+    assert (
+        'require_native_http_ready "LiteLLM proxy" '
+        '"http://127.0.0.1:4000/health/liveliness" agent-hub-litellm.service'
+    ) in script
+    assert (
+        'require_native_http_ready "Agent Hub API readiness" '
+        '"http://127.0.0.1:8000/health/ready" agent-hub-api.service'
+    ) in script
     start = script.index("systemctl enable --now agent-hub.target")
     litellm_check = script.index("require_native_service_active agent-hub-litellm.service")
+    litellm_ready = script.index('require_native_http_ready "LiteLLM proxy"')
+    api_ready = script.index('require_native_http_ready "Agent Hub API readiness"')
     mark = script.index('mark_stage "native-up"')
-    assert start < litellm_check < mark
+    assert start < litellm_check < litellm_ready < api_ready < mark
 
 
 def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() -> None:

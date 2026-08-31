@@ -664,6 +664,22 @@ require_native_service_active() {
   die "$unit did not become active after install; inspect the logs above"
 }
 
+require_native_http_ready() {
+  local label="$1" url="$2" unit="${3:-}" attempt
+  command -v curl >/dev/null 2>&1 || return 0
+  for attempt in {1..60}; do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    [[ "$attempt" -lt 60 ]] && sleep 2
+  done
+  if [[ -n "$unit" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$unit" --no-pager -l >&2 || true
+    journalctl -u "$unit" -n 120 --no-pager >&2 || true
+  fi
+  die "$label did not become ready at $url after install; inspect the logs above"
+}
+
 run_native_migrations() {
   log "running native database migrations"
   (
@@ -721,5 +737,7 @@ install_native_mode() {
   require_native_service_active agent-hub-api.service
   require_native_service_active agent-hub-worker.service
   require_native_service_active agent-hub-litellm.service
+  require_native_http_ready "LiteLLM proxy" "http://127.0.0.1:4000/health/liveliness" agent-hub-litellm.service
+  require_native_http_ready "Agent Hub API readiness" "http://127.0.0.1:8000/health/ready" agent-hub-api.service
   mark_stage "native-up"
 }
