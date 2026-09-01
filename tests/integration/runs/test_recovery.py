@@ -679,13 +679,12 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     )
 
     async with run_session_factory() as session:
-        rows = list(
-            await session.execute(
-                select(AdminResourceRow)
-                .where(AdminResourceRow.tenant_id == tenant_id)
-                .where(AdminResourceRow.kind == "hermes")
-            )
-        ).scalars()
+        result = await session.execute(
+            select(AdminResourceRow)
+            .where(AdminResourceRow.tenant_id == tenant_id)
+            .where(AdminResourceRow.kind == "hermes")
+        )
+        rows = list(result.scalars())
 
     scheduler_row = next(
         row for row in rows if not row.resource_id.startswith("cognitive_experience:")
@@ -707,8 +706,13 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     assert cognitive_payload["kind"] == "error_handling"
     assert cognitive_payload["status"] == "candidate"
     assert cognitive_payload["active_for_runtime"] is False
-    assert cognitive_payload["resource_id"].startswith("cognitive_experience:")
-    assert cognitive_payload["evidence"][0]["source_id"] == str(run_id)
+    cognitive_resource_id = cognitive_payload["resource_id"]
+    assert isinstance(cognitive_resource_id, str)
+    assert cognitive_resource_id.startswith("cognitive_experience:")
+    cognitive_evidence = cognitive_payload["evidence"]
+    assert isinstance(cognitive_evidence, list)
+    assert isinstance(cognitive_evidence[0], dict)
+    assert cognitive_evidence[0]["source_id"] == str(run_id)
 
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     run_session_factory: async_sessionmaker[AsyncSession],
