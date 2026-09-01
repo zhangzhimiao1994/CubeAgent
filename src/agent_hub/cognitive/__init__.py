@@ -2,7 +2,9 @@
 
 from agent_hub.cognitive.reflection import reflect_from_feedback
 from agent_hub.cognitive.repository import (
+    InMemoryCognitiveRecordRepository,
     InMemoryExperienceRepository,
+    PersistentCognitiveRecordRepository,
     PersistentExperienceRepository,
 )
 from agent_hub.cognitive.router import route_experiences
@@ -28,7 +30,9 @@ __all__ = [
     "ExperienceRecord",
     "ExperienceService",
     "ExperienceStatus",
+    "InMemoryCognitiveRecordRepository",
     "InMemoryExperienceRepository",
+    "PersistentCognitiveRecordRepository",
     "PersistentExperienceRepository",
     "ReflectionRecord",
     "RelationshipStateRecord",

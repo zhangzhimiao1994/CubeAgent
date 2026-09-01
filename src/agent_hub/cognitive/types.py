@@ -66,12 +66,12 @@ class ExperienceRecord(BaseModel):
     tags: tuple[str, ...] = ()
     applies_to_modes: tuple[str, ...] = ()
     applies_to_agents: tuple[str, ...] = ()
-    use_count: int = Field(ge=0)
-    success_count: int = Field(ge=0)
-    failure_count: int = Field(ge=0)
+    use_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
     last_used_at: datetime | None
     last_verified_at: datetime | None
-    version: int = Field(ge=1)
+    version: int = Field(default=1, ge=1)
     created_at: datetime
     updated_at: datetime
 
@@ -144,9 +144,22 @@ class BeliefRecord(BaseModel):
     evidence: tuple[CognitiveEvidence, ...] = ()
     contradictions: tuple[CognitiveEvidence, ...] = ()
     status: str = Field(min_length=1, max_length=32)
+    use_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    last_used_at: datetime | None = None
     last_verified_at: datetime | None
+    version: int = Field(default=1, ge=1)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_growth_counts(self) -> BeliefRecord:
+        if self.success_count + self.failure_count > self.use_count:
+            raise ValueError("success and failure counts cannot exceed use count")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at cannot be before created_at")
+        return self
 
 
 class RelationshipStateRecord(BaseModel):
@@ -195,14 +208,26 @@ class SkillCandidateRecord(BaseModel):
     steps: tuple[str, ...] = Field(min_length=1)
     required_inputs: tuple[str, ...] = ()
     output_contract: str = Field(min_length=1, max_length=512)
+    confidence: float = Field(default=0.62, ge=0, le=1)
     evidence: tuple[CognitiveEvidence, ...] = ()
-    use_count: int = Field(ge=0)
-    success_count: int = Field(ge=0)
-    failure_count: int = Field(ge=0)
-    version: int = Field(ge=1)
+    contradictions: tuple[CognitiveEvidence, ...] = ()
+    use_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    last_used_at: datetime | None = None
+    last_verified_at: datetime | None = None
+    version: int = Field(default=1, ge=1)
     status: str = Field(min_length=1, max_length=32)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_growth_counts(self) -> SkillCandidateRecord:
+        if self.success_count + self.failure_count > self.use_count:
+            raise ValueError("success and failure counts cannot exceed use count")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at cannot be before created_at")
+        return self
 
 
 def _bounded_printable(value: str, *, allow_empty: bool = False) -> str:

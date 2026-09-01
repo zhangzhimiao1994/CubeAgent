@@ -93,6 +93,11 @@ def test_belief_tracks_evidence_contradictions_and_verification() -> None:
         evidence=(CognitiveEvidence(source_type="feedback", source_id="msg-1", note="explicit preference"),),
         contradictions=(),
         status="active",
+        use_count=2,
+        success_count=1,
+        failure_count=1,
+        last_used_at=now,
+        version=3,
         last_verified_at=now,
         created_at=now,
         updated_at=now,
@@ -100,6 +105,8 @@ def test_belief_tracks_evidence_contradictions_and_verification() -> None:
 
     assert belief.confidence == 0.81
     assert belief.contradictions == ()
+    assert belief.use_count == 2
+    assert belief.version == 3
 
 
 def test_relationship_world_and_skill_records_are_separate_from_runtime_permissions() -> None:
@@ -141,10 +148,14 @@ def test_relationship_world_and_skill_records_are_separate_from_runtime_permissi
         steps=("压缩输入", "拆分审查", "重试或降级"),
         required_inputs=("失败步骤", "输入大小", "模型"),
         output_contract="给出可执行修复或明确跳过原因",
+        confidence=0.73,
         evidence=(CognitiveEvidence(source_type="experience", source_id="exp-1", note="repeated success"),),
+        contradictions=(),
         use_count=0,
         success_count=0,
         failure_count=0,
+        last_used_at=None,
+        last_verified_at=now,
         version=1,
         status="candidate",
         created_at=now,
