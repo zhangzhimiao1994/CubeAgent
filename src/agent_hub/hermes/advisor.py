@@ -9,6 +9,17 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.cognitive.context_router import CognitiveContextRouteResult, route_cognitive_context
+from agent_hub.cognitive.repository import (
+    ExperienceRepositoryError,
+    PersistentCognitiveRecordRepository,
+)
+from agent_hub.cognitive.types import (
+    BeliefRecord,
+    RelationshipStateRecord,
+    SkillCandidateRecord,
+    WorldStateRecord,
+)
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes.runtime_observation import is_runtime_observation_lesson
@@ -46,6 +57,7 @@ class PersistentHermesRunAdvisor:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self._cognitive_repository = PersistentCognitiveRecordRepository(session_factory)
 
     async def advise(
         self,
@@ -67,13 +79,8 @@ class PersistentHermesRunAdvisor:
             for lesson in await self._lessons(tenant_id, actor_id)
             if _lesson_is_conversation_advice(lesson) and _lesson_visible_to_actor(lesson, actor_id)
         ]
-        if not lessons:
-            return None
-
         lowered = message.casefold()
         confirmed = [lesson for lesson in lessons if _lesson_is_confirmed(lesson)]
-        if not confirmed:
-            return None
 
         injected: list[tuple[float, int, HermesMemoryInjection, dict[str, object]]] = []
         skipped: list[HermesSkippedMemory] = []
@@ -139,20 +146,66 @@ class PersistentHermesRunAdvisor:
                 )
 
         injected.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        selected_injections = tuple(item[2] for item in injected[:3])
-        selected_skipped = tuple(skipped[:5])
+        cognitive_context = await self._cognitive_context(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            message=message,
+            mode=mode,
+            agent_ids=agent_ids,
+        )
+        selected_injections = [item[2] for item in injected[:3]]
+        selected_ids = {item.id for item in selected_injections}
+        for item in cognitive_context.selected:
+            if len(selected_injections) >= 3:
+                break
+            if item.id in selected_ids:
+                continue
+            selected_injections.append(
+                HermesMemoryInjection(
+                    id=item.id,
+                    summary=item.summary,
+                    memory_type=item.source,
+                    target=item.target,
+                    score=item.score,
+                    reason=item.reason,
+                )
+            )
+            selected_ids.add(item.id)
+        selected_skipped = tuple(
+            [
+                *skipped,
+                *(
+                    HermesSkippedMemory(
+                        id=item.id,
+                        summary=item.summary,
+                        reason=item.reason,
+                        score=item.score,
+                    )
+                    for item in cognitive_context.skipped
+                ),
+            ][:5]
+        )
         if not selected_injections and not conflict_skipped:
             return None
-        best = injected[0][3] if injected else confirmed[0]
-        recommended_mode = _recommended_mode(best, lowered)
-        confidence = injected[0][0] if injected else 0.5
+        best = injected[0][3] if injected else confirmed[0] if confirmed else None
+        recommended_mode = _recommended_mode(best, lowered) if best is not None else _safe_mode(mode)
+        confidence = max(
+            [item[0] for item in injected[:1]]
+            + [item.score for item in cognitive_context.selected[:1]]
+            + [0.5]
+        )
+        reasons = []
+        if best is not None:
+            reasons.append(f"Hermes matched stored lesson {_lesson_id(best)}")
+        if cognitive_context.selected:
+            reasons.append(f"Hermes matched cognitive context {cognitive_context.selected[0].id}")
         return HermesRunAdvice(
             recommended_mode=recommended_mode,
             confidence=confidence,
-            reasons=(f"Hermes matched stored lesson {_lesson_id(best)}",),
+            reasons=tuple(reasons),
             recommended_skills=(),
             requires_approval=policy in {"suggest", "confirm_before_apply"} or confidence < 0.75,
-            injected_memories=selected_injections,
+            injected_memories=tuple(selected_injections),
             skipped_memories=selected_skipped,
         )
 
@@ -273,6 +326,54 @@ class PersistentHermesRunAdvisor:
         )
         async with self._session_factory() as session, session.begin():
             await session.execute(statement)
+
+    async def _cognitive_context(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+    ) -> CognitiveContextRouteResult:
+        try:
+            beliefs = await self._cognitive_repository.list_for_user(
+                BeliefRecord,
+                tenant_id=tenant_id,
+                user_id=actor_id,
+            )
+            relationships = await self._cognitive_repository.list_for_user(
+                RelationshipStateRecord,
+                tenant_id=tenant_id,
+                user_id=actor_id,
+            )
+            worlds = await self._cognitive_repository.list_for_user(
+                WorldStateRecord,
+                tenant_id=tenant_id,
+                user_id=actor_id,
+            )
+            skills = await self._cognitive_repository.list_for_user(
+                SkillCandidateRecord,
+                tenant_id=tenant_id,
+                user_id=actor_id,
+            )
+        except ExperienceRepositoryError:
+            return route_cognitive_context(
+                request=message,
+                mode=mode.value,
+                agent_ids=agent_ids,
+                limit=3,
+            )
+        return route_cognitive_context(
+            request=message,
+            mode=mode.value,
+            agent_ids=agent_ids,
+            beliefs=beliefs,
+            relationship_states=relationships,
+            world_states=worlds,
+            skill_candidates=skills,
+            limit=3,
+        )
 
 
 def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:
@@ -667,6 +768,13 @@ def _recommended_mode(lesson: dict[str, object], lowered_message: str) -> TaskMo
     if any(token in haystack for token in ("direct", "直接")):
         return TaskMode.DIRECT
     return TaskMode.DISPATCH
+
+
+def _safe_mode(mode: TaskMode) -> TaskMode:
+    if mode is TaskMode.AUTO:
+        return TaskMode.DISPATCH
+    return mode
+
 
 def _safe_scheduler_notices(
     notices: tuple[dict[str, object], ...],

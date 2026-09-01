@@ -912,6 +912,145 @@ async def test_runtime_advice_can_inject_root_scoped_cognitive_experience_for_an
     assert advice.injected_memories[0].summary == "根经验：生产烟测先给结论。"
 
 
+@pytest.mark.asyncio
+async def test_runtime_advice_injects_relevant_cognitive_state_without_hermes_lesson() -> None:
+    actor_id = uuid4()
+    tenant_id = uuid4()
+    now = datetime.now(UTC).isoformat()
+    world_state: dict[str, object] = {
+        "id": "world:cubeagent.project",
+        "tenant_id": str(tenant_id),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
+        "scope": "cubeagent.project",
+        "facts": ["CubeAgent 是纯对话 Agent，不直接修改代码 harness。"],
+        "open_items": ["持续学习系统需要接入运行时注入。"],
+        "future_events": ["harness 改造走独立项目。"],
+        "last_verified_at": now,
+        "evidence": [{"source_type": "handoff", "source_id": "HANDOFF", "note": "project boundary"}],
+        "created_at": now,
+        "updated_at": now,
+    }
+    skill_candidate: dict[str, object] = {
+        "id": str(uuid4()),
+        "tenant_id": str(tenant_id),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
+        "name": "runtime-context-injection",
+        "purpose": "持续学习系统命中相关经验后，将少量可信上下文注入运行时。",
+        "steps": ["检索相关 cognitive context。", "只注入可信且相关的少量条目。"],
+        "required_inputs": ["hybrid"],
+        "output_contract": "返回运行时可使用的上下文摘要。",
+        "confidence": 0.84,
+        "evidence": [{"source_type": "experience", "source_id": "exp-context", "note": "worked"}],
+        "contradictions": [],
+        "use_count": 2,
+        "success_count": 2,
+        "failure_count": 0,
+        "last_used_at": None,
+        "last_verified_at": now,
+        "version": 1,
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [],
+            [],
+            [],
+            [FakeRow(world_state)],
+            [FakeRow(skill_candidate)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="继续持续学习系统，注意不要改 harness",
+        mode=TaskMode.HYBRID,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert {item.memory_type for item in advice.injected_memories} >= {"world_state", "skill"}
+    assert any("不要改 harness" in item.summary or "harness" in item.summary for item in advice.injected_memories)
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_bounds_combined_hermes_and_cognitive_context() -> None:
+    actor_id = uuid4()
+    tenant_id = uuid4()
+    now = datetime.now(UTC).isoformat()
+    hermes_lesson = {
+        "id": "hermes_context_limit",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "持续学习系统运行时只注入少量高相关上下文。",
+        "user_summary": "运行时只注入少量高相关上下文。",
+        "tags": ["持续学习", "上下文"],
+        "weight": 10,
+        "source_mode": "hybrid",
+        "applies_to_modes": ["hybrid"],
+        "memory_type": "workflow_strategy",
+        "target": "main_agent",
+        "confidence": 0.9,
+        "noise_risk": 0.05,
+        "created_at": now,
+        "confirmed_at": now,
+    }
+    cognitive_rows: list[dict[str, object]] = [
+        {
+            "id": f"world:cognitive:{index}",
+            "tenant_id": str(tenant_id),
+            "user_id": str(actor_id),
+            "memory_scope": "user",
+            "scope": "cubeagent.cognitive",
+            "facts": [f"持续学习上下文注入规则 {index}。"],
+            "open_items": [],
+            "future_events": [],
+            "last_verified_at": now,
+            "evidence": [{"source_type": "test", "source_id": f"world-{index}", "note": "bounded"}],
+            "created_at": now,
+            "updated_at": now,
+        }
+        for index in range(5)
+    ]
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(hermes_lesson)],
+            [],
+            [],
+            [],
+            [FakeRow(row) for row in cognitive_rows],
+            [],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="持续学习系统上下文注入继续处理",
+        mode=TaskMode.HYBRID,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert len(advice.injected_memories) == 3
+    assert advice.injected_memories[0].id == "hermes_context_limit"
+
+
 def test_successful_runtime_outcome_without_notice_does_not_create_cognitive_candidate() -> None:
     payload = _cognitive_candidate_payload_from_outcome(
         HermesRunOutcome(
