@@ -116,7 +116,12 @@ def _verified_response_usage(
         or usage.completion_tokens > request.max_output_tokens
         or usage.total_tokens > context.token_budget
     ):
-        return None
+        return _estimated_response_usage(
+            text=text,
+            request=request,
+            context=context,
+            prompt_estimate=prompt_estimate,
+        )
     return usage
 
 

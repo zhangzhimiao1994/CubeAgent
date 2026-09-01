@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,7 +76,7 @@ class PersistentHermesRunAdvisor:
         skipped: list[HermesSkippedMemory] = []
         conflict_skipped = False
         for lesson in confirmed:
-            if not _lesson_matches(lowered, lesson, workflow_id):
+            if not _lesson_matches(lowered, lesson, workflow_id, mode=mode, agent_ids=agent_ids):
                 continue
             score = _lesson_relevance_score(
                 lowered,
@@ -161,6 +161,13 @@ class PersistentHermesRunAdvisor:
         lesson_id = f"hermes_run_{uuid4().hex}"
         payload = _outcome_learning_payload(outcome, lesson_id=lesson_id)
         await self._upsert(outcome.tenant_id, lesson_id, payload)
+        cognitive_payload = _cognitive_candidate_payload_from_outcome(outcome)
+        if cognitive_payload is not None:
+            await self._upsert(
+                outcome.tenant_id,
+                str(cognitive_payload["resource_id"]),
+                cognitive_payload,
+            )
 
     async def _enabled(self, tenant_id: UUID) -> bool:
         async with self._session_factory() as session:
@@ -195,16 +202,40 @@ class PersistentHermesRunAdvisor:
 
     async def _lessons(self, tenant_id: UUID) -> list[dict[str, object]]:
         async with self._session_factory() as session:
-            rows = (
+            conversation_rows = (
                 await session.execute(
                     select(AdminResourceRow)
                     .where(AdminResourceRow.tenant_id == tenant_id)
                     .where(AdminResourceRow.kind == "hermes")
+                    .where(AdminResourceRow.resource_id.not_like("cognitive_experience:%"))
+                    .where(
+                        or_(
+                            AdminResourceRow.payload["category"].as_string() == "conversation",
+                            AdminResourceRow.payload["category"].as_string().is_(None),
+                        )
+                    )
+                    .where(AdminResourceRow.payload["confirmed_at"].as_string().is_not(None))
                     .order_by(AdminResourceRow.created_at.desc())
                     .limit(200)
                 )
             ).scalars()
-            return [dict(row.payload) for row in rows]
+            cognitive_rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == tenant_id)
+                    .where(AdminResourceRow.kind == "hermes")
+                    .where(AdminResourceRow.resource_id.like("cognitive_experience:%"))
+                    .where(
+                        AdminResourceRow.payload["status"].as_string().in_(("confirmed", "active"))
+                    )
+                    .where(AdminResourceRow.payload["active_for_runtime"].as_boolean().is_(True))
+                    .order_by(AdminResourceRow.created_at.desc())
+                    .limit(200)
+                )
+            ).scalars()
+            return [dict(row.payload) for row in conversation_rows] + [
+                dict(row.payload) for row in cognitive_rows
+            ]
 
     async def _upsert(self, tenant_id: UUID, resource_id: str, payload: dict[str, object]) -> None:
         statement = (
@@ -312,10 +343,110 @@ def _outcome_learning_payload(
     }
 
 
-def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id: str | None) -> bool:
+def _cognitive_candidate_payload_from_outcome(
+    outcome: HermesRunOutcome,
+) -> dict[str, object] | None:
+    if outcome.status not in {RunStatus.FAILED, RunStatus.CANCELLED}:
+        return None
+    scheduler_notices = _safe_scheduler_notices(outcome.scheduler_notices)
+    if not scheduler_notices:
+        return None
+    experience_id = str(uuid4())
+    mode = "unknown" if outcome.mode is None else outcome.mode.value
+    workflow = outcome.workflow_id or "no-workflow"
+    triggers = _unique_tags(
+        [
+            notice.get("trigger", "")
+            for notice in scheduler_notices
+            if notice.get("trigger")
+        ]
+    )
+    actions = _unique_tags(
+        [
+            notice.get("action", "")
+            for notice in scheduler_notices
+            if notice.get("action")
+        ]
+    )
+    actor_tags = _unique_tags([actor for actor in outcome.agent_ids[:8] if actor])
+    tags = _unique_tags([outcome.status.value, mode, workflow, *triggers, *actions, *actor_tags])
+    summary_trigger = triggers[0] if triggers else "runtime_failure"
+    summary = _compact_sentence(
+        f"{workflow} 工作流在 {mode} 模式出现 {summary_trigger}，需要先按失败信号调整执行策略。",
+        limit=220,
+    )
+    lesson = _compact_sentence(
+        _scheduler_notice_lesson(
+            status=outcome.status.value,
+            mode=mode,
+            workflow=workflow,
+            notices=scheduler_notices,
+        ),
+        limit=900,
+    )
+    strategy = _compact_sentence(
+        "后续遇到相似失败信号时，先保留已有输出并重试；若仍失败，再压缩输入、切换更快或更稳模型、"
+        "拆分大步骤，最后才跳过非关键审查步骤。",
+        limit=360,
+    )
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": experience_id,
+        "kind": "error_handling",
+        "status": "candidate",
+        "summary": summary,
+        "lesson": lesson,
+        "strategy": strategy,
+        "confidence": 0.58,
+        "evidence": [
+            {
+                "source_type": "run",
+                "source_id": str(outcome.run_id),
+                "note": _compact_sentence(
+                    f"{outcome.status.value} outcome with scheduler notices: {', '.join(triggers or actions)}",
+                    limit=512,
+                ),
+            }
+        ],
+        "contradictions": [],
+        "source_run_ids": [str(outcome.run_id)],
+        "source_memory_ids": [],
+        "tags": tags,
+        "applies_to_modes": [] if mode == "unknown" else [mode],
+        "applies_to_agents": actor_tags,
+        "use_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "active_for_runtime": False,
+        "last_used_at": None,
+        "last_verified_at": None,
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "storage_kind": "hermes",
+        "resource_id": f"cognitive_experience:{experience_id}",
+    }
+
+
+def _lesson_matches(
+    lowered_message: str,
+    lesson: dict[str, object],
+    workflow_id: str | None,
+    *,
+    mode: TaskMode,
+    agent_ids: tuple[str, ...],
+) -> bool:
+    if _is_cognitive_experience_payload(lesson):
+        return _cognitive_lesson_matches(
+            lowered_message,
+            lesson,
+            workflow_id,
+            mode=mode,
+            agent_ids=agent_ids,
+        )
     tags = lesson.get("tags")
     if isinstance(tags, list) and any(
-        isinstance(tag, str) and tag.lower() in lowered_message for tag in tags
+        isinstance(tag, str) and _meaningful_tag_matches(tag, lowered_message) for tag in tags
     ):
         return True
     if workflow_id and isinstance(tags, list) and workflow_id in tags:
@@ -326,7 +457,47 @@ def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id
     return any(word and len(word) >= 4 and word in lowered_message for word in text.lower().split())
 
 
+def _cognitive_lesson_matches(
+    lowered_message: str,
+    lesson: dict[str, object],
+    workflow_id: str | None,
+    *,
+    mode: TaskMode,
+    agent_ids: tuple[str, ...],
+) -> bool:
+    if not _lesson_has_evidence(lesson):
+        return False
+    applies = _string_list(lesson.get("applies_to_modes"))
+    if applies and mode.value not in applies:
+        return False
+    assigned_agents = set(agent_ids)
+    applicable_agents = set(_string_list(lesson.get("applies_to_agents")))
+    if assigned_agents and applicable_agents and applicable_agents.isdisjoint(assigned_agents):
+        return False
+    tags = _string_list(lesson.get("tags"))
+    if workflow_id and workflow_id in tags:
+        return True
+    return any(_meaningful_tag_matches(tag, lowered_message) for tag in tags)
+
+
+def _lesson_has_evidence(lesson: dict[str, object]) -> bool:
+    evidence = lesson.get("evidence")
+    return isinstance(evidence, list | tuple) and any(isinstance(item, dict) for item in evidence)
+
+
+def _meaningful_tag_matches(tag: str, lowered_message: str) -> bool:
+    normalized = tag.casefold().strip()
+    if len(normalized) < 2:
+        return False
+    if normalized.isascii() and len(normalized) < 3:
+        return False
+    return normalized in lowered_message
+
+
 def _lesson_id(lesson: dict[str, object]) -> str:
+    resource_id = lesson.get("resource_id")
+    if _is_cognitive_experience_payload(lesson) and isinstance(resource_id, str) and resource_id:
+        return resource_id
     value = lesson.get("id")
     return value if isinstance(value, str) and value else "unknown"
 
@@ -340,11 +511,18 @@ def _lesson_user_summary(lesson: dict[str, object]) -> str:
 
 
 def _lesson_memory_type(lesson: dict[str, object]) -> str:
+    if _is_cognitive_experience_payload(lesson):
+        value = lesson.get("kind")
+        return value if isinstance(value, str) and value else "experience"
     value = lesson.get("memory_type")
     return value if isinstance(value, str) and value else "conversation_advice"
 
 
 def _lesson_target(lesson: dict[str, object]) -> str:
+    if _is_cognitive_experience_payload(lesson):
+        agents = _string_list(lesson.get("applies_to_agents"))
+        if agents:
+            return agents[0]
     value = lesson.get("target")
     return value if isinstance(value, str) and value else "main_agent"
 
@@ -391,9 +569,9 @@ def _lesson_relevance_score(
 ) -> float:
     score = 0.0
     tags = _string_list(lesson.get("tags"))
-    if _lesson_matches(lowered_message, lesson, workflow_id):
+    if _lesson_matches(lowered_message, lesson, workflow_id, mode=mode, agent_ids=agent_ids):
         score += 0.35
-    if any(tag.casefold() in lowered_message for tag in tags):
+    if any(_meaningful_tag_matches(tag, lowered_message) for tag in tags):
         score += 0.2
     if workflow_id and workflow_id in tags:
         score += 0.1
@@ -429,8 +607,15 @@ def _lesson_injection_reason(lesson: dict[str, object], score: float) -> str:
 
 
 def _lesson_is_confirmed(lesson: dict[str, object]) -> bool:
+    if _is_cognitive_experience_payload(lesson):
+        return lesson.get("status") in {"confirmed", "active"} and lesson.get("active_for_runtime") is True
     confirmed_at = lesson.get("confirmed_at")
     return isinstance(confirmed_at, str) and bool(confirmed_at.strip())
+
+
+def _is_cognitive_experience_payload(lesson: dict[str, object]) -> bool:
+    resource_id = lesson.get("resource_id")
+    return isinstance(resource_id, str) and resource_id.startswith("cognitive_experience:")
 
 
 def _lesson_weight(lesson: dict[str, object]) -> int:

@@ -9,7 +9,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
-from agent_hub.runtime.direct import DirectRuntime, RuntimeExecutionError
+from agent_hub.runtime.direct import DirectRuntime
 
 
 class UnusedGateway:
@@ -156,19 +156,23 @@ async def test_direct_runtime_uses_request_budget_when_usage_less_chinese_text_i
 
 
 @pytest.mark.asyncio
-async def test_direct_runtime_still_rejects_inconsistent_provider_usage() -> None:
+async def test_direct_runtime_completes_with_conservative_budget_when_provider_usage_is_inconsistent() -> None:
     runtime = DirectRuntime(InvalidUsageGateway(), logical_model="main")
 
-    with pytest.raises(RuntimeExecutionError, match="model response budget is unverifiable"):
-        _ = [
-            event
-            async for event in runtime.run(
-                TaskContext(
-                    run_id=uuid4(),
-                    tenant_id=uuid4(),
-                    mode=TaskMode.DIRECT,
-                    request="给出一个简短回答",
-                    token_budget=20_000,
-                )
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="给出一个简短回答",
+                token_budget=20_000,
             )
-        ]
+        )
+    ]
+
+    artifact_event = next(event for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact_event.artifact is not None
+    assert artifact_event.artifact.content["text"] == "这是一个有效文本，但 usage 不可信。"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED

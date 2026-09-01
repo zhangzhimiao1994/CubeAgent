@@ -875,15 +875,15 @@ async def test_invalid_model_text_is_redacted() -> None:
     "usage",
     [TokenUsage(1, 1000, 1001), TokenUsage(1000, 1, 1001)],
 )
-async def test_direct_fails_closed_when_usage_cannot_prove_budget(
+async def test_direct_uses_conservative_budget_when_provider_usage_is_inconsistent(
     usage: TokenUsage,
 ) -> None:
     gateway = FakeGateway(ModelResponse(text="answer", usage=usage))
     runtime = DirectRuntime(gateway, logical_model="general")
-    with pytest.raises(RuntimeExecutionError, match="budget"):
-        await collect(runtime, context(token_budget=1000))
-    with pytest.raises(RuntimeExecutionError, match="boundary"):
-        await runtime.save_checkpoint()
+
+    events = await collect(runtime, context(token_budget=1000))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_direct_accepts_usage_less_response_when_request_budget_is_bounded() -> None:

@@ -208,6 +208,43 @@ const secondHermesInsight = {
   created_at: "2026-08-07T00:06:00Z",
 };
 
+const cognitiveExperience = {
+  id: "exp_11111111111111111111111111111111",
+  resource_id: "cognitive_experience:11111111-1111-4111-8111-111111111111",
+  kind: "communication_style",
+  status: "candidate",
+  summary: "用户明确要求先给结论，再给必要证据。",
+  lesson: "When the user asks for project status, avoid long process logs and answer with a concise status plus evidence.",
+  strategy: "项目状态类问题先输出当前结论、阻塞项和下一步，不要堆叠完整运行轨迹。",
+  confidence: 0.72,
+  evidence: [
+    {
+      source_type: "hermes_feedback",
+      source_id: hermesInsight.id,
+      note: "用户纠正过调度报告过长，需要摘要化。",
+      created_at: "2026-08-07T00:04:00Z",
+    },
+  ],
+  source_run_ids: [runId],
+  source_memory_ids: [],
+  source_conversation_ids: ["conv-architecture-1"],
+  applies_to_modes: ["auto"],
+  applies_to_agents: ["main_agent"],
+  tags: ["summary", "status"],
+  contradictions: [],
+  use_count: 0,
+  success_count: 0,
+  failure_count: 0,
+  contradiction_count: 0,
+  active_for_runtime: false,
+  last_used_at: null,
+  created_at: "2026-08-07T00:08:00Z",
+  updated_at: "2026-08-07T00:08:00Z",
+  last_verified_at: null,
+  version: 1,
+  storage_kind: "hermes",
+};
+
 const agents = [
   {
     id: "director",
@@ -384,6 +421,7 @@ describe("operational management pages", () => {
   let deletedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
+  let visibleCognitiveExperiences = [cognitiveExperience];
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
   let skillUploadConflict = false;
@@ -401,6 +439,7 @@ describe("operational management pages", () => {
     deletedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
+    visibleCognitiveExperiences = [cognitiveExperience];
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     skillUploadConflict = false;
@@ -953,6 +992,15 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/hermes") {
           return jsonResponse([hermesInsight, secondHermesInsight].filter((item) => !deletedHermesIds.has(item.id)));
+        }
+        if (path === "/api/v1/admin/cognitive/experiences") {
+          return jsonResponse(visibleCognitiveExperiences);
+        }
+        if (path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/confirm` && method === "POST") {
+          return jsonResponse({ ...cognitiveExperience, status: "confirmed", active_for_runtime: true });
+        }
+        if (path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/reject` && method === "POST") {
+          return jsonResponse({ ...cognitiveExperience, status: "rejected", active_for_runtime: false });
         }
         if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111" && method === "DELETE") {
           deletedHermesIds.add("hermes_run_11111111111111111111111111111111");
@@ -3770,6 +3818,47 @@ describe("operational management pages", () => {
       }),
     );
   });
+
+  it("shows reusable experience candidates and lets operators confirm or reject them", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
+    expect(within(experienceSection).getByText("用户明确要求先给结论，再给必要证据。")).not.toBeNull();
+    expect(within(experienceSection).getByText("项目状态类问题先输出当前结论、阻塞项和下一步，不要堆叠完整运行轨迹。")).not.toBeNull();
+    expect(within(experienceSection).getByText("72%")).not.toBeNull();
+
+    await user.click(within(experienceSection).getByRole("button", { name: "确认" }));
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/confirm`)).toMatchObject({
+        method: "POST",
+      }),
+    );
+
+    await user.click(within(experienceSection).getByRole("button", { name: "拒绝" }));
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/reject`)).toMatchObject({
+        method: "POST",
+      }),
+    );
+  });
+
+  it("shows an empty reusable-experience state when only inactive experiences are returned", async () => {
+    visibleCognitiveExperiences = [
+      { ...cognitiveExperience, id: "rejected-exp", status: "rejected", active_for_runtime: false },
+      { ...cognitiveExperience, id: "deprecated-exp", status: "deprecated", active_for_runtime: false },
+      { ...cognitiveExperience, id: "superseded-exp", status: "superseded", active_for_runtime: false },
+    ];
+    render(<TestApp initialPath="/hermes" />);
+
+    const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
+
+    expect(within(experienceSection).getByText("暂无经验候选")).not.toBeNull();
+    expect(within(experienceSection).queryByText("已拒绝")).toBeNull();
+    expect(within(experienceSection).queryByText("已淘汰")).toBeNull();
+    expect(within(experienceSection).queryByText("已被替代")).toBeNull();
+  });
+
   it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);

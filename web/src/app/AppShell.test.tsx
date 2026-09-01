@@ -34,6 +34,7 @@ describe("AppShell presentation", () => {
         if (path === "/api/v1/admin/agents") return jsonResponse([]);
         if (path === "/api/v1/admin/workflows") return jsonResponse([]);
         if (path === "/api/v1/admin/hermes") return jsonResponse([]);
+        if (path === "/api/v1/admin/cognitive/experiences") return jsonResponse([]);
         if (path === "/api/v1/admin/settings") {
           return jsonResponse({
             default_mode: "auto",

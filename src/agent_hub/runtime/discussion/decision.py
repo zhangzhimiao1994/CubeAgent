@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -92,7 +93,7 @@ class ResolutionRequest:
     verified_option_id: str | None = None
 
     def __post_init__(self) -> None:
-        _require_bounded_text("task", self.task)
+        _require_bounded_text("task", self.task, allow_newlines=True, allow_tabs=True)
         if type(self.disagreement_kind) is not DisagreementKind:
             raise ValueError("disagreement_kind is invalid")
         if type(self.high_risk) is not bool:
@@ -335,12 +336,25 @@ def _require_bounded_text(
     *,
     max_length: int = _MAX_TEXT,
     allow_newlines: bool = False,
+    allow_tabs: bool = False,
 ) -> None:
     if type(value) is not str or not value or value != value.strip() or len(value) > max_length:
         raise ValueError(f"{name} must be nonblank, unpadded, and bounded")
-    allowed_controls = {"\n"} if allow_newlines else set()
-    if any(ord(character) < 32 and character not in allowed_controls for character in value):
+    allowed_controls = set()
+    if allow_newlines:
+        allowed_controls.add("\n")
+    if allow_tabs:
+        allowed_controls.add("\t")
+    if any(_is_disallowed_control_character(character, allowed_controls) for character in value):
         raise ValueError(f"{name} must not contain control characters")
+
+
+def _is_disallowed_control_character(character: str, allowed_controls: set[str]) -> bool:
+    if character in allowed_controls:
+        return False
+    if ord(character) < 32 or ord(character) == 127:
+        return True
+    return unicodedata.category(character) == "Cf"
 
 
 def _normalize_text_tuple(

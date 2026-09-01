@@ -3,7 +3,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { useNavSection } from "../app/navSections";
-import { api, formatApiError, type HermesInsight } from "../api/client";
+import { api, formatApiError, type CognitiveExperience, type HermesInsight } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 type HermesSortKey = "created" | "category" | "conversation" | "user_summary" | "outcome" | "status";
@@ -39,6 +39,36 @@ function statusLabel(confirmedAt: string | null) {
 
 function categoryLabel(category: HermesInsight["category"]) {
   return category === "scheduler" ? "调度观察" : "对话记忆";
+}
+
+function cognitiveKindLabel(kind: CognitiveExperience["kind"]) {
+  const labels: Record<CognitiveExperience["kind"], string> = {
+    user_preference: "用户偏好",
+    project_fact: "项目事实",
+    workflow_strategy: "工作流策略",
+    error_handling: "错误处理",
+    ui_rule: "界面规则",
+    communication_style: "沟通风格",
+    tooling_strategy: "工具策略",
+    domain_pattern: "领域模式",
+  };
+  return labels[kind];
+}
+
+function cognitiveStatusLabel(status: CognitiveExperience["status"]) {
+  const labels: Record<CognitiveExperience["status"], string> = {
+    candidate: "待确认",
+    confirmed: "已确认",
+    active: "生效中",
+    superseded: "已被替代",
+    deprecated: "已淘汰",
+    rejected: "已拒绝",
+  };
+  return labels[status];
+}
+
+function cognitiveSummary(item: CognitiveExperience) {
+  return item.summary.trim() || item.lesson.trim() || "未命名经验";
 }
 
 function normalizeCategory(value: string | null): HermesColumnFilters["category"] {
@@ -142,6 +172,10 @@ function HermesLearningTable() {
     queryKey: ["hermes"],
     queryFn: () => api.hermesInsights(),
   });
+  const cognitiveExperiences = useQuery({
+    queryKey: ["cognitive", "experiences"],
+    queryFn: () => api.cognitiveExperiences(),
+  });
   const feedback = useMutation({
     mutationFn: () =>
       api.recordHermesFeedback({
@@ -155,6 +189,7 @@ function HermesLearningTable() {
     onSuccess: async () => {
       setConversationId("");
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
     },
   });
   const bulkConfirm = useMutation({
@@ -182,6 +217,24 @@ function HermesLearningTable() {
     onSuccess: async (_result, id) => {
       setSelectedIds((current) => current.filter((item) => item !== id));
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
+  const confirmExperience = useMutation({
+    mutationFn: (id: string) => api.confirmCognitiveExperience(id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
+    },
+  });
+  const rejectExperience = useMutation({
+    mutationFn: (id: string) => api.rejectCognitiveExperience(id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
+    },
+  });
+  const deleteExperience = useMutation({
+    mutationFn: (id: string) => api.deleteCognitiveExperience(id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
     },
   });
 
@@ -213,9 +266,12 @@ function HermesLearningTable() {
     bulkDelete.mutate(ids);
   }
 
-  if (insights.isLoading) return <p>正在加载 Hermes...</p>;
+  if (insights.isLoading || cognitiveExperiences.isLoading) return <p>正在加载 Hermes...</p>;
   if (insights.isError) {
     return <p role="alert">{formatApiError(insights.error, "Hermes 加载失败")}</p>;
+  }
+  if (cognitiveExperiences.isError) {
+    return <p role="alert">{formatApiError(cognitiveExperiences.error, "经验候选加载失败")}</p>;
   }
 
   const items = insights.data ?? [];
@@ -228,7 +284,17 @@ function HermesLearningTable() {
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
   const allVisibleConfirmableSelected =
     visibleConfirmableIds.length > 0 && visibleConfirmableIds.every((id) => selectedIds.includes(id));
-  const busy = bulkConfirm.isPending || bulkDelete.isPending || confirmInsight.isPending || deleteInsight.isPending;
+  const experienceItems = cognitiveExperiences.data ?? [];
+  const candidateExperiences = experienceItems.filter((item) => item.status === "candidate");
+  const activeExperiences = experienceItems.filter((item) => item.active_for_runtime);
+  const visibleExperiences = [...candidateExperiences, ...activeExperiences].slice(0, 12);
+  const experienceBusy = confirmExperience.isPending || rejectExperience.isPending || deleteExperience.isPending;
+  const busy =
+    bulkConfirm.isPending ||
+    bulkDelete.isPending ||
+    confirmInsight.isPending ||
+    deleteInsight.isPending ||
+    experienceBusy;
   const ledgerNavSection = activeSection ?? "ledger";
 
   return (
@@ -239,6 +305,76 @@ function HermesLearningTable() {
         Hermes 是独立学习模块。它按时间和对话 ID 记录运行经验，外层以表格展示，
         点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
       </p>
+
+      <section aria-label="Cognitive 经验候选">
+        <h3>经验候选</h3>
+        <p>
+          这里显示由 Hermes+ 进一步抽象出的可复用经验。只有确认后的经验才会参与后续运行时注入；
+          调度观察和普通聊天记录不会自动变成经验。
+        </p>
+        {confirmExperience.isError ? <p role="alert">{formatApiError(confirmExperience.error, "经验确认失败")}</p> : null}
+        {rejectExperience.isError ? <p role="alert">{formatApiError(rejectExperience.error, "经验拒绝失败")}</p> : null}
+        {deleteExperience.isError ? <p role="alert">{formatApiError(deleteExperience.error, "经验删除失败")}</p> : null}
+        {visibleExperiences.length === 0 ? (
+          <article>
+            <h4>暂无经验候选</h4>
+            <p>当用户反馈、失败复盘或成功模式具备长期价值时，系统会在这里生成待确认经验。</p>
+          </article>
+        ) : (
+          <div className="card-grid compact-grid">
+            {visibleExperiences.map((item) => (
+              <article key={item.id} className="compact-card">
+                <span className="eyebrow">{cognitiveKindLabel(item.kind)} · {cognitiveStatusLabel(item.status)}</span>
+                <h4>{cognitiveSummary(item)}</h4>
+                <p>{item.strategy}</p>
+                <dl className="detail-list compact-detail-list">
+                  <div>
+                    <dt>置信度</dt>
+                    <dd>{Math.round(item.confidence * 100)}%</dd>
+                  </div>
+                  <div>
+                    <dt>使用</dt>
+                    <dd>{item.use_count} 次，成功 {item.success_count} / 失败 {item.failure_count}</dd>
+                  </div>
+                  <div>
+                    <dt>适用模式</dt>
+                    <dd>{item.applies_to_modes.join(", ") || "自动判断"}</dd>
+                  </div>
+                </dl>
+                <div className="inline-actions">
+                  {item.status === "candidate" ? (
+                    <>
+                      <button type="button" disabled={experienceBusy} onClick={() => confirmExperience.mutate(item.id)}>
+                        {confirmExperience.isPending ? "确认中..." : "确认"}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        disabled={experienceBusy}
+                        onClick={() => rejectExperience.mutate(item.id)}
+                      >
+                        拒绝
+                      </button>
+                    </>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="danger-action"
+                    disabled={experienceBusy}
+                    onClick={() => {
+                      if (window.confirm("确认删除这条经验？删除后不会再进入运行时注入。")) {
+                        deleteExperience.mutate(item.id);
+                      }
+                    }}
+                  >
+                    删除
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section aria-label="Hermes 学习台账" {...navTargetProps(ledgerNavSection)}>
         <h3>学习台账</h3>

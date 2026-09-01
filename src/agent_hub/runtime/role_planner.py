@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -1652,8 +1653,16 @@ def _require_identifier(name: str, value: str) -> str:
 def _require_text(name: str, value: str) -> None:
     if type(value) is not str or not value or value != value.strip() or len(value) > _MAX_TEXT:
         raise ValueError(f"{name} must be nonblank, unpadded, and bounded")
-    if any(ord(character) < 32 for character in value):
+    if any(_is_disallowed_control_character(character) for character in value):
         raise ValueError(f"{name} must not contain control characters")
+
+
+def _is_disallowed_control_character(character: str) -> bool:
+    if character in {"\n", "\t"}:
+        return False
+    if ord(character) < 32 or ord(character) == 127:
+        return True
+    return unicodedata.category(character) == "Cf"
 
 
 def _normalize_tuple(name: str, values: tuple[str, ...], *, min_length: int = 0) -> tuple[str, ...]:

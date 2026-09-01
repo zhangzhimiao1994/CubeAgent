@@ -10,6 +10,7 @@ import re
 import shlex
 import stat
 import tarfile
+import unicodedata
 import zipfile
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
+from agent_hub.cognitive.types import ExperienceKind, ExperienceStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -1678,6 +1680,40 @@ class HermesRecommendationResponse(BaseModel):
 
 
 _HERMES_BULK_ACTION_LIMIT = 1000
+_COGNITIVE_EXPERIENCE_PREFIX = "cognitive_experience:"
+
+
+def _clean_cognitive_text(value: str) -> str:
+    if value != value.strip():
+        raise ValueError("cognitive text must be unpadded")
+    if any(
+        (ord(ch) < 32 and ch not in "\n\t") or ord(ch) == 127 or unicodedata.category(ch) == "Cf"
+        for ch in value
+    ):
+        raise ValueError("cognitive text must be printable")
+    return value
+
+
+def _clean_cognitive_string_items(value: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalized = _clean_cognitive_text(item)
+        if len(normalized) > 128:
+            raise ValueError("cognitive identifiers must be bounded")
+        if normalized not in seen:
+            seen.add(normalized)
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _ensure_cognitive_experience_confirmable(experience: CognitiveExperienceResponse) -> None:
+    if not experience.evidence:
+        raise PublicAPIError(
+            422,
+            "cognitive_experience_missing_evidence",
+            "Cognitive experience requires evidence before it can be confirmed",
+        )
 
 
 class HermesBulkConfirmRequest(BaseModel):
@@ -1715,6 +1751,76 @@ class HermesBulkDeleteResponse(BaseModel):
 
     deleted: list[str]
     failed: list[BulkFailureResponse]
+
+
+class CognitiveEvidencePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: str = Field(min_length=1, max_length=48)
+    source_id: str = Field(min_length=1, max_length=128)
+    note: str = Field(min_length=1, max_length=512)
+
+    @field_validator("source_type", "source_id", "note")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return _clean_cognitive_text(value)
+
+
+class CognitiveExperienceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ExperienceKind
+    summary: str = Field(min_length=1, max_length=240)
+    lesson: str = Field(min_length=1, max_length=1200)
+    strategy: str = Field(min_length=1, max_length=1200)
+    confidence: float = Field(default=0.62, ge=0, le=1)
+    evidence: list[CognitiveEvidencePayload] = Field(min_length=1, max_length=12)
+    contradictions: list[CognitiveEvidencePayload] = Field(default_factory=list, max_length=12)
+    source_run_ids: list[str] = Field(default_factory=list, max_length=24)
+    source_memory_ids: list[str] = Field(default_factory=list, max_length=24)
+    tags: list[str] = Field(default_factory=list, max_length=24)
+    applies_to_modes: list[str] = Field(default_factory=list, max_length=12)
+    applies_to_agents: list[str] = Field(default_factory=list, max_length=24)
+
+    @field_validator("summary", "lesson", "strategy")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return _clean_cognitive_text(value)
+
+    @field_validator("source_run_ids", "source_memory_ids", "tags", "applies_to_modes", "applies_to_agents")
+    @classmethod
+    def clean_string_items(cls, value: list[str]) -> list[str]:
+        return _clean_cognitive_string_items(value)
+
+
+class CognitiveExperienceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: ExperienceKind
+    status: ExperienceStatus
+    summary: str
+    lesson: str
+    strategy: str
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[CognitiveEvidencePayload]
+    contradictions: list[CognitiveEvidencePayload]
+    source_run_ids: list[str]
+    source_memory_ids: list[str]
+    tags: list[str]
+    applies_to_modes: list[str]
+    applies_to_agents: list[str]
+    use_count: int = Field(ge=0)
+    success_count: int = Field(ge=0)
+    failure_count: int = Field(ge=0)
+    active_for_runtime: bool
+    last_used_at: datetime | None
+    last_verified_at: datetime | None
+    version: int = Field(ge=1)
+    created_at: datetime
+    updated_at: datetime
+    storage_kind: str = "hermes"
+    resource_id: str
 
 
 class AdminResourceService(Protocol):
@@ -1960,6 +2066,22 @@ class AdminResourceService(Protocol):
     async def recommend_with_hermes(
         self, request: HermesRecommendationRequest
     ) -> HermesRecommendationResponse: ...
+
+    async def list_cognitive_experiences(self) -> tuple[CognitiveExperienceResponse, ...]: ...
+
+    async def create_cognitive_experience(
+        self, request: CognitiveExperienceCreateRequest
+    ) -> CognitiveExperienceResponse: ...
+
+    async def confirm_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse: ...
+
+    async def reject_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse: ...
+
+    async def delete_cognitive_experience(self, experience_id: UUID) -> None: ...
 
 
 _SKILL_MANIFEST_NAMES = frozenset({"skill.yaml", "skill.yml", "skill.json"})
@@ -2705,6 +2827,7 @@ class InMemoryAdminResourceService:
     audit_events: list[AuditEventResponse] = field(default_factory=list)
     logs: list[LogEntryResponse] = field(default_factory=list)
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
+    cognitive_experiences: dict[str, CognitiveExperienceResponse] = field(default_factory=dict)
     openclaw_operations: dict[str, OpenClawOperationResponse] = field(default_factory=dict)
     openclaw_sessions: dict[str, OpenClawSessionResponse] = field(default_factory=dict)
     evolution_runs: dict[str, EvolutionRunResponse] = field(default_factory=dict)
@@ -3725,6 +3848,9 @@ class InMemoryAdminResourceService:
             created_at=datetime.now(UTC),
         )
         self.hermes_insights[insight.id] = insight
+        experience_request = _cognitive_experience_request_from_hermes_feedback(insight)
+        if experience_request is not None:
+            await self.create_cognitive_experience(experience_request)
         return insight
 
     async def recommend_with_hermes(
@@ -3781,6 +3907,58 @@ class InMemoryAdminResourceService:
             reasons=reasons,
             requires_approval=False,
         )
+
+    async def list_cognitive_experiences(self) -> tuple[CognitiveExperienceResponse, ...]:
+        return tuple(
+            sorted(self.cognitive_experiences.values(), key=lambda item: item.created_at)
+        )
+
+    async def create_cognitive_experience(
+        self, request: CognitiveExperienceCreateRequest
+    ) -> CognitiveExperienceResponse:
+        now = datetime.now(UTC)
+        experience_id = uuid4()
+        response = _cognitive_experience_response(
+            experience_id=experience_id,
+            request=request,
+            status=ExperienceStatus.CANDIDATE,
+            created_at=now,
+            updated_at=now,
+        )
+        self.cognitive_experiences[str(experience_id)] = response
+        return response
+
+    async def confirm_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse:
+        current = self.cognitive_experiences[str(experience_id)]
+        _ensure_cognitive_experience_confirmable(current)
+        updated = current.model_copy(
+            update={
+                "status": ExperienceStatus.CONFIRMED,
+                "active_for_runtime": True,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.cognitive_experiences[str(experience_id)] = updated
+        return updated
+
+    async def reject_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse:
+        current = self.cognitive_experiences[str(experience_id)]
+        updated = current.model_copy(
+            update={
+                "status": ExperienceStatus.REJECTED,
+                "active_for_runtime": False,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.cognitive_experiences[str(experience_id)] = updated
+        return updated
+
+    async def delete_cognitive_experience(self, experience_id: UUID) -> None:
+        del self.cognitive_experiences[str(experience_id)]
 
 
 class PersistentAdminResourceService(InMemoryAdminResourceService):
@@ -5322,10 +5500,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(sorted(entries, key=lambda entry: entry.created_at, reverse=True))
 
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]:
-        resources = await self._list_admin_payloads("hermes")
-        if resources is None:
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
             return await super().list_hermes_insights()
-        return tuple(_hermes_response_from_payload(payload) for payload in resources)
+        return tuple(
+            _hermes_response_from_payload(payload)
+            for resource_id, payload, _created_at, _updated_at in rows
+            if not resource_id.startswith(_COGNITIVE_EXPERIENCE_PREFIX)
+        )
 
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
@@ -5391,6 +5573,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         ):
             return await super().record_hermes_feedback(request)
         await self._record_audit("hermes.feedback", f"hermes:{insight_id}", {"id": insight_id})
+        experience_request = _cognitive_experience_request_from_hermes_feedback(response)
+        if experience_request is not None:
+            await self.create_cognitive_experience(experience_request)
         return response
 
     async def recommend_with_hermes(
@@ -5435,6 +5620,96 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             confidence=min(0.95, 0.45 + best.weight / 20),
             reasons=[f"Hermes lesson matched: {best.lesson}"],
             requires_approval=True,
+        )
+
+    async def list_cognitive_experiences(self) -> tuple[CognitiveExperienceResponse, ...]:
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
+            return await super().list_cognitive_experiences()
+        responses: list[CognitiveExperienceResponse] = []
+        for resource_id, payload, _created_at, _updated_at in rows:
+            if not resource_id.startswith(_COGNITIVE_EXPERIENCE_PREFIX):
+                continue
+            responses.append(_cognitive_experience_from_payload(payload, resource_id=resource_id))
+        return tuple(sorted(responses, key=lambda item: item.created_at))
+
+    async def create_cognitive_experience(
+        self, request: CognitiveExperienceCreateRequest
+    ) -> CognitiveExperienceResponse:
+        now = datetime.now(UTC)
+        experience_id = uuid4()
+        response = _cognitive_experience_response(
+            experience_id=experience_id,
+            request=request,
+            status=ExperienceStatus.CANDIDATE,
+            created_at=now,
+            updated_at=now,
+        )
+        await self._upsert_admin_payload("hermes", response.resource_id, response.model_dump(mode="json"))
+        await self._record_audit(
+            "cognitive.experience.create",
+            response.resource_id,
+            {"id": response.id, "kind": response.kind.value},
+        )
+        return response
+
+    async def confirm_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse:
+        current = await self._get_cognitive_experience(experience_id)
+        _ensure_cognitive_experience_confirmable(current)
+        updated = current.model_copy(
+            update={
+                "status": ExperienceStatus.CONFIRMED,
+                "active_for_runtime": True,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
+        await self._record_audit(
+            "cognitive.experience.confirm",
+            updated.resource_id,
+            {"id": updated.id},
+        )
+        return updated
+
+    async def reject_cognitive_experience(
+        self, experience_id: UUID
+    ) -> CognitiveExperienceResponse:
+        current = await self._get_cognitive_experience(experience_id)
+        updated = current.model_copy(
+            update={
+                "status": ExperienceStatus.REJECTED,
+                "active_for_runtime": False,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
+        await self._record_audit(
+            "cognitive.experience.reject",
+            updated.resource_id,
+            {"id": updated.id},
+        )
+        return updated
+
+    async def delete_cognitive_experience(self, experience_id: UUID) -> None:
+        current = await self._get_cognitive_experience(experience_id)
+        result = await self._delete_admin_payload("hermes", current.resource_id)
+        if result is False:
+            raise KeyError(str(experience_id))
+        await self._record_audit(
+            "cognitive.experience.delete",
+            current.resource_id,
+            {"id": current.id},
+        )
+
+    async def _get_cognitive_experience(self, experience_id: UUID) -> CognitiveExperienceResponse:
+        payload = await self._get_admin_payload("hermes", _cognitive_experience_resource_id(experience_id))
+        if not payload:
+            raise KeyError(str(experience_id))
+        return _cognitive_experience_from_payload(
+            payload,
+            resource_id=_cognitive_experience_resource_id(experience_id),
         )
 
     async def _mode_error_logs_from_repository(self) -> tuple[LogEntryResponse, ...]:
@@ -6619,6 +6894,229 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
         tags=normalized_tags,
         weight=weight,
         created_at=_datetime_from_json(payload.get("created_at")),
+    )
+
+
+def _cognitive_experience_resource_id(experience_id: UUID | str) -> str:
+    return f"{_COGNITIVE_EXPERIENCE_PREFIX}{experience_id}"
+
+
+def _cognitive_experience_request_from_hermes_feedback(
+    insight: HermesInsightResponse,
+) -> CognitiveExperienceCreateRequest | None:
+    if not insight.lesson.strip():
+        return None
+    localized_lesson = _localized_hermes_lesson(insight.lesson)
+    source_label = "运行观察" if insight.category == "scheduler" else "对话反馈"
+    kind = _cognitive_kind_from_hermes_feedback(insight)
+    return CognitiveExperienceCreateRequest(
+        kind=kind,
+        summary=_compact_cognitive_text(f"{source_label}经验：{localized_lesson}", limit=240),
+        lesson=_compact_cognitive_text(localized_lesson, limit=1200),
+        strategy=_cognitive_strategy_from_hermes_feedback(insight),
+        confidence=min(0.82, 0.48 + insight.weight * 0.035),
+        evidence=[
+            CognitiveEvidencePayload(
+                source_type="hermes_feedback",
+                source_id=insight.id,
+                note=_compact_cognitive_text(insight.user_summary, limit=512),
+            )
+        ],
+        source_run_ids=[str(insight.run_id)] if insight.run_id is not None else [],
+        source_memory_ids=[insight.id],
+        tags=_bounded_string_list(insight.tags, limit=24),
+        applies_to_modes=_mode_tags_from_hermes(insight.tags),
+        applies_to_agents=_agent_tags_from_hermes(insight.tags),
+    )
+
+
+def _cognitive_kind_from_hermes_feedback(insight: HermesInsightResponse) -> ExperienceKind:
+    if insight.outcome == "failure":
+        return ExperienceKind.ERROR_HANDLING
+    if insight.category == "scheduler":
+        return ExperienceKind.WORKFLOW_STRATEGY
+    if any(tag.casefold() in {"ui", "ux", "frontend", "界面", "交互"} for tag in insight.tags):
+        return ExperienceKind.UI_RULE
+    if any(tag.casefold() in {"tool", "tools", "docker", "git", "github"} for tag in insight.tags):
+        return ExperienceKind.TOOLING_STRATEGY
+    return ExperienceKind.COMMUNICATION_STYLE
+
+
+def _cognitive_strategy_from_hermes_feedback(insight: HermesInsightResponse) -> str:
+    if insight.outcome == "failure":
+        prefix = "后续遇到相似失败信号时，先规避已知失败路径，再压缩输入、分块处理或改用更稳妥的模式。"
+    elif insight.outcome == "success":
+        prefix = "后续遇到相似目标时，优先复用这条已验证做法，并在用户反馈冲突时降低置信度。"
+    else:
+        prefix = "后续遇到相似上下文时，将这条观察作为弱信号参考，不单独决定行为。"
+    return _compact_cognitive_text(f"{prefix} 原始经验：{_localized_hermes_lesson(insight.lesson)}", limit=1200)
+
+
+def _mode_tags_from_hermes(tags: list[str]) -> list[str]:
+    allowed = {"direct", "dispatch", "hybrid", "group_chat", "discuss", "relay"}
+    return [tag for tag in _bounded_string_list(tags, limit=12) if tag.casefold() in allowed]
+
+
+def _agent_tags_from_hermes(tags: list[str]) -> list[str]:
+    result: list[str] = []
+    for tag in _bounded_string_list(tags, limit=24):
+        lowered = tag.casefold()
+        if lowered.endswith("_agent") or "reviewer" in lowered or "moderator" in lowered:
+            result.append(tag)
+    return result[:12]
+
+
+def _bounded_string_list(values: list[str], *, limit: int) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        cleaned = _compact_cognitive_text(value, limit=128)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _compact_cognitive_text(value: str, *, limit: int) -> str:
+    cleaned = " ".join(value.strip().split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 1].rstrip()}…"
+
+
+def _cognitive_experience_response(
+    *,
+    experience_id: UUID,
+    request: CognitiveExperienceCreateRequest,
+    status: ExperienceStatus,
+    created_at: datetime,
+    updated_at: datetime,
+) -> CognitiveExperienceResponse:
+    return CognitiveExperienceResponse(
+        id=str(experience_id),
+        kind=request.kind,
+        status=status,
+        summary=request.summary,
+        lesson=request.lesson,
+        strategy=request.strategy,
+        confidence=request.confidence,
+        evidence=list(request.evidence),
+        contradictions=list(request.contradictions),
+        source_run_ids=list(request.source_run_ids),
+        source_memory_ids=list(request.source_memory_ids),
+        tags=list(request.tags),
+        applies_to_modes=list(request.applies_to_modes),
+        applies_to_agents=list(request.applies_to_agents),
+        use_count=0,
+        success_count=0,
+        failure_count=0,
+        active_for_runtime=status in {ExperienceStatus.CONFIRMED, ExperienceStatus.ACTIVE},
+        last_used_at=None,
+        last_verified_at=None,
+        version=1,
+        created_at=created_at,
+        updated_at=updated_at,
+        storage_kind="hermes",
+        resource_id=_cognitive_experience_resource_id(experience_id),
+    )
+
+
+def _cognitive_evidence_payloads(value: object) -> list[CognitiveEvidencePayload]:
+    if not isinstance(value, list):
+        return []
+    result: list[CognitiveEvidencePayload] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            result.append(CognitiveEvidencePayload.model_validate(dict(item)))
+        except ValidationError:
+            continue
+    return result
+
+
+def _string_list_from_payload(value: object, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item)[:512] for item in value[:limit] if isinstance(item, str) and item.strip()]
+
+
+def _int_from_payload(value: object, *, default: int = 0) -> int:
+    return value if type(value) is int and value >= 0 else default
+
+
+def _float_from_payload(value: object, *, default: float = 0.0) -> float:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return max(0.0, min(1.0, float(value)))
+    return default
+
+
+def _experience_kind_from_payload(value: object) -> ExperienceKind:
+    if isinstance(value, ExperienceKind):
+        return value
+    if isinstance(value, str):
+        try:
+            return ExperienceKind(value)
+        except ValueError:
+            return ExperienceKind.USER_PREFERENCE
+    return ExperienceKind.USER_PREFERENCE
+
+
+def _experience_status_from_payload(value: object) -> ExperienceStatus:
+    if isinstance(value, ExperienceStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return ExperienceStatus(value)
+        except ValueError:
+            return ExperienceStatus.CANDIDATE
+    return ExperienceStatus.CANDIDATE
+
+
+def _cognitive_experience_from_payload(
+    payload: dict[str, object],
+    *,
+    resource_id: str,
+) -> CognitiveExperienceResponse:
+    raw_id = payload.get("id")
+    experience_id = raw_id if isinstance(raw_id, str) and raw_id else resource_id.removeprefix(
+        _COGNITIVE_EXPERIENCE_PREFIX
+    )
+    status = _experience_status_from_payload(payload.get("status"))
+    return CognitiveExperienceResponse(
+        id=experience_id,
+        kind=_experience_kind_from_payload(payload.get("kind")),
+        status=status,
+        summary=str(payload.get("summary", ""))[:240] or "未命名经验",
+        lesson=str(payload.get("lesson", ""))[:1200] or "暂无经验内容。",
+        strategy=str(payload.get("strategy", ""))[:1200] or "暂无使用策略。",
+        confidence=_float_from_payload(payload.get("confidence"), default=0.0),
+        evidence=_cognitive_evidence_payloads(payload.get("evidence")),
+        contradictions=_cognitive_evidence_payloads(payload.get("contradictions")),
+        source_run_ids=_string_list_from_payload(payload.get("source_run_ids"), limit=24),
+        source_memory_ids=_string_list_from_payload(payload.get("source_memory_ids"), limit=24),
+        tags=_string_list_from_payload(payload.get("tags"), limit=24),
+        applies_to_modes=_string_list_from_payload(payload.get("applies_to_modes"), limit=12),
+        applies_to_agents=_string_list_from_payload(payload.get("applies_to_agents"), limit=24),
+        use_count=_int_from_payload(payload.get("use_count")),
+        success_count=_int_from_payload(payload.get("success_count")),
+        failure_count=_int_from_payload(payload.get("failure_count")),
+        active_for_runtime=bool(payload.get("active_for_runtime"))
+        and status in {ExperienceStatus.CONFIRMED, ExperienceStatus.ACTIVE},
+        last_used_at=_datetime_from_json(payload.get("last_used_at"))
+        if payload.get("last_used_at")
+        else None,
+        last_verified_at=_datetime_from_json(payload.get("last_verified_at"))
+        if payload.get("last_verified_at")
+        else None,
+        version=_int_from_payload(payload.get("version"), default=1) or 1,
+        created_at=_datetime_from_json(payload.get("created_at")),
+        updated_at=_datetime_from_json(payload.get("updated_at")),
+        storage_kind="hermes",
+        resource_id=resource_id,
     )
 
 
@@ -9198,6 +9696,97 @@ async def recommend_with_hermes(
 ) -> HermesRecommendationResponse:
     _require(principal, "hermes:read")
     return await service.recommend_with_hermes(body)
+
+
+@router.get(
+    "/cognitive/experiences",
+    response_model=list[CognitiveExperienceResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_cognitive_experiences(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[CognitiveExperienceResponse]:
+    _require(principal, "hermes:read")
+    return list(await service.list_cognitive_experiences())
+
+
+@router.post(
+    "/cognitive/experiences",
+    response_model=CognitiveExperienceResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def create_cognitive_experience(
+    body: CognitiveExperienceCreateRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveExperienceResponse:
+    _require(principal, "hermes:write")
+    return await service.create_cognitive_experience(body)
+
+
+@router.post(
+    "/cognitive/experiences/{experience_id}/confirm",
+    response_model=CognitiveExperienceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def confirm_cognitive_experience(
+    experience_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveExperienceResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.confirm_cognitive_experience(experience_id)
+    except KeyError:
+        raise PublicAPIError(
+            404,
+            "cognitive_experience_not_found",
+            "Cognitive experience was not found",
+        ) from None
+
+
+@router.post(
+    "/cognitive/experiences/{experience_id}/reject",
+    response_model=CognitiveExperienceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def reject_cognitive_experience(
+    experience_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveExperienceResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.reject_cognitive_experience(experience_id)
+    except KeyError:
+        raise PublicAPIError(
+            404,
+            "cognitive_experience_not_found",
+            "Cognitive experience was not found",
+        ) from None
+
+
+@router.delete(
+    "/cognitive/experiences/{experience_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_cognitive_experience(
+    experience_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "hermes:write")
+    try:
+        await service.delete_cognitive_experience(experience_id)
+    except KeyError:
+        raise PublicAPIError(
+            404,
+            "cognitive_experience_not_found",
+            "Cognitive experience was not found",
+        ) from None
+    return OperationStatusResponse(status="deleted")
 
 
 @router.post(

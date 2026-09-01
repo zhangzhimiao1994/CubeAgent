@@ -911,6 +911,52 @@ const HermesInsightSchema = z.object({
 
 export type HermesInsight = z.infer<typeof HermesInsightSchema>;
 
+const CognitiveEvidenceSchema = z.object({
+  source_type: z.string(),
+  source_id: z.string(),
+  note: z.string(),
+});
+
+const CognitiveExperienceSchema = z.object({
+  id: z.string(),
+  kind: z.enum([
+    "user_preference",
+    "project_fact",
+    "workflow_strategy",
+    "error_handling",
+    "ui_rule",
+    "communication_style",
+    "tooling_strategy",
+    "domain_pattern",
+  ]),
+  status: z.enum(["candidate", "confirmed", "active", "superseded", "deprecated", "rejected"]),
+  summary: z.string(),
+  lesson: z.string(),
+  strategy: z.string(),
+  confidence: z.number(),
+  evidence: z.array(CognitiveEvidenceSchema),
+  contradictions: z.array(CognitiveEvidenceSchema),
+  source_run_ids: z.array(z.string()),
+  source_memory_ids: z.array(z.string()),
+  tags: z.array(z.string()),
+  applies_to_modes: z.array(z.string()),
+  applies_to_agents: z.array(z.string()),
+  use_count: z.number(),
+  success_count: z.number(),
+  failure_count: z.number(),
+  active_for_runtime: z.boolean(),
+  last_used_at: z.string().nullable(),
+  last_verified_at: z.string().nullable(),
+  version: z.number(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  storage_kind: z.string(),
+  resource_id: z.string(),
+});
+
+export type CognitiveEvidence = z.infer<typeof CognitiveEvidenceSchema>;
+export type CognitiveExperience = z.infer<typeof CognitiveExperienceSchema>;
+
 const HermesBulkConfirmSchema = z.object({
   confirmed: z.array(HermesInsightSchema),
   failed: z.array(BulkFailureSchema),
@@ -1718,6 +1764,30 @@ export const api = {
   },
   deleteHermesInsight(id: string): Promise<OperationStatus> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "DELETE" }, OperationStatusSchema);
+  },
+  cognitiveExperiences(): Promise<CognitiveExperience[]> {
+    return request("/api/v1/admin/cognitive/experiences", { method: "GET" }, z.array(CognitiveExperienceSchema));
+  },
+  confirmCognitiveExperience(id: string): Promise<CognitiveExperience> {
+    return request(
+      `/api/v1/admin/cognitive/experiences/${encodeURIComponent(id)}/confirm`,
+      { method: "POST" },
+      CognitiveExperienceSchema,
+    );
+  },
+  rejectCognitiveExperience(id: string): Promise<CognitiveExperience> {
+    return request(
+      `/api/v1/admin/cognitive/experiences/${encodeURIComponent(id)}/reject`,
+      { method: "POST" },
+      CognitiveExperienceSchema,
+    );
+  },
+  deleteCognitiveExperience(id: string): Promise<OperationStatus> {
+    return request(
+      `/api/v1/admin/cognitive/experiences/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      OperationStatusSchema,
+    );
   },
   bulkConfirmHermesInsights(ids: string[]): Promise<HermesBulkConfirmResult> {
     return request(

@@ -4577,6 +4577,34 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
 
 
+def test_hermes_feedback_creates_cognitive_experience_candidate() -> None:
+    api = client()
+
+    feedback = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "failure",
+            "lesson": "Reviewer timed out when the task input was too large.",
+            "conversation_id": "conv-reviewer-timeout",
+            "tags": ["reviewer", "timeout"],
+            "weight": 7,
+        },
+    )
+    experiences = api.get("/api/v1/admin/cognitive/experiences", headers=headers())
+
+    assert feedback.status_code == 200
+    assert experiences.status_code == 200
+    items = experiences.json()
+    assert len(items) == 1
+    assert items[0]["status"] == "candidate"
+    assert items[0]["active_for_runtime"] is False
+    assert items[0]["kind"] == "error_handling"
+    assert items[0]["evidence"][0]["source_type"] == "hermes_feedback"
+    assert items[0]["evidence"][0]["source_id"] == feedback.json()["id"]
+    assert "reviewer" in items[0]["tags"]
+
+
 def test_hermes_recommendation_ignores_scheduler_observations() -> None:
     api = client()
 
@@ -4872,6 +4900,211 @@ def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
 
     assert response.status_code == 422
     assert "sk-secret-value" not in response.text
+
+
+def test_cognitive_experience_api_confirms_candidate_without_evolution_storage() -> None:
+    api = client()
+
+    created = api.post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "reviewer 超时时先压缩上下文再分块审查。",
+            "lesson": "大输入会让 reviewer 步骤超时。",
+            "strategy": "先压缩输入，再拆分审查。",
+            "confidence": 0.72,
+            "evidence": [
+                {"source_type": "run", "source_id": "run-1", "note": "reviewer timeout"}
+            ],
+            "tags": ["reviewer", "timeout"],
+            "applies_to_modes": ["dispatch", "hybrid"],
+            "applies_to_agents": ["quality_reviewer"],
+        },
+    )
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["status"] == "candidate"
+    assert body["active_for_runtime"] is False
+    assert body["storage_kind"] == "hermes"
+    assert body["resource_id"].startswith("cognitive_experience:")
+    assert "evolution" not in body["resource_id"]
+
+    listed = api.get("/api/v1/admin/cognitive/experiences", headers=headers())
+    assert listed.status_code == 200
+    assert listed.json()[0]["summary"] == "reviewer 超时时先压缩上下文再分块审查。"
+
+    confirmed = api.post(
+        f"/api/v1/admin/cognitive/experiences/{body['id']}/confirm",
+        headers=headers(),
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "confirmed"
+    assert confirmed.json()["active_for_runtime"] is True
+
+
+def test_cognitive_experience_api_requires_evidence_on_creation() -> None:
+    response = client().post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "reviewer 超时时先压缩上下文再分块审查。",
+            "lesson": "大输入会让 reviewer 步骤超时。",
+            "strategy": "先压缩输入，再拆分审查。",
+            "confidence": 0.72,
+            "tags": ["reviewer", "timeout"],
+            "applies_to_modes": ["dispatch", "hybrid"],
+            "applies_to_agents": ["quality_reviewer"],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_cognitive_experience_api_rejects_confirming_legacy_evidence_free_record() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "reviewer 超时时先压缩上下文再分块审查。",
+            "lesson": "大输入会让 reviewer 步骤超时。",
+            "strategy": "先压缩输入，再拆分审查。",
+            "confidence": 0.72,
+            "evidence": [
+                {"source_type": "run", "source_id": "run-1", "note": "reviewer timeout"}
+            ],
+            "tags": ["reviewer", "timeout"],
+            "applies_to_modes": ["dispatch", "hybrid"],
+            "applies_to_agents": ["quality_reviewer"],
+        },
+    )
+    body = created.json()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    service.cognitive_experiences[body["id"]] = service.cognitive_experiences[
+        body["id"]
+    ].model_copy(update={"evidence": []})
+
+    confirmed = api.post(
+        f"/api/v1/admin/cognitive/experiences/{body['id']}/confirm",
+        headers=headers(),
+    )
+
+    assert confirmed.status_code == 422
+    assert confirmed.json()["error"]["code"] == "cognitive_experience_missing_evidence"
+
+
+def test_cognitive_experience_api_rejects_hidden_format_characters() -> None:
+    response = client().post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "reviewer 超时时先压缩上下文\u200b再分块审查。",
+            "lesson": "大输入会让 reviewer 步骤超时。",
+            "strategy": "先压缩输入，再拆分审查。",
+            "confidence": 0.72,
+            "evidence": [
+                {"source_type": "run", "source_id": "run-1", "note": "reviewer timeout"}
+            ],
+            "tags": ["reviewer", "timeout"],
+            "applies_to_modes": ["dispatch", "hybrid"],
+            "applies_to_agents": ["quality_reviewer"],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_list_filters_cognitive_experience_rows(tmp_path: Path) -> None:
+    now = datetime.now(UTC).isoformat()
+    cognitive_id = uuid4()
+
+    class StoredPersistentHermesService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "hermes",
+                    "hermes_regular",
+                ): {
+                    "id": "hermes_regular",
+                    "category": "conversation",
+                    "outcome": "success",
+                    "lesson": "Use group chat when debate review is required.",
+                    "summary": "Learned success pattern",
+                    "user_summary": "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。",
+                    "tags": ["debate", "review"],
+                    "weight": 5,
+                    "created_at": now,
+                    "confirmed_at": now,
+                },
+                (
+                    "hermes",
+                    f"cognitive_experience:{cognitive_id}",
+                ): {
+                    "id": str(cognitive_id),
+                    "kind": "workflow_strategy",
+                    "status": "confirmed",
+                    "summary": "确认后的经验只能走经验列表。",
+                    "lesson": "不要混入 Hermes 普通台账。",
+                    "strategy": "按 resource_id 前缀分流。",
+                    "confidence": 0.8,
+                    "evidence": [],
+                    "contradictions": [],
+                    "source_run_ids": [],
+                    "source_memory_ids": [],
+                    "tags": ["hermes"],
+                    "applies_to_modes": ["hybrid"],
+                    "applies_to_agents": ["main_agent"],
+                    "use_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "active_for_runtime": True,
+                    "last_used_at": None,
+                    "last_verified_at": None,
+                    "version": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                    "storage_kind": "hermes",
+                    "resource_id": f"cognitive_experience:{cognitive_id}",
+                },
+            }
+
+        async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+            return [
+                payload
+                for (stored_kind, _resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (resource_id, payload, None, None)
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+    service = StoredPersistentHermesService()
+
+    hermes = await service.list_hermes_insights()
+    cognitive = await service.list_cognitive_experiences()
+
+    assert [item.id for item in hermes] == ["hermes_regular"]
+    assert [item.id for item in cognitive] == [str(cognitive_id)]
 
 
 @pytest.mark.asyncio

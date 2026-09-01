@@ -40,6 +40,28 @@ def position(
     )
 
 
+def test_resolution_request_allows_shared_link_multiline_task() -> None:
+    request = ResolutionRequest(
+        task="标题\nhttps://example.com/a?x=1&y=2\t备注",
+        disagreement_kind=DisagreementKind.STRATEGY,
+        positions=(position("analyst", "option-a"), position("critic", "option-b")),
+    )
+
+    assert request.task == "标题\nhttps://example.com/a?x=1&y=2\t备注"
+
+
+@pytest.mark.parametrize("hidden_character", ["\x00", "\x1b", "\u200b", "\u202e"])
+def test_resolution_request_rejects_hidden_or_dangerous_control_task(
+    hidden_character: str,
+) -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        ResolutionRequest(
+            task=f"正常文本{hidden_character}隐藏内容",
+            disagreement_kind=DisagreementKind.STRATEGY,
+            positions=(position("analyst", "option-a"), position("critic", "option-b")),
+        )
+
+
 def test_strategy_disagreement_selects_highest_weighted_option_with_audit_memo() -> None:
     result = DecisionResolver().resolve(
         ResolutionRequest(

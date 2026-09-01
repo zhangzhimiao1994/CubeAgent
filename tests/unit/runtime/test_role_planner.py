@@ -12,6 +12,34 @@ from agent_hub.runtime.role_planner import (
 )
 
 
+def test_role_planning_request_allows_shared_link_multiline_text() -> None:
+    request = RolePlanningRequest(
+        task="标题\nhttps://example.com/a?x=1&y=2\t备注",
+        mode=TaskMode.HYBRID,
+        profile=TaskProfile.GENERAL,
+        high_risk=False,
+        requested_skills=("link-review",),
+        default_model="main-agent",
+    )
+
+    assert request.task == "标题\nhttps://example.com/a?x=1&y=2\t备注"
+
+
+@pytest.mark.parametrize("hidden_character", ["\x00", "\x1b", "\u200b", "\u202e"])
+def test_role_planning_request_rejects_hidden_or_dangerous_control_text(
+    hidden_character: str,
+) -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        RolePlanningRequest(
+            task=f"正常文本{hidden_character}隐藏内容",
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.GENERAL,
+            high_risk=False,
+            requested_skills=(),
+            default_model="main-agent",
+        )
+
+
 def test_discussion_software_task_gets_dynamic_constrained_discussion_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

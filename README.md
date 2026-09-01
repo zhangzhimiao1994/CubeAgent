@@ -179,7 +179,7 @@ Office file generation is a runtime tool capability, not a `ModelCapability` val
 
 Built-in PPTX templates are `consulting-clean`, `technical-blueprint`, and `dark-launch`. Generated files include file metadata and an authenticated `download_url`; the Web console renders them as file cards in run details, conversation output, and child-agent work seats.
 
-## Chat, Evolution, And Modes
+## Chat And Modes
 
 The first screen is the actual work surface. Use the left navigation drawer for modules and the right conversation drawer for historical chats. Conversation names use the first user request plus a timestamp, so repeated topics stay distinguishable.
 
@@ -191,17 +191,15 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. Until that harness exists, coding-related requests are treated as advisory work: the agent may inspect supplied code context, explain issues, draft implementation plans, and produce patch-style suggestions or file artifacts, but it does not directly mutate the user's source tree. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. Until that harness exists, coding-related requests are treated as advisory work: the agent may inspect supplied code context, explain issues, draft implementation plans, and produce patch-style suggestions or file artifacts, but it does not directly mutate the user's source tree. A running chat can be stopped from the composer, and detected schedule proposals can be cancelled before they create durable records.
 
 Dispatch and discussion runs render a compact process card in the conversation stream. The card opens the child-agent work-seat drawer, where each agent has its own seat with status such as working, waiting, failed, or done. The drawer favors short categorized summaries; detailed event fields, tool payloads, model metadata, and artifact metadata are hidden until the user opens the relevant card and expands full fields. This keeps long task traces readable while preserving auditability.
 
-Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
-
-Evolution is for durable asset improvement: Skill distillation, Darwin-style iteration, agent/workflow/prompt improvement, and score-gated candidate testing. Normal Q&A, one-off plans, and ordinary research do not enter Evolution unless the request asks to improve or create a durable asset.
+Long conversations are handled by the conversation framework. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 
 Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
 
-Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then create a grounded Evolution run instead of installing an unverified Skill directly.
+Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then produce a reviewable Skill candidate instead of installing an unverified Skill directly.
 
 ## OpenClaw
 
@@ -261,7 +259,7 @@ The legacy Feishu field `FEISHU_COMMAND_ALIASES` is kept only for backward-compa
 
 See [docs/feishu-setup.md](docs/feishu-setup.md).
 
-## Logs, Audit, And Hermes
+## Logs, Audit, And Hermes+
 
 The Logs center separates audit logs, model errors, mode errors, feature errors, agent errors, and channel errors. Each log table supports search, column filters, sorting, selection, and JSON export.
 
@@ -274,7 +272,7 @@ Audit records cover administrative changes and user-triggered conversation submi
 - workflow, selected agents, direct model, the backend-compatible Vibe Coding metadata flag, and attachment count
 - message preview and `message_sha256`
 
-Hermes stores learning records separately from chat. Conversation memory and scheduler observations are separated into distinct record categories, and records can be filtered, sorted, confirmed, or deleted individually or in bulk.
+Hermes+ stores learning records separately from chat. Conversation memory, scheduler observations, and reusable experience candidates are separated so runtime telemetry does not pollute user-facing conversation memory. Experience candidates must be confirmed before they can be injected into future runs. Confirmed experiences are retrieved through the existing Hermes runtime advice path as short, bounded guidance instead of dumping the whole memory ledger into context.
 
 ## Operations
 
