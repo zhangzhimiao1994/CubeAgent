@@ -236,7 +236,7 @@ export function WorkflowsPage() {
         decision_policy: decisionPolicy.trim(),
       }),
     onSuccess: async () => {
-      setMessage("工作流配置已保存。它不会立即执行，只会在聊天任务选择该工作流时生效。");
+      setMessage("流程模板已保存。它不会立即执行，只会在聊天任务选择该流程时生效。");
       await queryClient.invalidateQueries({ queryKey: ["workflows"] });
     },
   });
@@ -316,20 +316,20 @@ export function WorkflowsPage() {
     [savedWorkflows, workflowColumnFilters, workflowSearchTerm, workflowSort],
   );
 
-  if (workflows.isLoading || agents.isLoading) return <p>正在加载工作流配置...</p>;
+  if (workflows.isLoading || agents.isLoading) return <p>正在加载流程模板...</p>;
   if (workflows.isError) return <p role="alert">{formatApiError(workflows.error, "工作流加载失败")}</p>;
   if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 列表加载失败")}</p>;
 
   return (
     <section>
       <p className="eyebrow">Workflow configuration</p>
-      <h2>工作流配置</h2>
+      <h2>流程模板</h2>
       <p>
-        这里只负责配置工作流，不会直接执行任务。工作流用于描述某类任务应该用什么模式、哪些角色、哪些步骤和什么裁决规则。
+        这里只负责维护流程模板，不会直接执行任务。流程模板用于描述某类任务应该用什么模式、哪些角色、哪些步骤和什么裁决规则。
       </p>
 
       <div className="two-column">
-        <form onSubmit={submit} aria-label="保存工作流配置">
+        <form onSubmit={submit} aria-label="保存流程模板">
           <h3>新增或更新工作流</h3>
           <label htmlFor="workflow-preset">
             任务模板
@@ -430,7 +430,7 @@ export function WorkflowsPage() {
           </label>
 
           <button type="submit" disabled={saveWorkflow.isPending}>
-            {saveWorkflow.isPending ? "正在保存..." : "保存工作流配置"}
+            {saveWorkflow.isPending ? "正在保存..." : "保存流程模板"}
           </button>
           {message ? <p role="status">{message}</p> : null}
           {saveWorkflow.isError ? <p role="alert">{formatApiError(saveWorkflow.error, "工作流保存失败")}</p> : null}
@@ -441,7 +441,7 @@ export function WorkflowsPage() {
           <ol>
             <li>模式只定义协作方式；角色由任务类型和工作流决定。</li>
             <li>同样是派单，短视频、代码、财经、艺术设计应配置不同工作流。</li>
-            <li>工作流配置后不会自动执行，只有聊天任务选择它时才会使用。</li>
+            <li>流程模板配置后不会自动执行，只有聊天任务选择它时才会使用。</li>
             <li>如果自动检测不确定，主 Agent 应询问用户，而不是猜错模式。</li>
           </ol>
         </article>

@@ -26,9 +26,9 @@ export const MODULE_GROUPS: ModuleGroup[] = [
   {
     id: "workspace",
     to: "/workspace",
-    label: "对话与进化",
-    eyebrow: "Conversation & Evolution",
-    description: "发起对话、接续会话、查看运行过程，并管理 Skill 蒸馏、长期迭代和进化任务。",
+    label: "对话",
+    eyebrow: "Conversation",
+    description: "发起对话、接续会话、查看运行过程和交付内容。",
     tone: "cyan",
     modules: [
       {
@@ -37,19 +37,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "连续对话、历史会话、运行过程和附件入口集中在这里。",
         permission: "run:read",
       },
-      {
-        to: "/evolution",
-        label: "进化",
-        description: "管理 Skill、Agent、工作流和调度策略的评估、迭代、验证与人工确认。",
-        permission: "skill:read",
-        children: [
-          { to: "/evolution?type=skill", label: "Skill 进化", permission: "skill:read" },
-          { to: "/evolution?type=agent", label: "Agent/角色进化", permission: "agent:read" },
-          { to: "/evolution?type=workflow", label: "工作流进化", permission: "agent:read" },
-          { to: "/evolution?type=scheduler-policy", label: "调度策略进化", permission: "config:read" },
-          { to: "/evolution?type=context-memory", label: "多轮记忆策略", permission: "memory:read" },
-        ],
-      },
     ],
   },
   {
@@ -57,7 +44,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     to: "/orchestration",
     label: "编排",
     eyebrow: "Agent Control",
-    description: "主 Agent、角色、工作流和 Hermes 学习都属于 Agent 编排控制层。",
+    description: "主 Agent、协作配置和 Hermes 学习都属于 Agent 编排控制层。",
     tone: "green",
     modules: [
       {
@@ -73,21 +60,15 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         ],
       },
       {
-        to: "/agents",
-        label: "Agent 角色",
-        description: "管理导演、文案、剪辑师、经济分析师等可扩展角色。",
-        permission: "agent:read",
-      },
-      {
-        to: "/workflows",
-        label: "工作流配置",
-        description: "配置任务类型、默认角色、执行步骤、交付物和分歧裁决规则。",
+        to: "/collaboration",
+        label: "协作配置",
+        description: "合并管理子助手分工和流程模板，减少低频配置入口。",
         permission: "agent:read",
         children: [
-          { to: "/workflows?section=list", label: "工作流列表", permission: "agent:read" },
-          { to: "/workflows?section=roles", label: "角色配置", permission: "agent:read" },
-          { to: "/workflows?section=execution", label: "执行策略", permission: "agent:read" },
-          { to: "/workflows?section=review", label: "审查/裁决规则", permission: "agent:read" },
+          { to: "/collaboration?section=roles", label: "角色", permission: "agent:read" },
+          { to: "/collaboration?section=workflows", label: "工作流", permission: "agent:read" },
+          { to: "/collaboration?section=execution", label: "执行策略", permission: "agent:read" },
+          { to: "/collaboration?section=review", label: "审查/裁决规则", permission: "agent:read" },
         ],
       },
       {

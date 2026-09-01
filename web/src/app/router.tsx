@@ -3,11 +3,10 @@ import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-rout
 
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
-import { AgentsPage } from "../pages/AgentsPage";
 import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
+import { CollaborationPage } from "../pages/CollaborationPage";
 import { ConfigPage } from "../pages/ConfigPage";
-import { EvolutionPage } from "../pages/EvolutionPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
@@ -23,7 +22,6 @@ import { SchedulesPage } from "../pages/SchedulesPage";
 import { SetupPage } from "../pages/SetupPage";
 import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
-import { WorkflowsPage } from "../pages/WorkflowsPage";
 import { MODULE_GROUPS } from "./navigation";
 
 const queryClient = new QueryClient({
@@ -51,15 +49,16 @@ export function AppRoutes() {
           <Route key={group.id} path={group.to.slice(1)} element={<ModuleHubPage group={group} />} />
         ))}
         <Route path="runs/:runId" element={<RunDetailPage />} />
-        <Route path="evolution" element={<EvolutionPage />} />
+        <Route path="evolution" element={<Navigate to="/" replace />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />
         <Route path="openclaw" element={<OpenClawPage />} />
         <Route path="multimedia" element={<Navigate to="/models" replace />} />
         <Route path="attachments" element={<AttachmentsPage />} />
-        <Route path="agents" element={<AgentsPage />} />
-        <Route path="workflows" element={<WorkflowsPage />} />
+        <Route path="collaboration" element={<CollaborationPage />} />
+        <Route path="agents" element={<Navigate to="/collaboration?section=roles" replace />} />
+        <Route path="workflows" element={<Navigate to="/collaboration?section=workflows" replace />} />
         <Route path="schedules" element={<SchedulesPage />} />
         <Route path="skills" element={<SkillsPage />} />
         <Route path="mcp" element={<McpPage />} />

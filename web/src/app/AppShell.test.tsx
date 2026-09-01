@@ -75,7 +75,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(screen.getAllByText("工作台").length).toBeGreaterThan(0);
-    expect(screen.getByRole("link", { name: "对话与进化" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
     const accountNavigation = screen.getByRole("navigation", { name: "账号操作" });
@@ -85,13 +85,13 @@ describe("AppShell presentation", () => {
     expect(screen.queryByText("沉淀经验，但不绕过审核")).toBeNull();
   });
 
-  it("groups navigation into six module hubs with colored module cards", async () => {
+  it("groups navigation into simplified module hubs with collaboration config merged", async () => {
     render(<TestApp initialPath="/orchestration" />);
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
-    expect(within(navigation).getByRole("link", { name: "对话与进化" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "对话" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "编排" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "资源" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "工具" })).not.toBeNull();
@@ -100,25 +100,26 @@ describe("AppShell presentation", () => {
 
     const moduleGrid = screen.getByRole("list", { name: "编排模块" });
     expect(within(moduleGrid).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(moduleGrid).getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
-    expect(within(moduleGrid).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(moduleGrid).getByRole("link", { name: /协作配置/ })).not.toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /Agent 角色/ })).toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /工作流配置/ })).toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
 
     const drawer = screen.getByLabelText("编排二级导航");
     expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(drawer).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(drawer).getByRole("link", { name: /协作配置/ })).not.toBeNull();
   });
 
-  it("shows tertiary navigation under module drawers without adding top-level entries", async () => {
+  it("removes evolution from navigation and sends legacy evolution route back to chat", async () => {
     render(<TestApp initialPath="/evolution" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
 
-    const workspaceDrawer = screen.getByLabelText("对话与进化二级导航");
-    expect(within(workspaceDrawer).getByRole("link", { name: "Skill 进化" }).getAttribute("href")).toBe("/evolution?type=skill");
-    expect(within(workspaceDrawer).getByRole("link", { name: "调度策略进化" }).getAttribute("href")).toBe("/evolution?type=scheduler-policy");
+    const workspaceDrawer = screen.getByLabelText("对话二级导航");
+    expect(within(workspaceDrawer).queryByRole("link", { name: /进化/ })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "进化" })).toBeNull();
   });
 
   it("activates the matching page section after a third-level menu click", async () => {
@@ -140,33 +141,25 @@ describe("AppShell presentation", () => {
     const original = window.HTMLElement.prototype.scrollIntoView;
     window.HTMLElement.prototype.scrollIntoView = scrollIntoView;
     try {
-      render(<TestApp initialPath="/evolution?type=skill" />);
+      render(<TestApp initialPath="/collaboration?section=workflows" />);
 
-      expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
-      await waitFor(() => expect(document.querySelector('[data-nav-section="skill"]')).not.toBeNull());
+      expect(await screen.findByRole("heading", { name: "协作配置" })).not.toBeNull();
+      await waitFor(() => expect(document.querySelector('[data-nav-section="workflows"]')).not.toBeNull());
       scrollIntoView.mockClear();
 
-      const drawer = screen.getByLabelText("对话与进化二级导航");
-      await user.click(within(drawer).getByRole("link", { name: "Skill 进化" }));
+      const drawer = screen.getByLabelText("编排二级导航");
+      await user.click(within(drawer).getByRole("link", { name: "工作流" }));
 
       await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
     } finally {
       window.HTMLElement.prototype.scrollIntoView = original;
     }
   });
-  it("activates evolution third-level sections from type query", async () => {
-    render(<TestApp initialPath="/evolution?type=scheduler-policy" />);
 
-    expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
-    await waitFor(() => {
-      expect(document.querySelector('[data-nav-section="scheduler-policy"]')?.getAttribute("data-nav-active")).toBe("true");
-    });
-  });
+  it("activates collaboration workflow sections from section query", async () => {
+    render(<TestApp initialPath="/collaboration?section=review" />);
 
-  it("activates workflow third-level sections from section query", async () => {
-    render(<TestApp initialPath="/workflows?section=review" />);
-
-    expect(await screen.findByRole("heading", { name: "工作流配置" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "协作配置" })).not.toBeNull();
     await waitFor(() => {
       expect(document.querySelector('[data-nav-section="review"]')?.getAttribute("data-nav-active")).toBe("true");
     });
@@ -185,7 +178,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
-    expect(within(navigation).getByRole("link", { name: "对话与进化" }).getAttribute("href")).toBe("/");
+    expect(within(navigation).getByRole("link", { name: "对话" }).getAttribute("href")).toBe("/");
     expect(within(navigation).getByRole("link", { name: "编排" }).getAttribute("href")).toBe("/main-agent");
     expect(within(navigation).getByRole("link", { name: "资源" }).getAttribute("href")).toBe("/models");
     expect(within(navigation).getByRole("link", { name: "工具" }).getAttribute("href")).toBe("/skills");
@@ -223,7 +216,8 @@ describe("AppShell presentation", () => {
 
     expect(orchestrationTrigger.getAttribute("aria-expanded")).toBe("true");
     expect(within(mobileNavigation).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
-    expect(within(mobileNavigation).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(mobileNavigation).getByRole("link", { name: /协作配置/ })).not.toBeNull();
+    expect(within(mobileNavigation).queryByRole("link", { name: /工作流配置/ })).toBeNull();
 
     await user.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
 

@@ -81,7 +81,7 @@ describe("AgentsPage", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/agents" />);
 
-    expect(await screen.findByText("Agent 角色编排")).not.toBeNull();
+    expect(await screen.findByText("角色池")).not.toBeNull();
     await user.selectOptions(screen.getByLabelText("角色模板"), "director");
     await user.clear(screen.getByLabelText("Agent ID"));
     await user.type(screen.getByLabelText("Agent ID"), "director");
@@ -120,7 +120,7 @@ describe("AgentsPage", () => {
     ];
     render(<TestApp initialPath="/agents" />);
 
-    expect(await screen.findByText("Agent 角色编排")).not.toBeNull();
+    expect(await screen.findByText("角色池")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "编辑 Agent" }));
 
     expect(screen.getByRole("status").textContent).toContain("已载入 审查员");

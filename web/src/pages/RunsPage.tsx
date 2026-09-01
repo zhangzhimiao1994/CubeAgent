@@ -46,13 +46,11 @@ type SkillUploadConflict = {
 };
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
-type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
   mode?: RunMode;
-  skipEvolutionProposal?: boolean;
   successNotice?: string;
 };
 
@@ -679,15 +677,6 @@ function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
   };
 }
 
-function evolutionApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.evolution_proposal) return null;
-  return {
-    runId: run.id,
-    proposal: run.evolution_proposal,
-    createdEvolutionId: null,
-  };
-}
-
 function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
   if (!run || run.status !== "waiting_approval" || !run.openclaw_proposal) return null;
   return {
@@ -707,45 +696,6 @@ function openClawProposalBody(proposal: OpenClawProposal) {
     "系统不会在对话页直接执行。请到 OpenClaw 管理页确认目标、权限、审批策略和执行边界。",
   ].join("\n\n");
 }
-function evolutionProposalBody(proposal: EvolutionProposal) {
-  const skills = proposal.source_skill_ids.length > 0 ? proposal.source_skill_ids.join("、") : "由主 Agent 在确认后补齐";
-  const candidates = proposal.candidate_agent_ids.length > 0 ? proposal.candidate_agent_ids.join("、") : "由主 Agent 调度";
-  return [
-    proposal.summary,
-    `任务目标：${proposal.objective}`,
-    `任务类型：${proposal.kind}`,
-    `来源 Skill：${skills}`,
-    `基准 agent：${proposal.baseline_agent_id ?? "主 Agent 判断"}`,
-    `候选 agent：${candidates}`,
-    `评测 agent：${proposal.evaluator_agent_id ?? "主 Agent 判断"}`,
-    `迭代策略：${proposal.iteration_policy}；记忆策略：${proposal.memory_policy}`,
-  ].join("\n\n");
-}
-
-function evolutionProposalCreatePayload(proposal: EvolutionProposal) {
-  return {
-    kind: proposal.kind,
-    title: proposal.title,
-    objective: proposal.objective,
-    mode: proposal.mode,
-    source_skill_ids: proposal.source_skill_ids,
-    source_conversation_id: proposal.source_conversation_id ?? null,
-    source_run_id: proposal.source_run_id ?? null,
-    target_artifact_type: proposal.target_artifact_type,
-    baseline_agent_id: proposal.baseline_agent_id ?? null,
-    candidate_agent_ids: proposal.candidate_agent_ids,
-    evaluator_agent_id: proposal.evaluator_agent_id ?? null,
-    approval_policy: proposal.approval_policy,
-    iteration_policy: proposal.iteration_policy,
-    memory_policy: proposal.memory_policy,
-    max_rounds: proposal.max_rounds,
-    min_delta: proposal.min_delta,
-    budget_tokens: proposal.budget_tokens,
-    budget_minutes: proposal.budget_minutes,
-    rubric: proposal.rubric,
-  };
-}
-
 function scheduleProposalBody(proposal: ScheduleProposal) {
   return [
     "主 Agent 判断这条消息更像计划任务。请先确认计划，再加入日程；加入后由系统计划任务按时间提交普通运行。",
@@ -867,16 +817,6 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             role: "assistant" as const,
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
-          },
-        ]
-      : []),
-    ...(detail.status === "waiting_approval" && detail.evolution_proposal
-      ? [
-          {
-            id: `${detail.id}-evolution-approval`,
-            role: "assistant" as const,
-            title: "进化任务确认",
-            body: evolutionProposalBody(detail.evolution_proposal),
           },
         ]
       : []),
@@ -2708,12 +2648,6 @@ export function RunsPage() {
     createdScheduleId: string | null;
   } | null>(null);
   const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
-  const [dismissedEvolutionApprovalRunIds, setDismissedEvolutionApprovalRunIds] = useState<string[]>([]);
-  const [evolutionApproval, setEvolutionApproval] = useState<{
-    runId: string;
-    proposal: EvolutionProposal;
-    createdEvolutionId: string | null;
-  } | null>(null);
   const [openClawApproval, setOpenClawApproval] = useState<{
     runId: string;
     proposal: OpenClawProposal;
@@ -2829,7 +2763,6 @@ export function RunsPage() {
     if (approval) {
       setModeSelection(null);
       setScheduleApproval(null);
-      setEvolutionApproval(null);
       setOpenClawApproval(null);
       setTemporaryApproval((current) =>
         current &&
@@ -2844,20 +2777,9 @@ export function RunsPage() {
     if (proposedSchedule && !dismissedScheduleApprovalRunIds.includes(proposedSchedule.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
-      setEvolutionApproval(null);
       setOpenClawApproval(null);
       setScheduleApproval((current) =>
         current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
-      );
-    }
-    const proposedEvolution = evolutionApprovalFromRunDetail(selectedRun.data);
-    if (proposedEvolution && !dismissedEvolutionApprovalRunIds.includes(proposedEvolution.runId)) {
-      setModeSelection(null);
-      setTemporaryApproval(null);
-      setScheduleApproval(null);
-      setOpenClawApproval(null);
-      setEvolutionApproval((current) =>
-        current && current.runId === proposedEvolution.runId ? current : proposedEvolution,
       );
     }
     const proposedOpenClaw = openClawApprovalFromRunDetail(selectedRun.data);
@@ -2865,12 +2787,11 @@ export function RunsPage() {
       setModeSelection(null);
       setTemporaryApproval(null);
       setScheduleApproval(null);
-      setEvolutionApproval(null);
       setOpenClawApproval((current) =>
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
       );
     }
-  }, [dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
+  }, [dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -2920,7 +2841,7 @@ export function RunsPage() {
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
-        skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
+        skip_evolution_proposal: true,
       });
     },
     onSuccess: async (run, override) => {
@@ -2932,7 +2853,6 @@ export function RunsPage() {
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
         setScheduleApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval(null);
         setModeSelection(null);
         setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
@@ -2957,29 +2877,18 @@ export function RunsPage() {
         setModeSelection(null);
         setTemporaryApproval(null);
         setScheduleApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval({ runId: run.id, proposal: run.openclaw_proposal, createdOperationId: null });
         setSubmitNotice("主 Agent 已识别为 OpenClaw 操作请求，请到 OpenClaw 管理页确认权限和执行边界。");
       } else if (run.schedule_proposal) {
         setModeSelection(null);
         setTemporaryApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval(null);
         setDismissedScheduleApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
         setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
-      } else if (run.evolution_proposal) {
-        setModeSelection(null);
-        setTemporaryApproval(null);
-        setScheduleApproval(null);
-        setOpenClawApproval(null);
-        setDismissedEvolutionApprovalRunIds((current) => current.filter((id) => id !== run.id));
-        setEvolutionApproval({ runId: run.id, proposal: run.evolution_proposal, createdEvolutionId: null });
-        setSubmitNotice("主 Agent 已识别为进化任务，确认后会加入进化记录。");
       } else if (run.temporary_agent_proposal && run.decision_token) {
         setModeSelection(null);
         setScheduleApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval(null);
         setTemporaryApproval({
           runId: run.id,
@@ -2993,14 +2902,12 @@ export function RunsPage() {
       } else if (selection) {
         setTemporaryApproval(null);
         setScheduleApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval(null);
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
         setTemporaryApproval(null);
         setScheduleApproval(null);
-        setEvolutionApproval(null);
         setOpenClawApproval(null);
         setModeSelection(null);
         setSubmitNotice(override?.successNotice ?? explainActualMode(run));
@@ -3070,34 +2977,6 @@ export function RunsPage() {
       );
       setSubmitNotice(`已加入计划：${schedule.name}。到计划任务页面可以查看、删除或等待系统自动触发。`);
       await queryClient.invalidateQueries({ queryKey: ["schedules"] });
-    },
-  });
-  const cancelEvolutionApproval = () => {
-    const approval = evolutionApproval;
-    if (!approval) return;
-    setDismissedEvolutionApprovalRunIds((current) =>
-      current.includes(approval.runId) ? current : [...current, approval.runId],
-    );
-    setEvolutionApproval(null);
-    setSubmitNotice("已取消进化任务创建，正在按普通对话继续执行原消息。");
-    createRun.mutate({
-      message: approval.proposal.objective,
-      mode: "auto",
-      skipEvolutionProposal: true,
-      successNotice: "已取消进化任务创建，已按普通对话继续执行原消息。",
-    });
-  };
-  const createEvolutionFromProposal = useMutation({
-    mutationFn: () => {
-      if (!evolutionApproval) throw new Error("evolution approval is unavailable");
-      return api.createEvolutionRun(evolutionProposalCreatePayload(evolutionApproval.proposal));
-    },
-    onSuccess: async (run) => {
-      setEvolutionApproval((current) =>
-        current ? { ...current, createdEvolutionId: run.id } : current,
-      );
-      setSubmitNotice(`已加入进化：${run.title}。到进化页面可以审批、登记轮次和查看结果。`);
-      await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
     },
   });
 
@@ -3475,7 +3354,6 @@ export function RunsPage() {
     setDirectModel("");
     setTemporaryApproval(null);
     setScheduleApproval(null);
-    setEvolutionApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
@@ -3497,7 +3375,6 @@ export function RunsPage() {
     setDirectModel("");
     setTemporaryApproval(null);
     setScheduleApproval(null);
-    setEvolutionApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
@@ -3619,9 +3496,9 @@ export function RunsPage() {
   return (
     <section>
       <p className="eyebrow">Conversation</p>
-      <h2>对话与进化</h2>
+      <h2>对话</h2>
       <p className="compact-page-intro">
-        这里是连续对话窗口，也会承接长期多轮任务、上下文压缩和后续 Skill 进化。历史会话从右侧抽屉打开。
+        这里是连续对话窗口，也会承接长期多轮任务、上下文压缩和交付内容。历史会话从右侧抽屉打开。
       </p>
 
       <div className="mobile-chat-hierarchy" aria-label="移动端对话层级">
@@ -4063,33 +3940,6 @@ export function RunsPage() {
             {createScheduleFromProposal.isError ? (
               <p role="alert">{formatApiError(createScheduleFromProposal.error, "计划任务创建失败")}</p>
             ) : null}
-            {evolutionApproval ? (
-              <aside className="composer-attachment-card" role="status" aria-label="进化任务确认">
-                <div>
-                  <span className="eyebrow">{evolutionApproval.createdEvolutionId ? "进化任务已加入" : "进化任务待确认"}</span>
-                  <strong>{evolutionApproval.proposal.title}</strong>
-                  <small>{evolutionApproval.proposal.summary}</small>
-                </div>
-                <p>{evolutionApproval.proposal.objective}</p>
-                {evolutionApproval.createdEvolutionId ? (
-                  <Link to="/evolution" className="secondary-action">
-                    查看进化任务
-                  </Link>
-                ) : (
-                  <div className="composer-card-actions">
-                    <button type="button" onClick={() => createEvolutionFromProposal.mutate()} disabled={createEvolutionFromProposal.isPending}>
-                      {createEvolutionFromProposal.isPending ? "加入中..." : "加入进化"}
-                    </button>
-                    <button type="button" className="secondary-action" disabled={createEvolutionFromProposal.isPending} onClick={cancelEvolutionApproval}>
-                      取消进化
-                    </button>
-                  </div>
-                )}
-              </aside>
-            ) : null}
-            {createEvolutionFromProposal.isError ? (
-              <p role="alert">{formatApiError(createEvolutionFromProposal.error, "进化任务创建失败")}</p>
-            ) : null}
             {openClawApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="OpenClaw 操作确认">
                 <div>
@@ -4342,7 +4192,6 @@ export function RunsPage() {
           </form>
         </div>
       </div>
-
     </section>
   );
 }

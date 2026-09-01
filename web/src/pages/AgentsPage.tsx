@@ -227,14 +227,14 @@ export function AgentsPage() {
     deleteAgent.mutate(agent.id);
   }
 
-  if (agents.isLoading || models.isLoading) return <p>正在加载 Agent 配置...</p>;
+  if (agents.isLoading || models.isLoading) return <p>正在加载角色池配置...</p>;
   if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 加载失败")}</p>;
   if (models.isError) return <p role="alert">{formatApiError(models.error, "模型加载失败")}</p>;
 
   return (
     <section>
       <p className="eyebrow">Role orchestration</p>
-      <h2>Agent 角色编排</h2>
+      <h2>角色池</h2>
       <p>
         子 Agent 的角色不是写死的。模板只是快速起点，你可以创建完全自定义的角色、提示词、模型绑定和 Skill 白名单。
       </p>
