@@ -254,3 +254,75 @@ async def test_skill_candidate_use_outcomes_update_counts_and_confidence() -> No
     assert failed.failure_count == 1
     assert len(failed.contradictions) == 1
     assert failed.confidence < succeeded.confidence
+
+
+@pytest.mark.asyncio
+async def test_relationship_state_merges_user_habits_and_shared_context() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+
+    first = await service.update_relationship_state(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        preferred_language="zh-CN",
+        preferred_confirmation_style="minimal",
+        shared_milestones=("完成 Hermes+ 记忆隔离。",),
+        recent_friction_points=("调度经验不应写入普通对话记忆。",),
+        familiarity_delta=0.08,
+    )
+    second = await service.update_relationship_state(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        preferred_confirmation_style="no-confirmation-for-approved-scope",
+        shared_milestones=("完成 Hermes+ 记忆隔离。", "完成认知状态服务。"),
+        recent_friction_points=("调度经验不应写入普通对话记忆。",),
+        familiarity_delta=0.08,
+    )
+
+    assert second.id == first.id
+    assert second.familiarity > first.familiarity
+    assert second.preferred_language == "zh-CN"
+    assert second.preferred_confirmation_style == "no-confirmation-for-approved-scope"
+    assert second.shared_milestones == ("完成 Hermes+ 记忆隔离。", "完成认知状态服务。")
+    assert second.recent_friction_points == ("调度经验不应写入普通对话记忆。",)
+
+
+@pytest.mark.asyncio
+async def test_world_state_merges_facts_and_closes_open_items() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+
+    first = await service.update_world_state(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scope="cubeagent.project",
+        facts=("CubeAgent 是纯对话 Agent 仓库。",),
+        open_items=("实现统一 Memory/Experience Router。", "后续合并 Memory/Hermes。"),
+        future_events=("harness 改造走独立项目。",),
+        evidence=CognitiveEvidence(source_type="handoff", source_id="HANDOFF", note="project boundary"),
+    )
+    second = await service.update_world_state(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scope="cubeagent.project",
+        facts=("CubeAgent 是纯对话 Agent 仓库。", "生产只保留当前 release。"),
+        open_items=("实现 Skill Candidate 晋升。",),
+        completed_items=("实现统一 Memory/Experience Router。",),
+        future_events=("harness 改造走独立项目。",),
+        evidence=CognitiveEvidence(source_type="handoff", source_id="HANDOFF", note="state update"),
+    )
+
+    assert second.id == first.id
+    assert second.facts == ("CubeAgent 是纯对话 Agent 仓库。", "生产只保留当前 release。")
+    assert second.open_items == ("后续合并 Memory/Hermes。", "实现 Skill Candidate 晋升。")
+    assert second.future_events == ("harness 改造走独立项目。",)
+    assert len(second.evidence) == 2
+    assert second.last_verified_at is not None

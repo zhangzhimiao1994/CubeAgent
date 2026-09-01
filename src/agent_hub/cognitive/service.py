@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol, overload
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.cognitive.types import (
     BeliefRecord,
@@ -12,7 +12,9 @@ from agent_hub.cognitive.types import (
     ExperienceKind,
     ExperienceRecord,
     ExperienceStatus,
+    RelationshipStateRecord,
     SkillCandidateRecord,
+    WorldStateRecord,
 )
 
 
@@ -42,6 +44,12 @@ class CognitiveStateRepository(Protocol):
     async def upsert(self, record: SkillCandidateRecord) -> SkillCandidateRecord: ...
 
     @overload
+    async def upsert(self, record: RelationshipStateRecord) -> RelationshipStateRecord: ...
+
+    @overload
+    async def upsert(self, record: WorldStateRecord) -> WorldStateRecord: ...
+
+    @overload
     async def get(
         self, record_type: type[BeliefRecord], record_id: str | UUID
     ) -> BeliefRecord | None: ...
@@ -50,6 +58,16 @@ class CognitiveStateRepository(Protocol):
     async def get(
         self, record_type: type[SkillCandidateRecord], record_id: str | UUID
     ) -> SkillCandidateRecord | None: ...
+
+    @overload
+    async def get(
+        self, record_type: type[RelationshipStateRecord], record_id: str | UUID
+    ) -> RelationshipStateRecord | None: ...
+
+    @overload
+    async def get(
+        self, record_type: type[WorldStateRecord], record_id: str | UUID
+    ) -> WorldStateRecord | None: ...
 
     async def list_for_user(
         self,
@@ -62,6 +80,25 @@ class CognitiveStateRepository(Protocol):
 
 def _bounded_confidence(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _stable_record_id(kind: str, tenant_id: UUID, user_id: UUID, memory_scope: CognitiveMemoryScope, scope: str) -> str:
+    return f"{kind}:{uuid5(NAMESPACE_URL, f'agent-hub:{kind}:{tenant_id}:{user_id}:{memory_scope.value}:{scope}')}"
+
+
+def _merge_unique(existing: tuple[str, ...], incoming: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in (*existing, *incoming):
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return tuple(result)
+
+
+def _remove_items(existing: tuple[str, ...], completed: tuple[str, ...]) -> tuple[str, ...]:
+    completed_set = set(completed)
+    return tuple(item for item in existing if item not in completed_set)
 
 
 class ExperienceService:
@@ -286,6 +323,108 @@ class CognitiveStateService:
                     failure_count=failure_count,
                     current_status=skill.status,
                 ),
+                "updated_at": timestamp,
+            }
+        )
+        return await self._repository.upsert(updated)
+
+    async def update_relationship_state(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        preferred_language: str | None = None,
+        preferred_confirmation_style: str | None = None,
+        shared_milestones: tuple[str, ...] = (),
+        recent_friction_points: tuple[str, ...] = (),
+        familiarity_delta: float = 0.0,
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
+    ) -> RelationshipStateRecord:
+        record_id = _stable_record_id("relationship", tenant_id, user_id, memory_scope, "default")
+        timestamp = self._now()
+        existing = await self._repository.get(RelationshipStateRecord, record_id)
+        if existing is None:
+            record = RelationshipStateRecord(
+                id=record_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                memory_scope=memory_scope,
+                familiarity=_bounded_confidence(0.2 + familiarity_delta),
+                preferred_language=preferred_language or "zh-CN",
+                preferred_confirmation_style=preferred_confirmation_style or "minimal",
+                shared_milestones=_merge_unique((), shared_milestones),
+                recent_friction_points=_merge_unique((), recent_friction_points),
+                last_interaction_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            return await self._repository.upsert(record)
+        if existing.tenant_id != tenant_id or existing.user_id != user_id:
+            raise PermissionError("relationship state is not visible to caller")
+        updated = existing.model_copy(
+            update={
+                "familiarity": _bounded_confidence(existing.familiarity + familiarity_delta),
+                "preferred_language": preferred_language or existing.preferred_language,
+                "preferred_confirmation_style": preferred_confirmation_style
+                or existing.preferred_confirmation_style,
+                "shared_milestones": _merge_unique(
+                    existing.shared_milestones,
+                    shared_milestones,
+                ),
+                "recent_friction_points": _merge_unique(
+                    existing.recent_friction_points,
+                    recent_friction_points,
+                ),
+                "last_interaction_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+        return await self._repository.upsert(updated)
+
+    async def update_world_state(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str,
+        facts: tuple[str, ...] = (),
+        open_items: tuple[str, ...] = (),
+        completed_items: tuple[str, ...] = (),
+        future_events: tuple[str, ...] = (),
+        evidence: CognitiveEvidence | None = None,
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
+    ) -> WorldStateRecord:
+        record_id = _stable_record_id("world", tenant_id, user_id, memory_scope, scope)
+        timestamp = self._now()
+        existing = await self._repository.get(WorldStateRecord, record_id)
+        if existing is None:
+            record = WorldStateRecord(
+                id=record_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                memory_scope=memory_scope,
+                scope=scope,
+                facts=_merge_unique((), facts),
+                open_items=_merge_unique((), open_items),
+                future_events=_merge_unique((), future_events),
+                last_verified_at=timestamp if evidence is not None else None,
+                evidence=(evidence,) if evidence is not None else (),
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            return await self._repository.upsert(record)
+        if existing.tenant_id != tenant_id or existing.user_id != user_id:
+            raise PermissionError("world state is not visible to caller")
+        remaining_open_items = _remove_items(existing.open_items, completed_items)
+        updated = existing.model_copy(
+            update={
+                "facts": _merge_unique(existing.facts, facts),
+                "open_items": _merge_unique(remaining_open_items, open_items),
+                "future_events": _merge_unique(existing.future_events, future_events),
+                "last_verified_at": timestamp if evidence is not None else existing.last_verified_at,
+                "evidence": (*existing.evidence, evidence)
+                if evidence is not None
+                else existing.evidence,
                 "updated_at": timestamp,
             }
         )
