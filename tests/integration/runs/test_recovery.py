@@ -744,6 +744,8 @@ async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     advisor = PersistentHermesRunAdvisor(run_session_factory)
     lesson_payload = {
         "id": "hermes_unconfirmed_dispatch",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "outcome": "success",
         "lesson": "Use dispatch for smoke approval planning tasks.",
         "summary": "Learned success pattern: dispatch for planning.",
@@ -815,6 +817,8 @@ async def test_persistent_hermes_runtime_advice_respects_main_agent_policy(
     advisor = PersistentHermesRunAdvisor(run_session_factory)
     confirmed_lesson = {
         "id": "hermes_confirmed_policy",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "outcome": "success",
         "lesson": "Use dispatch for planning tasks.",
         "summary": "Learned success pattern: dispatch for planning.",
