@@ -14,6 +14,8 @@ from agent_hub.cognitive.types import (
     ExperienceStatus,
     RelationshipStateRecord,
     SkillCandidateRecord,
+    StrategyRecord,
+    StrategyStatus,
     WorldStateRecord,
 )
 
@@ -44,6 +46,9 @@ class CognitiveStateRepository(Protocol):
     async def upsert(self, record: SkillCandidateRecord) -> SkillCandidateRecord: ...
 
     @overload
+    async def upsert(self, record: StrategyRecord) -> StrategyRecord: ...
+
+    @overload
     async def upsert(self, record: RelationshipStateRecord) -> RelationshipStateRecord: ...
 
     @overload
@@ -58,6 +63,11 @@ class CognitiveStateRepository(Protocol):
     async def get(
         self, record_type: type[SkillCandidateRecord], record_id: str | UUID
     ) -> SkillCandidateRecord | None: ...
+
+    @overload
+    async def get(
+        self, record_type: type[StrategyRecord], record_id: str | UUID
+    ) -> StrategyRecord | None: ...
 
     @overload
     async def get(
@@ -86,6 +96,15 @@ class CognitiveStateRepository(Protocol):
         tenant_id: UUID,
         user_id: UUID,
     ) -> tuple[SkillCandidateRecord, ...]: ...
+
+    @overload
+    async def list_for_user(
+        self,
+        record_type: type[StrategyRecord],
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> tuple[StrategyRecord, ...]: ...
 
 
 def _bounded_confidence(value: float) -> float:
@@ -123,6 +142,22 @@ def _merge_evidence(
             seen.add(key)
             result.append(item)
     return tuple(result)
+
+
+def _matches_request(value: str, request: str) -> bool:
+    haystack = value.casefold()
+    for token in _request_tokens(request):
+        if token in haystack:
+            return True
+    return False
+
+
+def _request_tokens(request: str) -> tuple[str, ...]:
+    normalized = request.casefold()
+    separators = ",.;:!?，。；：！？、()（）[]【】{}<>《》\n\t\r"
+    for separator in separators:
+        normalized = normalized.replace(separator, " ")
+    return tuple(token for token in normalized.split(" ") if len(token) >= 2)
 
 
 class ExperienceService:
@@ -352,6 +387,149 @@ class CognitiveStateService:
         )
         return await self._repository.upsert(updated)
 
+    async def create_strategy_candidate(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        name: str,
+        context: str,
+        strategy: str,
+        rationale: str,
+        evidence: tuple[CognitiveEvidence, ...],
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
+        confidence: float = 0.62,
+        contradictions: tuple[CognitiveEvidence, ...] = (),
+        tags: tuple[str, ...] = (),
+        applies_to_modes: tuple[str, ...] = (),
+        applies_to_agents: tuple[str, ...] = (),
+    ) -> StrategyRecord:
+        timestamp = self._now()
+        record = StrategyRecord(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"agent-hub:strategy:{tenant_id}:{user_id}:{memory_scope.value}:{name}",
+            ),
+            tenant_id=tenant_id,
+            user_id=user_id,
+            memory_scope=memory_scope,
+            name=name,
+            context=context,
+            strategy=strategy,
+            rationale=rationale,
+            status=StrategyStatus.CANDIDATE,
+            confidence=confidence,
+            evidence=evidence,
+            contradictions=contradictions,
+            tags=tags,
+            applies_to_modes=applies_to_modes,
+            applies_to_agents=applies_to_agents,
+            last_verified_at=timestamp,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        return await self._repository.upsert(record)
+
+    async def confirm_strategy(
+        self,
+        strategy_id: UUID,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> StrategyRecord:
+        strategy = await self._owned_strategy(strategy_id, tenant_id=tenant_id, user_id=user_id)
+        timestamp = self._now()
+        updated = strategy.model_copy(
+            update={
+                "status": StrategyStatus.ACTIVE,
+                "last_verified_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+        return await self._repository.upsert(updated)
+
+    async def reject_strategy(
+        self,
+        strategy_id: UUID,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> StrategyRecord:
+        strategy = await self._owned_strategy(strategy_id, tenant_id=tenant_id, user_id=user_id)
+        updated = strategy.model_copy(
+            update={"status": StrategyStatus.REJECTED, "updated_at": self._now()}
+        )
+        return await self._repository.upsert(updated)
+
+    async def select_strategies_for_task(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        request: str,
+        mode: str,
+        limit: int = 3,
+        include_candidates: bool = False,
+    ) -> tuple[StrategyRecord, ...]:
+        records = await self._repository.list_for_user(
+            StrategyRecord,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        scored: list[tuple[float, StrategyRecord]] = []
+        for strategy in records:
+            if not self._strategy_selectable(
+                strategy,
+                mode=mode,
+                include_candidates=include_candidates,
+            ):
+                continue
+            score = self._strategy_score(strategy, request=request)
+            if score <= 0:
+                continue
+            scored.append((score, strategy))
+        scored.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].created_at))
+        return tuple(strategy for _score, strategy in scored[: max(0, limit)])
+
+    async def record_strategy_use_outcome(
+        self,
+        strategy_id: UUID,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        succeeded: bool,
+        evidence: CognitiveEvidence,
+    ) -> StrategyRecord:
+        strategy = await self._owned_strategy(strategy_id, tenant_id=tenant_id, user_id=user_id)
+        timestamp = self._now()
+        use_count = strategy.use_count + 1
+        success_count = strategy.success_count + (1 if succeeded else 0)
+        failure_count = strategy.failure_count + (0 if succeeded else 1)
+        confidence = _bounded_confidence(strategy.confidence + (0.05 if succeeded else -0.08))
+        updated = strategy.model_copy(
+            update={
+                "confidence": confidence,
+                "evidence": (*strategy.evidence, evidence) if succeeded else strategy.evidence,
+                "contradictions": strategy.contradictions
+                if succeeded
+                else (*strategy.contradictions, evidence),
+                "use_count": use_count,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "last_used_at": timestamp,
+                "last_verified_at": timestamp,
+                "version": strategy.version + 1,
+                "status": self._strategy_status(
+                    confidence=confidence,
+                    success_count=success_count,
+                    failure_count=failure_count,
+                    current_status=strategy.status,
+                ),
+                "updated_at": timestamp,
+            }
+        )
+        return await self._repository.upsert(updated)
+
     async def update_relationship_state(
         self,
         *,
@@ -480,6 +658,20 @@ class CognitiveStateService:
             None,
         )
 
+    async def _owned_strategy(
+        self,
+        strategy_id: UUID,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> StrategyRecord:
+        strategy = await self._repository.get(StrategyRecord, strategy_id)
+        if strategy is None:
+            raise CognitiveRecordNotFound("strategy not found")
+        if strategy.tenant_id != tenant_id or strategy.user_id != user_id:
+            raise PermissionError("strategy is not visible to caller")
+        return strategy
+
     @staticmethod
     def _belief_status(*, confidence: float, supported: bool) -> str:
         if confidence <= 0.24:
@@ -502,6 +694,53 @@ class CognitiveStateService:
             return "contested"
         if success_count >= 2 and confidence >= 0.72:
             return "active"
+        return current_status
+
+    @staticmethod
+    def _strategy_selectable(
+        strategy: StrategyRecord,
+        *,
+        mode: str,
+        include_candidates: bool,
+    ) -> bool:
+        if strategy.status in {
+            StrategyStatus.REJECTED,
+            StrategyStatus.DEPRECATED,
+            StrategyStatus.CONTESTED,
+        }:
+            return False
+        if strategy.status is StrategyStatus.CANDIDATE and not include_candidates:
+            return False
+        if strategy.confidence < 0.6:
+            return False
+        return not strategy.applies_to_modes or mode in strategy.applies_to_modes
+
+    @staticmethod
+    def _strategy_score(strategy: StrategyRecord, *, request: str) -> float:
+        searchable = (
+            strategy.name,
+            strategy.context,
+            strategy.strategy,
+            strategy.rationale,
+            *strategy.tags,
+        )
+        matches = sum(1 for value in searchable if _matches_request(value, request))
+        if matches == 0:
+            return 0.0
+        return float(matches) + strategy.confidence
+
+    @staticmethod
+    def _strategy_status(
+        *,
+        confidence: float,
+        success_count: int,
+        failure_count: int,
+        current_status: StrategyStatus,
+    ) -> StrategyStatus:
+        if confidence <= 0.24:
+            return StrategyStatus.DEPRECATED
+        if failure_count > success_count and confidence < 0.45:
+            return StrategyStatus.CONTESTED
         return current_status
 
 

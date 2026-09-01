@@ -16,6 +16,7 @@ from agent_hub.cognitive.types import (
     ReflectionRecord,
     RelationshipStateRecord,
     SkillCandidateRecord,
+    StrategyRecord,
     WorldStateRecord,
 )
 from agent_hub.db.models import AdminResourceRow
@@ -28,6 +29,7 @@ _RECORD_STORAGE: dict[type[object], tuple[str, str]] = {
     RelationshipStateRecord: ("cognitive_relationship:", "relationship"),
     WorldStateRecord: ("cognitive_world:", "world_state"),
     SkillCandidateRecord: ("cognitive_skill:", "skill_candidate"),
+    StrategyRecord: ("cognitive_strategy:", "strategy"),
 }
 
 CognitiveRecord = (
@@ -36,6 +38,7 @@ CognitiveRecord = (
     | RelationshipStateRecord
     | WorldStateRecord
     | SkillCandidateRecord
+    | StrategyRecord
 )
 CognitiveRecordT = TypeVar("CognitiveRecordT", bound=CognitiveRecord)
 

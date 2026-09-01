@@ -28,6 +28,14 @@ class ExperienceStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class StrategyStatus(StrEnum):
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    CONTESTED = "contested"
+    DEPRECATED = "deprecated"
+    REJECTED = "rejected"
+
+
 class CognitiveMemoryScope(StrEnum):
     USER = "user"
     ROOT = "root"
@@ -223,6 +231,65 @@ class SkillCandidateRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_growth_counts(self) -> SkillCandidateRecord:
+        if self.success_count + self.failure_count > self.use_count:
+            raise ValueError("success and failure counts cannot exceed use count")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at cannot be before created_at")
+        return self
+
+
+class StrategyRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
+    name: str = Field(min_length=1, max_length=128)
+    context: str = Field(min_length=1, max_length=512)
+    strategy: str = Field(min_length=1, max_length=1200)
+    rationale: str = Field(min_length=1, max_length=512)
+    status: StrategyStatus = StrategyStatus.CANDIDATE
+    confidence: float = Field(default=0.62, ge=0, le=1)
+    evidence: tuple[CognitiveEvidence, ...] = ()
+    contradictions: tuple[CognitiveEvidence, ...] = ()
+    tags: tuple[str, ...] = ()
+    applies_to_modes: tuple[str, ...] = ()
+    applies_to_agents: tuple[str, ...] = ()
+    use_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    last_used_at: datetime | None = None
+    last_verified_at: datetime | None = None
+    version: int = Field(default=1, ge=1)
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def active_for_runtime(self) -> bool:
+        return self.status is StrategyStatus.ACTIVE
+
+    @field_validator("name", "context", "strategy", "rationale")
+    @classmethod
+    def clean_body_text(cls, value: str) -> str:
+        return _bounded_printable(value)
+
+    @field_validator("tags", "applies_to_modes", "applies_to_agents")
+    @classmethod
+    def clean_string_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            cleaned = _bounded_printable(item)
+            if len(cleaned) > 128:
+                raise ValueError("strategy identifiers must be bounded")
+            if cleaned not in seen:
+                seen.add(cleaned)
+                result.append(cleaned)
+        return tuple(result)
+
+    @model_validator(mode="after")
+    def validate_growth_counts(self) -> StrategyRecord:
         if self.success_count + self.failure_count > self.use_count:
             raise ValueError("success and failure counts cannot exceed use count")
         if self.updated_at < self.created_at:

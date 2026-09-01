@@ -12,6 +12,8 @@ from agent_hub.cognitive.types import (
     CognitiveMemoryScope,
     RelationshipStateRecord,
     SkillCandidateRecord,
+    StrategyRecord,
+    StrategyStatus,
 )
 
 
@@ -112,3 +114,66 @@ async def test_cognitive_record_repository_keeps_record_types_separate() -> None
 
     assert relationships == (relationship,)
     assert skills == (skill,)
+
+
+@pytest.mark.asyncio
+async def test_cognitive_record_repository_scopes_user_and_root_strategies() -> None:
+    now = datetime.now(UTC)
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    other_user_id = uuid4()
+    other_tenant_id = uuid4()
+    repository = InMemoryCognitiveRecordRepository()
+    owner_strategy = StrategyRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        memory_scope=CognitiveMemoryScope.USER,
+        name="private-status-summary",
+        context="该用户询问项目状态。",
+        strategy="先给结论，再列验证证据。",
+        rationale="该用户纠正过冗长过程输出。",
+        status=StrategyStatus.ACTIVE,
+        confidence=0.82,
+        evidence=(CognitiveEvidence(source_type="feedback", source_id="msg-1", note="explicit preference"),),
+        contradictions=(),
+        tags=("status", "summary"),
+        applies_to_modes=("direct",),
+        created_at=now,
+        updated_at=now,
+    )
+    root_strategy = StrategyRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        memory_scope=CognitiveMemoryScope.ROOT,
+        name="repository-boundary",
+        context="任务涉及 CubeAgent 仓库范围。",
+        strategy="只做纯对话 Agent 改动，不做 harness 或部署。",
+        rationale="仓库边界是 root 级约束。",
+        status=StrategyStatus.ACTIVE,
+        confidence=0.9,
+        evidence=(CognitiveEvidence(source_type="handoff", source_id="handoff-1", note="project boundary"),),
+        contradictions=(),
+        tags=("cubeagent", "boundary"),
+        applies_to_modes=("hybrid", "dispatch"),
+        created_at=now,
+        updated_at=now,
+    )
+
+    await repository.upsert(owner_strategy)
+    await repository.upsert(root_strategy)
+
+    owner_records = await repository.list_for_user(
+        StrategyRecord, tenant_id=tenant_id, user_id=owner_user_id
+    )
+    other_user_records = await repository.list_for_user(
+        StrategyRecord, tenant_id=tenant_id, user_id=other_user_id
+    )
+    other_tenant_records = await repository.list_for_user(
+        StrategyRecord, tenant_id=other_tenant_id, user_id=other_user_id
+    )
+
+    assert [item.id for item in owner_records] == [owner_strategy.id, root_strategy.id]
+    assert [item.id for item in other_user_records] == [root_strategy.id]
+    assert other_tenant_records == ()

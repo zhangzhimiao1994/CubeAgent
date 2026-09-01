@@ -13,6 +13,8 @@ from agent_hub.cognitive.types import (
     ExperienceStatus,
     RelationshipStateRecord,
     SkillCandidateRecord,
+    StrategyRecord,
+    StrategyStatus,
     WorldStateRecord,
 )
 
@@ -165,3 +167,34 @@ def test_relationship_world_and_skill_records_are_separate_from_runtime_permissi
     assert relationship.preferred_language == "zh-CN"
     assert world.scope == "project:cubeagent"
     assert skill.status == "candidate"
+
+
+def test_strategy_record_starts_as_candidate_and_tracks_outcomes() -> None:
+    now = datetime.now(UTC)
+    record = StrategyRecord(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        user_id=uuid4(),
+        name="large-task-split-first",
+        context="用户要求完成大范围系统测试或多模块改造。",
+        strategy="先拆分任务，分别验证，再汇总结论。",
+        rationale="大任务直接执行容易超时或遗漏。",
+        status=StrategyStatus.CANDIDATE,
+        confidence=0.66,
+        evidence=(CognitiveEvidence(source_type="reflection", source_id="ref-1", note="failure analysis"),),
+        contradictions=(),
+        tags=("large-task", "split", "verify"),
+        applies_to_modes=("hybrid", "dispatch"),
+        use_count=3,
+        success_count=2,
+        failure_count=1,
+        last_used_at=now,
+        last_verified_at=now,
+        version=2,
+        created_at=now,
+        updated_at=now,
+    )
+
+    assert record.active_for_runtime is False
+    assert record.success_count + record.failure_count <= record.use_count
+    assert record.status is StrategyStatus.CANDIDATE

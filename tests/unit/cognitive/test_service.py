@@ -18,6 +18,7 @@ from agent_hub.cognitive.types import (
     ExperienceKind,
     ExperienceStatus,
     SkillCandidateRecord,
+    StrategyStatus,
 )
 
 
@@ -521,3 +522,189 @@ async def test_skill_promotion_updates_existing_candidate_without_duplicate() ->
     assert updated.id == original.id
     assert updated.version == original.version + 1
     assert updated.steps == ("先压缩输入。", "再拆分审查块。")
+
+
+@pytest.mark.asyncio
+async def test_strategy_library_candidate_is_not_selected_until_confirmed() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+
+    candidate = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="reviewer-timeout-recovery",
+        context="reviewer 审查大输入时超时。",
+        strategy="先压缩输入，再拆分审查块。",
+        rationale="大输入直接审查容易超时。",
+        evidence=(CognitiveEvidence(source_type="reflection", source_id="ref-1", note="timeout analysis"),),
+        tags=("reviewer", "timeout"),
+        applies_to_modes=("hybrid", "dispatch"),
+        confidence=0.78,
+    )
+
+    before_confirm = await service.select_strategies_for_task(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request="reviewer 审查时又 timeout 了",
+        mode="hybrid",
+    )
+    confirmed = await service.confirm_strategy(candidate.id, tenant_id=tenant_id, user_id=user_id)
+    after_confirm = await service.select_strategies_for_task(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request="reviewer 审查时又 timeout 了",
+        mode="hybrid",
+    )
+
+    assert candidate.status is StrategyStatus.CANDIDATE
+    assert candidate.active_for_runtime is False
+    assert before_confirm == ()
+    assert confirmed.status is StrategyStatus.ACTIVE
+    assert confirmed.active_for_runtime is True
+    assert [item.id for item in after_confirm] == [candidate.id]
+
+
+@pytest.mark.asyncio
+async def test_strategy_library_selects_active_relevant_visible_high_confidence_strategies() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    other_user_id = uuid4()
+    visible = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        memory_scope=CognitiveMemoryScope.ROOT,
+        name="cubeagent-boundary",
+        context="CubeAgent 仓库任务。",
+        strategy="只做纯对话 Agent，不做 harness，不部署。",
+        rationale="当前仓库边界要求。",
+        evidence=(CognitiveEvidence(source_type="handoff", source_id="handoff-1", note="project boundary"),),
+        tags=("cubeagent", "harness", "deploy"),
+        applies_to_modes=("hybrid",),
+        confidence=0.9,
+    )
+    visible = await service.confirm_strategy(visible.id, tenant_id=tenant_id, user_id=owner_user_id)
+    low_confidence = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        name="weak-boundary",
+        context="CubeAgent 仓库任务。",
+        strategy="弱信号不应进入选择。",
+        rationale="证据不足。",
+        evidence=(CognitiveEvidence(source_type="note", source_id="n-1", note="weak"),),
+        tags=("cubeagent",),
+        applies_to_modes=("hybrid",),
+        confidence=0.52,
+    )
+    await service.confirm_strategy(low_confidence.id, tenant_id=tenant_id, user_id=owner_user_id)
+    wrong_mode = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        name="direct-only",
+        context="direct 模式任务。",
+        strategy="direct 专用策略不应进入 hybrid。",
+        rationale="模式不匹配。",
+        evidence=(CognitiveEvidence(source_type="note", source_id="n-2", note="mode"),),
+        tags=("cubeagent",),
+        applies_to_modes=("direct",),
+        confidence=0.9,
+    )
+    await service.confirm_strategy(wrong_mode.id, tenant_id=tenant_id, user_id=owner_user_id)
+    irrelevant = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        name="billing-response",
+        context="用户询问账单。",
+        strategy="先解释账单口径。",
+        rationale="账单类问题需要口径。",
+        evidence=(CognitiveEvidence(source_type="note", source_id="n-3", note="billing"),),
+        tags=("billing",),
+        applies_to_modes=("hybrid",),
+        confidence=0.9,
+    )
+    await service.confirm_strategy(irrelevant.id, tenant_id=tenant_id, user_id=owner_user_id)
+
+    selected = await service.select_strategies_for_task(
+        tenant_id=tenant_id,
+        user_id=other_user_id,
+        request="继续 CubeAgent 认知层，仓库只做纯对话 Agent，不要做 harness 或部署",
+        mode="hybrid",
+    )
+
+    assert [item.id for item in selected] == [visible.id]
+
+
+@pytest.mark.asyncio
+async def test_strategy_library_reject_and_use_outcome_update_learning_state() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    timestamps = iter(
+        [
+            datetime(2026, 9, 2, 10, 0, tzinfo=UTC),
+            datetime(2026, 9, 2, 10, 1, tzinfo=UTC),
+            datetime(2026, 9, 2, 10, 2, tzinfo=UTC),
+            datetime(2026, 9, 2, 10, 3, tzinfo=UTC),
+            datetime(2026, 9, 2, 10, 4, tzinfo=UTC),
+        ]
+    )
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: next(timestamps))
+    tenant_id = uuid4()
+    user_id = uuid4()
+    rejected_candidate = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="obsolete",
+        context="旧任务。",
+        strategy="旧策略。",
+        rationale="不再适用。",
+        evidence=(CognitiveEvidence(source_type="note", source_id="n-1", note="obsolete"),),
+        tags=("obsolete",),
+        confidence=0.7,
+    )
+    rejected = await service.reject_strategy(
+        rejected_candidate.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+    active = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="reviewer-timeout-recovery",
+        context="reviewer 审查大输入时超时。",
+        strategy="先压缩输入，再拆分审查块。",
+        rationale="大输入直接审查容易超时。",
+        evidence=(CognitiveEvidence(source_type="reflection", source_id="ref-1", note="timeout analysis"),),
+        tags=("reviewer", "timeout"),
+        applies_to_modes=("hybrid",),
+        confidence=0.78,
+    )
+    active = await service.confirm_strategy(active.id, tenant_id=tenant_id, user_id=user_id)
+
+    failed = await service.record_strategy_use_outcome(
+        active.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=False,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-1", note="strategy failed"),
+    )
+
+    assert rejected.status is StrategyStatus.REJECTED
+    assert rejected.active_for_runtime is False
+    assert failed.use_count == 1
+    assert failed.success_count == 0
+    assert failed.failure_count == 1
+    assert failed.confidence < active.confidence
+    assert failed.status is StrategyStatus.ACTIVE
+    assert failed.version == active.version + 1
+    assert len(failed.evidence) == 1
+    assert len(failed.contradictions) == 1
+    assert failed.last_used_at == datetime(2026, 9, 2, 10, 4, tzinfo=UTC)
+    assert failed.last_verified_at == datetime(2026, 9, 2, 10, 4, tzinfo=UTC)

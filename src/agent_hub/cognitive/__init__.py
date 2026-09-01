@@ -25,6 +25,8 @@ from agent_hub.cognitive.types import (
     ReflectionRecord,
     RelationshipStateRecord,
     SkillCandidateRecord,
+    StrategyRecord,
+    StrategyStatus,
     WorldStateRecord,
 )
 
@@ -46,6 +48,8 @@ __all__ = [
     "SkillCandidateRecord",
     "SkillPromotionNotReady",
     "SkillPromotionService",
+    "StrategyRecord",
+    "StrategyStatus",
     "WorldStateRecord",
     "reflect_from_feedback",
     "route_cognitive_context",
