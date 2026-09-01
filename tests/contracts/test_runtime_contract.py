@@ -873,10 +873,10 @@ async def test_invalid_model_text_is_redacted() -> None:
 
 @pytest.mark.parametrize(
     "usage",
-    [None, TokenUsage(1, 1000, 1001), TokenUsage(1000, 1, 1001)],
+    [TokenUsage(1, 1000, 1001), TokenUsage(1000, 1, 1001)],
 )
 async def test_direct_fails_closed_when_usage_cannot_prove_budget(
-    usage: TokenUsage | None,
+    usage: TokenUsage,
 ) -> None:
     gateway = FakeGateway(ModelResponse(text="answer", usage=usage))
     runtime = DirectRuntime(gateway, logical_model="general")
@@ -884,6 +884,15 @@ async def test_direct_fails_closed_when_usage_cannot_prove_budget(
         await collect(runtime, context(token_budget=1000))
     with pytest.raises(RuntimeExecutionError, match="boundary"):
         await runtime.save_checkpoint()
+
+
+async def test_direct_accepts_usage_less_response_when_request_budget_is_bounded() -> None:
+    gateway = FakeGateway(ModelResponse(text="answer", usage=None))
+    runtime = DirectRuntime(gateway, logical_model="general")
+
+    events = await collect(runtime, context(token_budget=10_000))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_direct_accepts_provider_usage_with_additional_token_categories() -> None:
