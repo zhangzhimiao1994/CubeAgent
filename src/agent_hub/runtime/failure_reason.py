@@ -144,6 +144,15 @@ def runtime_failure_diagnostic_from_reason(
         or "model response is empty" in lowered
     ):
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
+    elif "model response budget is unverifiable" in lowered:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="model_usage_unverifiable",
+            error_code="runtime.model_usage_unverifiable",
+            retryable=True,
+            suggested_action="模型返回内容可用但 usage 账本不可验证；系统会优先使用保守估算，若仍失败请检查模型适配器 usage 字段、输出长度和上下文预算。",
+        )
     elif lowered.startswith("capability failed:"):
         diagnostic = _base_diagnostic(
             normalized,

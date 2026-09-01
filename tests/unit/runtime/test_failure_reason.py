@@ -127,6 +127,21 @@ def test_runtime_failure_diagnostic_classifies_prefixed_empty_model_response() -
     assert "空" in str(diagnostic["suggested_action"])
 
 
+def test_runtime_failure_diagnostic_classifies_unverifiable_model_budget() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "hybrid direct failed: model response budget is unverifiable"
+    )
+
+    assert diagnostic["error_summary"] == (
+        "hybrid direct failed: model response budget is unverifiable"
+    )
+    assert diagnostic["error_stage"] == "runtime_accounting"
+    assert diagnostic["error_category"] == "model_usage_unverifiable"
+    assert diagnostic["error_code"] == "runtime.model_usage_unverifiable"
+    assert diagnostic["retryable"] is True
+    assert "usage" in str(diagnostic["suggested_action"]).lower()
+
+
 def test_runtime_failure_diagnostic_from_reason_redacts_sensitive_unknown_reason() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("Authorization: Bearer sk-secret failed")
 

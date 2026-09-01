@@ -969,11 +969,26 @@ export class ApiError extends Error {
   }
 }
 
+const EXPIRED_LOGIN_MESSAGE = "登录已失效，请重新登录。";
+
+function isExpiredLoginError(error: ApiError): boolean {
+  return (
+    error.code === "invalid_token" ||
+    (error.status === 401 && error.message.toLowerCase().includes("invalid access token"))
+  );
+}
+
 export function formatApiError(error: unknown, fallback: string): string {
   if (!(error instanceof ApiError)) return fallback;
+  if (isExpiredLoginError(error)) return EXPIRED_LOGIN_MESSAGE;
   const parts = [error.code, `HTTP ${error.status}`];
   if (error.errorId) parts.push(`error ${error.errorId}`);
   return `${fallback}: ${error.message} (${parts.join(", ")})`;
+}
+
+function clearExpiredSession(error: ApiError): ApiError {
+  if (isExpiredLoginError(error)) clearSession();
+  return error;
 }
 
 async function errorFromResponse(response: Response): Promise<ApiError> {
@@ -1016,7 +1031,7 @@ async function request<T>(
     throw new ApiError("network request failed", 0, "network_error");
   }
   if (!response.ok) {
-    throw await errorFromResponse(response);
+    throw clearExpiredSession(await errorFromResponse(response));
   }
   const payload = await response.json();
   const parsed = schema.safeParse(payload);
@@ -1047,7 +1062,7 @@ async function requestNoContent(path: string, init: RequestInit): Promise<void> 
     throw new ApiError("network request failed", 0, "network_error");
   }
   if (!response.ok) {
-    throw await errorFromResponse(response);
+    throw clearExpiredSession(await errorFromResponse(response));
   }
 }
 
@@ -1071,7 +1086,7 @@ async function requestBinary<T>(
     throw new ApiError("network request failed", 0, "network_error");
   }
   if (!response.ok) {
-    throw await errorFromResponse(response);
+    throw clearExpiredSession(await errorFromResponse(response));
   }
   const payload = await response.json();
   const parsed = schema.safeParse(payload);

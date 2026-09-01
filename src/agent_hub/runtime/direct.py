@@ -56,6 +56,7 @@ class _PromptOutcome:
 class _RequestOutcome:
     request: ModelRequest | None = field(default=None, repr=False)
     included_source_ids: tuple[str, ...] = ()
+    prompt_estimate: int = 0
     error_code: str | None = None
 
 
@@ -93,6 +94,54 @@ def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
         return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
     prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
     return f"{prefix}{suffix}"
+
+
+def _verified_response_usage(
+    usage: TokenUsage | None,
+    *,
+    text: str,
+    request: ModelRequest,
+    context: TaskContext,
+    prompt_estimate: int,
+) -> TokenUsage | None:
+    if usage is None:
+        return _estimated_response_usage(
+            text=text,
+            request=request,
+            context=context,
+            prompt_estimate=prompt_estimate,
+        )
+    if (
+        usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
+        or usage.completion_tokens > request.max_output_tokens
+        or usage.total_tokens > context.token_budget
+    ):
+        return None
+    return usage
+
+
+def _estimated_response_usage(
+    *,
+    text: str,
+    request: ModelRequest,
+    context: TaskContext,
+    prompt_estimate: int,
+) -> TokenUsage | None:
+    prompt_tokens = max(0, prompt_estimate)
+    completion_tokens = request.max_output_tokens
+    total_tokens = prompt_tokens + completion_tokens
+    if (
+        not text.strip()
+        or len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES
+        or completion_tokens <= 0
+        or total_tokens > context.token_budget
+    ):
+        return None
+    return TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 class DirectRunStream:
@@ -202,6 +251,7 @@ class DirectRuntime:
                 _raise_execution_error(error_code)
             request = request_outcome.request
             included_source_ids = request_outcome.included_source_ids
+            prompt_estimate = request_outcome.prompt_estimate
             del request_outcome
             gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
             if self._active_token is not token:  # pragma: no cover - defensive
@@ -266,13 +316,14 @@ class DirectRuntime:
                 gateway_task = None
                 del text, response, completion, request, included_source_ids, context
                 _raise_execution_error("model response is invalid")
-            usage = response.usage
-            if (
-                usage is None
-                or usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
-                or usage.completion_tokens > request.max_output_tokens
-                or usage.total_tokens > context.token_budget
-            ):
+            usage = _verified_response_usage(
+                response.usage,
+                text=text,
+                request=request,
+                context=context,
+                prompt_estimate=prompt_estimate,
+            )
+            if usage is None:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
                 gateway_task = None
@@ -416,10 +467,15 @@ class DirectRuntime:
             del error
             failed = True
         included_source_ids = prompt.included_source_ids
+        prompt_estimate = prompt.prompt_estimate
         del prompt, context, messages
         if failed or request is None:
             return _RequestOutcome(error_code="runtime model request is invalid")
-        return _RequestOutcome(request=request, included_source_ids=included_source_ids)
+        return _RequestOutcome(
+            request=request,
+            included_source_ids=included_source_ids,
+            prompt_estimate=prompt_estimate,
+        )
 
     def _build_prompt(
         self, context: TaskContext

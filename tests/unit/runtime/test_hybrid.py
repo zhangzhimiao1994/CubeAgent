@@ -7,6 +7,8 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.types import ModelRequest, ModelResponse
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -15,6 +17,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hybrid import HybridRuntime
 
 
@@ -138,6 +141,17 @@ class UnusedRuntime(FailingRuntime):
 class RecordingArtifactRuntime(MultiArtifactRuntime):
     def __init__(self, mode: TaskMode, output: Artifact) -> None:
         super().__init__(mode, (output,))
+
+
+class UsageLessTextGateway:
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        return GatewayCompletion(
+            response=ModelResponse(text="这是 direct fallback 生成的最终回答。", usage=None),
+            deployment_id="main_deployment",
+            logical_model=request.logical_model,
+            provider_id="test",
+            provider_model="test/model",
+        )
 
 
 def artifact(
@@ -349,6 +363,45 @@ async def test_hybrid_runtime_synthesizes_when_discussion_fails_with_only_histor
     )
     assert any(
         event.kind is EventKind.ARTIFACT_CREATED and event.artifact == final_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_direct_fallback_completes_when_provider_omits_usage() -> None:
+    run_id = uuid4()
+    history = artifact("conversation_history", "上一轮已经给过两个风格。")
+    runtime = HybridRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, "unused"),
+        FailingRuntime(TaskMode.DISCUSS, "model gateway failed: model response text is empty"),
+        DirectRuntime(UsageLessTextGateway(), logical_model="main"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="这两个风格都给我生成对应的提示词",
+                artifacts=(history,),
+                token_budget=20_000,
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_FAILED
+        and event.reason == "hybrid discuss failed: model gateway failed: model response text is empty"
+        for event in events
+    )
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.content["text"] == "这是 direct fallback 生成的最终回答。"
         for event in events
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
