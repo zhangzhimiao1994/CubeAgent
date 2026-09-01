@@ -6,12 +6,13 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.cognitive.repository import InMemoryExperienceRepository
-from agent_hub.cognitive.service import ExperienceService
+from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.cognitive.types import (
     CognitiveEvidence,
     CognitiveMemoryScope,
     ExperienceKind,
     ExperienceStatus,
+    SkillCandidateRecord,
 )
 
 
@@ -159,3 +160,97 @@ async def test_root_scoped_experience_is_listed_for_other_users_in_same_tenant()
     other_records = await service.list_records(tenant_id=tenant_id, user_id=other_user_id)
 
     assert [item.id for item in other_records] == [record.id]
+
+
+@pytest.mark.asyncio
+async def test_belief_observations_accumulate_evidence_and_contradictions() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+
+    first = await service.record_belief_observation(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        subject="user.workflow_preference",
+        claim="用户偏好默认使用子 agent。",
+        evidence=CognitiveEvidence(source_type="feedback", source_id="msg-1", note="explicit preference"),
+        supported=True,
+    )
+    reinforced = await service.record_belief_observation(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        subject="user.workflow_preference",
+        claim="用户偏好默认使用子 agent。",
+        evidence=CognitiveEvidence(source_type="feedback", source_id="msg-2", note="same preference repeated"),
+        supported=True,
+    )
+    contradicted = await service.record_belief_observation(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        subject="user.workflow_preference",
+        claim="用户偏好默认使用子 agent。",
+        evidence=CognitiveEvidence(source_type="feedback", source_id="msg-3", note="requested inline work"),
+        supported=False,
+    )
+
+    assert reinforced.id == first.id
+    assert reinforced.version == first.version + 1
+    assert reinforced.confidence > first.confidence
+    assert contradicted.id == first.id
+    assert len(contradicted.evidence) == 2
+    assert len(contradicted.contradictions) == 1
+    assert contradicted.confidence < reinforced.confidence
+    assert contradicted.last_verified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_skill_candidate_use_outcomes_update_counts_and_confidence() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    now = datetime.now(UTC)
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+    skill = SkillCandidateRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="reviewer-timeout-recovery",
+        purpose="处理 reviewer 超时。",
+        steps=("压缩输入", "拆分审查", "重试"),
+        output_contract="输出修复结果。",
+        confidence=0.62,
+        evidence=(CognitiveEvidence(source_type="experience", source_id="exp-1", note="candidate created"),),
+        status="candidate",
+        created_at=now,
+        updated_at=now,
+    )
+    await repository.upsert(skill)
+
+    succeeded = await service.record_skill_use_outcome(
+        skill.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=True,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-1", note="worked"),
+    )
+    failed = await service.record_skill_use_outcome(
+        skill.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=False,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-2", note="did not work"),
+    )
+
+    assert succeeded.use_count == 1
+    assert succeeded.success_count == 1
+    assert succeeded.confidence > skill.confidence
+    assert failed.use_count == 2
+    assert failed.success_count == 1
+    assert failed.failure_count == 1
+    assert len(failed.contradictions) == 1
+    assert failed.confidence < succeeded.confidence

@@ -8,7 +8,7 @@ from agent_hub.cognitive.repository import (
     PersistentExperienceRepository,
 )
 from agent_hub.cognitive.router import route_experiences
-from agent_hub.cognitive.service import ExperienceService
+from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.cognitive.types import (
     BeliefRecord,
     CognitiveEvidence,
@@ -26,6 +26,7 @@ __all__ = [
     "BeliefRecord",
     "CognitiveEvidence",
     "CognitiveMemoryScope",
+    "CognitiveStateService",
     "ExperienceKind",
     "ExperienceRecord",
     "ExperienceService",
