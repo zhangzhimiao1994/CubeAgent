@@ -10,6 +10,7 @@ from agent_hub.cognitive.service import ExperienceService
 from agent_hub.cognitive.types import (
     BeliefRecord,
     CognitiveEvidence,
+    CognitiveMemoryScope,
     ExperienceKind,
     ExperienceRecord,
     ExperienceStatus,
@@ -22,6 +23,7 @@ from agent_hub.cognitive.types import (
 __all__ = [
     "BeliefRecord",
     "CognitiveEvidence",
+    "CognitiveMemoryScope",
     "ExperienceKind",
     "ExperienceRecord",
     "ExperienceService",

@@ -896,6 +896,8 @@ export type LogEntry = z.infer<typeof LogEntrySchema>;
 
 const HermesInsightSchema = z.object({
   id: z.string(),
+  user_id: z.string().default(""),
+  memory_scope: z.enum(["user", "root"]).default("user"),
   category: z.enum(["conversation", "scheduler"]).default("conversation"),
   outcome: z.string(),
   lesson: z.string(),
@@ -919,6 +921,8 @@ const CognitiveEvidenceSchema = z.object({
 
 const CognitiveExperienceSchema = z.object({
   id: z.string(),
+  user_id: z.string(),
+  memory_scope: z.enum(["user", "root"]),
   kind: z.enum([
     "user_preference",
     "project_fact",

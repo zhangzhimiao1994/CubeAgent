@@ -96,8 +96,11 @@ async def test_runtime_advice_ignores_confirmed_scheduler_observations() -> None
 
 @pytest.mark.asyncio
 async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
+    actor_id = uuid4()
     conversation_lesson = {
         "id": "hermes_conversation_review",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "category": "conversation",
         "outcome": "success",
         "lesson": "Use group chat when debate review is required.",
@@ -120,7 +123,7 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="please run a debate review",
         mode=TaskMode.AUTO,
         agent_ids=(),
@@ -132,9 +135,92 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_advice_does_not_use_other_users_conversation_lessons() -> None:
+    actor_id = uuid4()
+    other_user_id = uuid4()
+    conversation_lesson = {
+        "id": "hermes_other_user_review",
+        "user_id": str(other_user_id),
+        "memory_scope": "user",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use group chat when debate review is required.",
+        "summary": "Learned success pattern: debate review.",
+        "tags": ["debate", "review"],
+        "weight": 10,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": None,
+        "conversation_id": "conv-review",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(conversation_lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="please run a debate review",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_can_use_root_scoped_conversation_lessons() -> None:
+    actor_id = uuid4()
+    conversation_lesson = {
+        "id": "hermes_root_review",
+        "user_id": str(uuid4()),
+        "memory_scope": "root",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use group chat when debate review is required.",
+        "summary": "Learned success pattern: debate review.",
+        "tags": ["debate", "review"],
+        "weight": 10,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": None,
+        "conversation_id": "conv-review",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(conversation_lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="please run a debate review",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.injected_memories[0].id == "hermes_root_review"
+
+
+@pytest.mark.asyncio
 async def test_runtime_advice_confirmed_conversation_lesson_not_starved_by_scheduler_rows() -> None:
+    actor_id = uuid4()
     confirmed_lesson = {
         "id": "hermes_confirmed_review_starvation",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "category": "conversation",
         "outcome": "success",
         "lesson": "Use group chat when debate review is required.",
@@ -172,7 +258,7 @@ async def test_runtime_advice_confirmed_conversation_lesson_not_starved_by_sched
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="please run a debate review",
         mode=TaskMode.AUTO,
         agent_ids=(),
@@ -185,8 +271,11 @@ async def test_runtime_advice_confirmed_conversation_lesson_not_starved_by_sched
 
 @pytest.mark.asyncio
 async def test_runtime_advice_injects_cross_mode_project_rule_when_relevant() -> None:
+    actor_id = uuid4()
     lesson = {
         "id": "hermes_ui_drawer_rule",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "category": "conversation",
         "outcome": "success",
         "lesson": "调度卡片应默认显示摘要，详情放抽屉，点击遮罩关闭。",
@@ -213,7 +302,7 @@ async def test_runtime_advice_injects_cross_mode_project_rule_when_relevant() ->
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="修改调度卡片 UI，详情用抽屉展示",
         mode=TaskMode.DISPATCH,
         agent_ids=("frontend",),
@@ -227,9 +316,12 @@ async def test_runtime_advice_injects_cross_mode_project_rule_when_relevant() ->
 
 @pytest.mark.asyncio
 async def test_runtime_advice_injects_confirmed_cognitive_experience() -> None:
+    actor_id = uuid4()
     experience_id = uuid4()
     cognitive_experience = {
         "id": str(experience_id),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "kind": "error_handling",
         "status": "confirmed",
         "summary": "分享链接多行文本需要在角色规划前统一校验。",
@@ -265,6 +357,7 @@ async def test_runtime_advice_injects_confirmed_cognitive_experience() -> None:
         [
             [],
             [FakeRow({"hermes_policy": "suggest"})],
+            [],
             [FakeRow(cognitive_experience)],
         ]
     )
@@ -272,7 +365,7 @@ async def test_runtime_advice_injects_confirmed_cognitive_experience() -> None:
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="帮我排查分享链接后多行 control 字符失败",
         mode=TaskMode.HYBRID,
         agent_ids=("main_agent",),
@@ -288,9 +381,12 @@ async def test_runtime_advice_injects_confirmed_cognitive_experience() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_advice_does_not_inject_cognitive_experience_from_short_common_tag() -> None:
+    actor_id = uuid4()
     experience_id = uuid4()
     cognitive_experience = {
         "id": str(experience_id),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "kind": "error_handling",
         "status": "confirmed",
         "summary": "Go release jobs require the release agent.",
@@ -326,6 +422,7 @@ async def test_runtime_advice_does_not_inject_cognitive_experience_from_short_co
         [
             [],
             [FakeRow({"hermes_policy": "suggest"})],
+            [],
             [FakeRow(cognitive_experience)],
         ]
     )
@@ -333,7 +430,7 @@ async def test_runtime_advice_does_not_inject_cognitive_experience_from_short_co
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="ongoing investigation of the dashboard layout",
         mode=TaskMode.DIRECT,
         agent_ids=("frontend",),
@@ -345,8 +442,11 @@ async def test_runtime_advice_does_not_inject_cognitive_experience_from_short_co
 
 @pytest.mark.asyncio
 async def test_runtime_advice_ignores_unconfirmed_cognitive_experience() -> None:
+    actor_id = uuid4()
     cognitive_experience = {
         "id": str(uuid4()),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "kind": "preference",
         "status": "candidate",
         "summary": "候选经验不能直接影响运行时。",
@@ -363,6 +463,7 @@ async def test_runtime_advice_ignores_unconfirmed_cognitive_experience() -> None
         [
             [],
             [FakeRow({"hermes_policy": "suggest"})],
+            [],
             [FakeRow(cognitive_experience)],
         ]
     )
@@ -370,7 +471,7 @@ async def test_runtime_advice_ignores_unconfirmed_cognitive_experience() -> None
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="继续处理候选经验相关任务",
         mode=TaskMode.HYBRID,
         agent_ids=("main_agent",),
@@ -382,8 +483,11 @@ async def test_runtime_advice_ignores_unconfirmed_cognitive_experience() -> None
 
 @pytest.mark.asyncio
 async def test_runtime_advice_skips_same_mode_low_quality_noise() -> None:
+    actor_id = uuid4()
     lesson = {
         "id": "hermes_noise",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "category": "conversation",
         "outcome": "neutral",
         "lesson": "这个任务成功了。",
@@ -409,7 +513,7 @@ async def test_runtime_advice_skips_same_mode_low_quality_noise() -> None:
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="direct 模式继续处理这个任务",
         mode=TaskMode.DIRECT,
         agent_ids=(),
@@ -541,8 +645,11 @@ async def test_runtime_advice_ignores_legacy_scheduler_notice_observations() -> 
 
 @pytest.mark.asyncio
 async def test_runtime_advice_records_conflicting_memory_as_skipped() -> None:
+    actor_id = uuid4()
     lesson = {
         "id": "hermes_hybrid_preference",
+        "user_id": str(actor_id),
+        "memory_scope": "user",
         "category": "conversation",
         "outcome": "success",
         "lesson": "大任务优先使用混合模式。",
@@ -568,7 +675,7 @@ async def test_runtime_advice_records_conflicting_memory_as_skipped() -> None:
 
     advice = await advisor.advise(
         tenant_id=uuid4(),
-        actor_id=uuid4(),
+        actor_id=actor_id,
         message="先跑直连模式，不要混合，处理这个大任务",
         mode=TaskMode.DIRECT,
         agent_ids=(),
@@ -597,10 +704,11 @@ def test_runtime_lesson_summary_localizes_scheduler_outcomes_for_users() -> None
 
 def test_runtime_outcome_without_scheduler_notice_creates_scheduler_observation() -> None:
     run_id = uuid4()
+    actor_id = uuid4()
     payload = _outcome_learning_payload(
         HermesRunOutcome(
             tenant_id=uuid4(),
-            actor_id=uuid4(),
+            actor_id=actor_id,
             run_id=run_id,
             status=RunStatus.COMPLETED,
             mode=TaskMode.HYBRID,
@@ -612,6 +720,8 @@ def test_runtime_outcome_without_scheduler_notice_creates_scheduler_observation(
     )
 
     assert payload["category"] == "scheduler"
+    assert payload["user_id"] == str(actor_id)
+    assert payload["memory_scope"] == "user"
     assert payload["memory_type"] == "runtime_observation"
     assert payload["target"] == "scheduler"
     assert payload["conversation_id"] == "conv-dialog"
@@ -654,10 +764,11 @@ def test_runtime_outcome_with_scheduler_notice_creates_scheduler_observation() -
 
 def test_failed_runtime_outcome_with_notice_creates_cognitive_candidate() -> None:
     run_id = uuid4()
+    actor_id = uuid4()
     payload = _cognitive_candidate_payload_from_outcome(
         HermesRunOutcome(
             tenant_id=uuid4(),
-            actor_id=uuid4(),
+            actor_id=actor_id,
             run_id=run_id,
             status=RunStatus.FAILED,
             mode=TaskMode.HYBRID,
@@ -681,9 +792,124 @@ def test_failed_runtime_outcome_with_notice_creates_cognitive_candidate() -> Non
     assert payload["status"] == "candidate"
     assert payload["active_for_runtime"] is False
     assert payload["source_run_ids"] == [str(run_id)]
+    assert payload["user_id"] == str(actor_id)
+    assert payload["memory_scope"] == "user"
     assert payload["applies_to_modes"] == ["hybrid"]
     assert "quality_reviewer" in cast(list[str], payload["applies_to_agents"])
     assert str(payload["resource_id"]).startswith("cognitive_experience:")
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_does_not_inject_user_scoped_cognitive_experience_from_other_user() -> None:
+    actor_id = uuid4()
+    other_user_id = uuid4()
+    experience_id = uuid4()
+    cognitive_experience = {
+        "id": str(experience_id),
+        "user_id": str(other_user_id),
+        "memory_scope": "user",
+        "kind": "communication_style",
+        "status": "confirmed",
+        "summary": "另一个用户偏好冗长解释。",
+        "lesson": "当用户提到 cognitive-smoke 时输出长篇背景。",
+        "strategy": "输出长篇背景。",
+        "confidence": 0.9,
+        "evidence": [{"source_type": "feedback", "source_id": "other-user", "note": "explicit"}],
+        "contradictions": [],
+        "source_run_ids": [],
+        "source_memory_ids": [],
+        "tags": ["cognitive-smoke"],
+        "applies_to_modes": ["direct"],
+        "applies_to_agents": ["main_agent"],
+        "use_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "active_for_runtime": True,
+        "last_used_at": None,
+        "last_verified_at": None,
+        "version": 1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
+        "storage_kind": "hermes",
+        "resource_id": f"cognitive_experience:{experience_id}",
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [FakeRow(cognitive_experience)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="请做 cognitive-smoke 生产烟测",
+        mode=TaskMode.DIRECT,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_can_inject_root_scoped_cognitive_experience_for_any_user() -> None:
+    actor_id = uuid4()
+    owner_id = uuid4()
+    experience_id = uuid4()
+    cognitive_experience = {
+        "id": str(experience_id),
+        "user_id": str(owner_id),
+        "memory_scope": "root",
+        "kind": "communication_style",
+        "status": "confirmed",
+        "summary": "根经验：生产烟测先给结论。",
+        "lesson": "当用户提到 cognitive-smoke 时，回答应先给结论。",
+        "strategy": "先输出结论，再给证据。",
+        "confidence": 0.9,
+        "evidence": [{"source_type": "feedback", "source_id": "root-policy", "note": "admin confirmed"}],
+        "contradictions": [],
+        "source_run_ids": [],
+        "source_memory_ids": [],
+        "tags": ["cognitive-smoke"],
+        "applies_to_modes": ["direct"],
+        "applies_to_agents": ["main_agent"],
+        "use_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "active_for_runtime": True,
+        "last_used_at": None,
+        "last_verified_at": None,
+        "version": 1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
+        "storage_kind": "hermes",
+        "resource_id": f"cognitive_experience:{experience_id}",
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [FakeRow(cognitive_experience)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=actor_id,
+        message="请做 cognitive-smoke 生产烟测",
+        mode=TaskMode.DIRECT,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.injected_memories[0].summary == "根经验：生产烟测先给结论。"
 
 
 def test_successful_runtime_outcome_without_notice_does_not_create_cognitive_candidate() -> None:

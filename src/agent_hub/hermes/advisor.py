@@ -57,13 +57,16 @@ class PersistentHermesRunAdvisor:
         agent_ids: tuple[str, ...],
         workflow_id: str | None,
     ) -> HermesRunAdvice | None:
-        del actor_id
         if not await self._enabled(tenant_id):
             return None
         policy = await self._main_agent_hermes_policy(tenant_id)
         if policy in {"off", "observe"}:
             return None
-        lessons = [lesson for lesson in await self._lessons(tenant_id) if _lesson_is_conversation_advice(lesson)]
+        lessons = [
+            lesson
+            for lesson in await self._lessons(tenant_id, actor_id)
+            if _lesson_is_conversation_advice(lesson) and _lesson_visible_to_actor(lesson, actor_id)
+        ]
         if not lessons:
             return None
 
@@ -200,7 +203,7 @@ class PersistentHermesRunAdvisor:
             return str(policy)
         return "observe"
 
-    async def _lessons(self, tenant_id: UUID) -> list[dict[str, object]]:
+    async def _lessons(self, tenant_id: UUID, actor_id: UUID) -> list[dict[str, object]]:
         async with self._session_factory() as session:
             conversation_rows = (
                 await session.execute(
@@ -214,6 +217,12 @@ class PersistentHermesRunAdvisor:
                             AdminResourceRow.payload["category"].as_string().is_(None),
                         )
                     )
+                    .where(
+                        or_(
+                            AdminResourceRow.payload["memory_scope"].as_string() == "root",
+                            AdminResourceRow.payload["user_id"].as_string() == str(actor_id),
+                        )
+                    )
                     .where(AdminResourceRow.payload["confirmed_at"].as_string().is_not(None))
                     .order_by(AdminResourceRow.created_at.desc())
                     .limit(200)
@@ -225,6 +234,12 @@ class PersistentHermesRunAdvisor:
                     .where(AdminResourceRow.tenant_id == tenant_id)
                     .where(AdminResourceRow.kind == "hermes")
                     .where(AdminResourceRow.resource_id.like("cognitive_experience:%"))
+                    .where(
+                        or_(
+                            AdminResourceRow.payload["memory_scope"].as_string() == "root",
+                            AdminResourceRow.payload["user_id"].as_string() == str(actor_id),
+                        )
+                    )
                     .where(
                         AdminResourceRow.payload["status"].as_string().in_(("confirmed", "active"))
                     )
@@ -323,6 +338,8 @@ def _outcome_learning_payload(
         noise_risk = 0.35 if outcome.status is RunStatus.COMPLETED else 0.55
     return {
         "id": lesson_id,
+        "user_id": str(outcome.actor_id),
+        "memory_scope": "user",
         "category": category,
         "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
         "lesson": lesson,
@@ -392,6 +409,8 @@ def _cognitive_candidate_payload_from_outcome(
     now = datetime.now(UTC).isoformat()
     return {
         "id": experience_id,
+        "user_id": str(outcome.actor_id),
+        "memory_scope": "user",
         "kind": "error_handling",
         "status": "candidate",
         "summary": summary,
@@ -611,6 +630,14 @@ def _lesson_is_confirmed(lesson: dict[str, object]) -> bool:
         return lesson.get("status") in {"confirmed", "active"} and lesson.get("active_for_runtime") is True
     confirmed_at = lesson.get("confirmed_at")
     return isinstance(confirmed_at, str) and bool(confirmed_at.strip())
+
+
+def _lesson_visible_to_actor(lesson: dict[str, object], actor_id: UUID) -> bool:
+    memory_scope = lesson.get("memory_scope")
+    if memory_scope == "root":
+        return True
+    owner_user_id = lesson.get("user_id")
+    return memory_scope == "user" and owner_user_id == str(actor_id)
 
 
 def _is_cognitive_experience_payload(lesson: dict[str, object]) -> bool:

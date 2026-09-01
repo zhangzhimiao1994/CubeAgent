@@ -21,6 +21,8 @@ import agent_hub.api.routers.admin as admin_router
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
+    HermesInsightResponse,
+    HermesRecommendationRequest,
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
     MainAgentModelConfig,
@@ -43,6 +45,7 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, PermissionDenied, Role
+from agent_hub.cognitive.types import CognitiveMemoryScope, ExperienceStatus
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
@@ -4529,6 +4532,8 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
 
     assert feedback.status_code == 200
     insight_id = feedback.json()["id"]
+    assert feedback.json()["user_id"] == str(USER_ID)
+    assert feedback.json()["memory_scope"] == "user"
     assert feedback.json()["category"] == "conversation"
     assert feedback.json()["conversation_id"] == "conv-architecture-1"
     assert feedback.json()["confirmed_at"] is None
@@ -4577,6 +4582,68 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_hermes_recommendation_respects_user_and_root_scope(tmp_path: Path) -> None:
+    other_user_id = UUID("44444444-4444-4444-8444-444444444444")
+    now = datetime.now(UTC)
+
+    class ScopedHermesService(InMemoryAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hermes_insights = {
+                "other": HermesInsightResponse(
+                    id="other",
+                    user_id=str(other_user_id),
+                    memory_scope=CognitiveMemoryScope.USER,
+                    category="conversation",
+                    outcome="success",
+                    lesson="Use direct mode even when debate review is required.",
+                    summary="Other user lesson.",
+                    user_summary="其他用户的对话记忆。",
+                    run_id=None,
+                    conversation_id="conv-other",
+                    confirmed_at=now,
+                    tags=["debate", "review"],
+                    weight=10,
+                    created_at=now,
+                ),
+                "root": HermesInsightResponse(
+                    id="root",
+                    user_id=str(other_user_id),
+                    memory_scope=CognitiveMemoryScope.ROOT,
+                    category="conversation",
+                    outcome="success",
+                    lesson="Use group chat when debate review is required.",
+                    summary="Root lesson.",
+                    user_summary="根记忆：争议评审优先讨论模式。",
+                    run_id=None,
+                    conversation_id="conv-root",
+                    confirmed_at=now,
+                    tags=["debate", "review"],
+                    weight=5,
+                    created_at=now,
+                ),
+            }
+
+    service = ScopedHermesService()
+    recommendation = await service.recommend_with_hermes(
+        HermesRecommendationRequest(
+            task="Run a debate review for this architecture.",
+            mode_candidates=["dispatch", "group_chat"],
+            model_candidates=["deepseek-chat"],
+            skill_candidates=[],
+        ),
+        actor_id=USER_ID,
+    )
+
+    assert recommendation.confidence > 0.45
+    assert any(
+        reason == "Matched prior Hermes lesson: Use group chat when debate review is required."
+        for reason in recommendation.reasons
+    )
+    assert not any("Use direct mode even when debate review is required." in reason for reason in recommendation.reasons)
+
+
 def test_hermes_feedback_creates_cognitive_experience_candidate() -> None:
     api = client()
 
@@ -4594,6 +4661,8 @@ def test_hermes_feedback_creates_cognitive_experience_candidate() -> None:
     experiences = api.get("/api/v1/admin/cognitive/experiences", headers=headers())
 
     assert feedback.status_code == 200
+    assert feedback.json()["user_id"] == str(USER_ID)
+    assert feedback.json()["memory_scope"] == "user"
     assert experiences.status_code == 200
     items = experiences.json()
     assert len(items) == 1
@@ -4665,6 +4734,60 @@ def test_hermes_payload_reader_reclassifies_legacy_runtime_conversation() -> Non
     assert response.user_summary == (
         "本次运行观察记录了一个成功经验：no-workflow 工作流以 hybrid 模式成功完成。"
     )
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_confirm_backfills_legacy_user_scope(tmp_path: Path) -> None:
+    caller_id = UUID("44444444-4444-4444-8444-444444444444")
+
+    class StoredPersistentHermesService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "hermes",
+                    "legacy_conversation",
+                ): {
+                    "id": "legacy_conversation",
+                    "category": "conversation",
+                    "outcome": "success",
+                    "lesson": "Use group chat when debate review is required.",
+                    "summary": "Learned success pattern.",
+                    "user_summary": "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。",
+                    "tags": ["debate", "review"],
+                    "weight": 5,
+                    "memory_scope": "global",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "confirmed_at": None,
+                },
+            }
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            payload = self.payloads.get((kind, resource_id))
+            return None if payload is None else dict(payload)
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+    service = StoredPersistentHermesService()
+
+    confirmed = await service.confirm_hermes_insight("legacy_conversation", actor_id=caller_id)
+
+    assert confirmed.confirmed_at is not None
+    assert confirmed.user_id == str(caller_id)
+    assert confirmed.memory_scope == CognitiveMemoryScope.USER
+    stored = service.payloads[("hermes", "legacy_conversation")]
+    assert stored["user_id"] == str(caller_id)
+    assert stored["memory_scope"] == "user"
 
 
 def test_hermes_feedback_reclassifies_runtime_shaped_conversation() -> None:
@@ -4927,6 +5050,8 @@ def test_cognitive_experience_api_confirms_candidate_without_evolution_storage()
     body = created.json()
     assert body["status"] == "candidate"
     assert body["active_for_runtime"] is False
+    assert body["user_id"]
+    assert body["memory_scope"] == "user"
     assert body["storage_kind"] == "hermes"
     assert body["resource_id"].startswith("cognitive_experience:")
     assert "evolution" not in body["resource_id"]
@@ -4943,6 +5068,105 @@ def test_cognitive_experience_api_confirms_candidate_without_evolution_storage()
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "confirmed"
     assert confirmed.json()["active_for_runtime"] is True
+
+
+def test_cognitive_experience_api_can_create_root_scoped_experience() -> None:
+    response = client().post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "memory_scope": "root",
+            "kind": "communication_style",
+            "summary": "根经验：默认先给结论。",
+            "lesson": "系统级经验应只在管理员显式设为 root 后跨用户生效。",
+            "strategy": "先给结论，再补充证据。",
+            "confidence": 0.82,
+            "evidence": [
+                {"source_type": "feedback", "source_id": "admin-root", "note": "admin confirmed"}
+            ],
+            "tags": ["根经验", "结论"],
+            "applies_to_modes": ["direct"],
+            "applies_to_agents": ["main_agent"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["memory_scope"] == "root"
+    assert body["user_id"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_cognitive_confirm_backfills_legacy_user_scope(tmp_path: Path) -> None:
+    caller_id = UUID("44444444-4444-4444-8444-444444444444")
+    experience_id = UUID("55555555-5555-4555-8555-555555555555")
+    now = datetime.now(UTC).isoformat()
+
+    class StoredPersistentCognitiveService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "hermes",
+                    f"cognitive_experience:{experience_id}",
+                ): {
+                    "id": str(experience_id),
+                    "kind": "error_handling",
+                    "status": "candidate",
+                    "summary": "旧经验确认时要绑定确认用户。",
+                    "lesson": "缺少 user_id 的旧 Cognitive 经验不能确认后变成不可注入记录。",
+                    "strategy": "确认旧记录时回填当前用户和用户作用域。",
+                    "confidence": 0.72,
+                    "evidence": [
+                        {"source_type": "run", "source_id": "legacy-run", "note": "legacy candidate"}
+                    ],
+                    "contradictions": [],
+                    "source_run_ids": ["legacy-run"],
+                    "source_memory_ids": [],
+                    "tags": ["legacy", "scope"],
+                    "applies_to_modes": ["direct"],
+                    "applies_to_agents": ["main_agent"],
+                    "use_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "active_for_runtime": False,
+                    "last_used_at": None,
+                    "last_verified_at": None,
+                    "version": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                    "storage_kind": "hermes",
+                    "resource_id": f"cognitive_experience:{experience_id}",
+                },
+            }
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            payload = self.payloads.get((kind, resource_id))
+            return None if payload is None else dict(payload)
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+    service = StoredPersistentCognitiveService()
+
+    confirmed = await service.confirm_cognitive_experience(experience_id, actor_id=caller_id)
+
+    assert confirmed.status == ExperienceStatus.CONFIRMED
+    assert confirmed.active_for_runtime is True
+    assert confirmed.user_id == str(caller_id)
+    assert confirmed.memory_scope == CognitiveMemoryScope.USER
+    stored = service.payloads[("hermes", f"cognitive_experience:{experience_id}")]
+    assert stored["user_id"] == str(caller_id)
+    assert stored["memory_scope"] == "user"
 
 
 def test_cognitive_experience_api_requires_evidence_on_creation() -> None:

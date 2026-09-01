@@ -28,6 +28,11 @@ class ExperienceStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class CognitiveMemoryScope(StrEnum):
+    USER = "user"
+    ROOT = "root"
+
+
 class CognitiveEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -47,6 +52,7 @@ class ExperienceRecord(BaseModel):
     id: UUID
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     kind: ExperienceKind
     status: ExperienceStatus
     summary: str = Field(min_length=1, max_length=240)
@@ -107,6 +113,7 @@ class ReflectionRecord(BaseModel):
     id: UUID
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     source_run_id: str
     trigger: str = Field(min_length=1, max_length=64)
     outcome: str = Field(min_length=1, max_length=32)
@@ -130,6 +137,7 @@ class BeliefRecord(BaseModel):
     id: UUID
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     subject: str = Field(min_length=1, max_length=160)
     claim: str = Field(min_length=1, max_length=512)
     confidence: float = Field(ge=0, le=1)
@@ -147,6 +155,7 @@ class RelationshipStateRecord(BaseModel):
     id: str = Field(min_length=1, max_length=160)
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     familiarity: float = Field(ge=0, le=1)
     preferred_language: str = Field(default="zh-CN", min_length=1, max_length=32)
     preferred_confirmation_style: str = Field(default="minimal", min_length=1, max_length=64)
@@ -163,6 +172,7 @@ class WorldStateRecord(BaseModel):
     id: str = Field(min_length=1, max_length=160)
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     scope: str = Field(min_length=1, max_length=160)
     facts: tuple[str, ...] = ()
     open_items: tuple[str, ...] = ()
@@ -179,6 +189,7 @@ class SkillCandidateRecord(BaseModel):
     id: UUID
     tenant_id: UUID
     user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     name: str = Field(min_length=1, max_length=128)
     purpose: str = Field(min_length=1, max_length=512)
     steps: tuple[str, ...] = Field(min_length=1)

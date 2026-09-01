@@ -2889,8 +2889,27 @@ article:hover {
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
 }
 
-.card-grid.compact {
+.card-grid.compact,
+.card-grid.compact-grid {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.compact-card {
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  padding: 0.9rem;
+}
+
+.compact-detail-list {
+  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  margin: 0.75rem 0;
+}
+
+.compact-detail-list div {
+  border-radius: 0.8rem;
+  padding: 0.65rem;
 }
 
 .mini-card {

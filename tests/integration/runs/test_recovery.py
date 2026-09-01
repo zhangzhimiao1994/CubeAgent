@@ -8,12 +8,17 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.cognitive.repository import PersistentExperienceRepository
+from agent_hub.cognitive.service import ExperienceService
+from agent_hub.cognitive.types import CognitiveEvidence, CognitiveMemoryScope, ExperienceKind
 from agent_hub.db.models import AdminResourceRow, RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.types import ModelRequest, ModelResponse
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import (
@@ -30,6 +35,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 
 
@@ -251,6 +257,22 @@ class ExplodingRuntime:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RecordingTextGateway:
+    def __init__(self, text: str = "已根据经验完成。") -> None:
+        self.text = text
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(text=self.text, usage=None),
+            deployment_id="main_deployment",
+            logical_model=request.logical_model,
+            provider_id="test",
+            provider_model="test/model",
+        )
 
 
 class RestoreExplodingRuntime(FakeRuntime):
@@ -854,6 +876,90 @@ async def test_persistent_hermes_runtime_advice_respects_main_agent_policy(
     assert suggest is not None
     assert suggest.recommended_mode is TaskMode.DISPATCH
     assert suggest.requires_approval is True
+
+
+async def test_cognitive_experience_confirmation_injects_into_direct_runtime_prompt(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    actor_id = uuid4()
+    experience_service = ExperienceService(PersistentExperienceRepository(run_session_factory))
+    repository = RunRepository(run_session_factory)
+    gateway = RecordingTextGateway()
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((DirectRuntime(gateway, logical_model="main"),)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        hermes_advisor=PersistentHermesRunAdvisor(run_session_factory),
+    )
+
+    try:
+        experience = await experience_service.create_candidate(
+            tenant_id=tenant_id,
+            user_id=owner_user_id,
+            memory_scope=CognitiveMemoryScope.ROOT,
+            kind=ExperienceKind.ERROR_HANDLING,
+            summary="模型空输出时先走直连兜底。",
+            lesson="empty_model_response 场景使用 direct 兜底更稳定。",
+            strategy="遇到 empty_model_response 时先重试，仍为空则选择 direct 模式输出简短可验证结果。",
+            evidence=(
+                CognitiveEvidence(
+                    source_type="run",
+                    source_id="empty-response-smoke",
+                    note="confirmed root runtime lesson",
+                ),
+            ),
+            tags=("empty_model_response", "direct"),
+            applies_to_modes=(),
+            applies_to_agents=("main_agent",),
+            confidence=0.86,
+        )
+        confirmed = await experience_service.confirm(
+            experience.id,
+            tenant_id=tenant_id,
+            user_id=owner_user_id,
+        )
+
+        async with run_session_factory() as session, session.begin():
+            session.add(
+                AdminResourceRow(
+                    tenant_id=tenant_id,
+                    kind="main_agent",
+                    resource_id="default",
+                    payload={"hermes_policy": "suggest"},
+                )
+            )
+
+        submitted = await service.submit(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            message="empty_model_response 这个问题请给一个简短可验证结论",
+            mode=TaskMode.AUTO,
+            skip_evolution_proposal=True,
+            idempotency_key=f"cognitive-injection-{uuid4().hex}",
+        )
+        record = await repository.get(tenant_id, submitted.id)
+        assert record.mode is TaskMode.DIRECT
+        assert record.routing_decision is not None
+        hermes_payload = cast(dict[str, object], record.routing_decision["hermes"])
+        injected = cast(list[dict[str, object]], hermes_payload["injected_memories"])
+        assert injected[0]["id"] == f"cognitive_experience:{confirmed.id}"
+        assert injected[0]["summary"] == "模型空输出时先走直连兜底。"
+
+        completed = await service.execute(submitted.id)
+
+        assert completed.status is RunStatus.COMPLETED
+        assert len(gateway.requests) == 1
+        serialized_prompt = "\n".join(
+            message.content for message in gateway.requests[0].messages if isinstance(message.content, str)
+        )
+        assert "HERMES_MEMORY_CONTEXT" in serialized_prompt
+        assert "模型空输出时先走直连兜底" in serialized_prompt
+    finally:
+        async with run_session_factory() as session, session.begin():
+            await session.execute(delete(AdminResourceRow).where(AdminResourceRow.tenant_id == tenant_id))
 
 
 async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(

@@ -18,6 +18,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 - Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
 - Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
 - Review Hermes learning, logs, and audit records. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
+- Keep Hermes/Cognitive memory separated by scope. User memory is bound to the current user and must not affect other users. Root memory is shared within the tenant and should only be used for stable project-wide lessons, policies, or environment facts. Runtime injection retrieves only the current user's confirmed memories plus confirmed root memories.
 
 ## Quick Install
 
@@ -196,6 +197,8 @@ Historical conversations expose a branch action for continuing with prior contex
 Dispatch and discussion runs render a compact process card in the conversation stream. The card opens the child-agent work-seat drawer, where each agent has its own seat with status such as working, waiting, failed, or done. The drawer favors short categorized summaries; detailed event fields, tool payloads, model metadata, and artifact metadata are hidden until the user opens the relevant card and expands full fields. This keeps long task traces readable while preserving auditability.
 
 Long conversations are handled by the conversation framework. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
+
+Hermes learning is not the same as raw chat history. A learning record first lands in the Hermes ledger with a Chinese one-line summary. Reusable Cognitive experiences are separate candidates and only affect future runs after confirmation. Runtime guidance is scoped: `用户记忆` applies only to the same user, while `根记忆` applies across users in the same tenant.
 
 Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
 

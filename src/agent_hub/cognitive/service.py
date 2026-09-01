@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from agent_hub.cognitive.types import (
     CognitiveEvidence,
+    CognitiveMemoryScope,
     ExperienceKind,
     ExperienceRecord,
     ExperienceStatus,
@@ -47,6 +48,7 @@ class ExperienceService:
         lesson: str,
         strategy: str,
         evidence: tuple[CognitiveEvidence, ...],
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
         confidence: float = 0.62,
         contradictions: tuple[CognitiveEvidence, ...] = (),
         source_run_ids: tuple[str, ...] = (),
@@ -60,6 +62,7 @@ class ExperienceService:
             id=uuid4(),
             tenant_id=tenant_id,
             user_id=user_id,
+            memory_scope=memory_scope,
             kind=kind,
             status=ExperienceStatus.CANDIDATE,
             summary=summary,

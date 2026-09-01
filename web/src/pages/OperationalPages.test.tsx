@@ -180,6 +180,8 @@ const secondRunListItem: RunListItem = {
 
 const hermesInsight = {
   id: "hermes_run_11111111111111111111111111111111",
+  user_id: "11111111-1111-4111-8111-111111111111",
+  memory_scope: "user",
   outcome: "success",
   category: "conversation",
   lesson: "Use group chat when debate review is required.",
@@ -210,6 +212,8 @@ const secondHermesInsight = {
 
 const cognitiveExperience = {
   id: "exp_11111111111111111111111111111111",
+  user_id: "11111111-1111-4111-8111-111111111111",
+  memory_scope: "user",
   resource_id: "cognitive_experience:11111111-1111-4111-8111-111111111111",
   kind: "communication_style",
   status: "candidate",
@@ -422,6 +426,7 @@ describe("operational management pages", () => {
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
   let visibleCognitiveExperiences = [cognitiveExperience];
+  let failCognitiveExperiences = false;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
   let skillUploadConflict = false;
@@ -440,6 +445,7 @@ describe("operational management pages", () => {
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
     visibleCognitiveExperiences = [cognitiveExperience];
+    failCognitiveExperiences = false;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     skillUploadConflict = false;
@@ -994,6 +1000,9 @@ describe("operational management pages", () => {
           return jsonResponse([hermesInsight, secondHermesInsight].filter((item) => !deletedHermesIds.has(item.id)));
         }
         if (path === "/api/v1/admin/cognitive/experiences") {
+          if (failCognitiveExperiences) {
+            return jsonResponse({ error: { code: "cognitive_failed", message: "cognitive unavailable" } }, { status: 500 });
+          }
           return jsonResponse(visibleCognitiveExperiences);
         }
         if (path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/confirm` && method === "POST") {
@@ -3824,6 +3833,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/hermes" />);
 
     const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
+    expect(within(experienceSection).getByText(/用户记忆/)).not.toBeNull();
     expect(within(experienceSection).getByText("用户明确要求先给结论，再给必要证据。")).not.toBeNull();
     expect(within(experienceSection).getByText("项目状态类问题先输出当前结论、阻塞项和下一步，不要堆叠完整运行轨迹。")).not.toBeNull();
     expect(within(experienceSection).getByText("72%")).not.toBeNull();
@@ -3857,6 +3867,16 @@ describe("operational management pages", () => {
     expect(within(experienceSection).queryByText("已拒绝")).toBeNull();
     expect(within(experienceSection).queryByText("已淘汰")).toBeNull();
     expect(within(experienceSection).queryByText("已被替代")).toBeNull();
+  });
+
+  it("keeps the Hermes ledger visible when reusable experiences fail to load", async () => {
+    failCognitiveExperiences = true;
+    render(<TestApp initialPath="/hermes" />);
+
+    const ledgerSection = await screen.findByRole("region", { name: "Hermes 学习台账" });
+    expect(within(ledgerSection).getByText(hermesInsight.user_summary)).not.toBeNull();
+    expect(screen.getByText("经验候选暂不可用")).not.toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain("cognitive unavailable");
   });
 
   it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {

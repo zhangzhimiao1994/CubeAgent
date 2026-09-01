@@ -8,7 +8,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.cognitive.types import ExperienceRecord
+from agent_hub.cognitive.types import CognitiveMemoryScope, ExperienceRecord
 from agent_hub.db.models import AdminResourceRow
 
 _HERMES_KIND = "hermes"
@@ -36,7 +36,11 @@ class InMemoryExperienceRepository:
                 (
                     record
                     for record in self._records.values()
-                    if record.tenant_id == tenant_id and record.user_id == user_id
+                    if record.tenant_id == tenant_id
+                    and (
+                        record.user_id == user_id
+                        or record.memory_scope is CognitiveMemoryScope.ROOT
+                    )
                 ),
                 key=lambda item: item.created_at,
             )
@@ -64,8 +68,13 @@ class PersistentExperienceRepository:
         self._session_factory = session_factory
 
     async def upsert(self, record: ExperienceRecord) -> ExperienceRecord:
-        payload = record.model_dump(mode="json")
         resource_id = _resource_id(record.id)
+        payload = {
+            **record.model_dump(mode="json"),
+            "active_for_runtime": record.active_for_runtime,
+            "resource_id": resource_id,
+            "storage_kind": _HERMES_KIND,
+        }
         statement = (
             insert(AdminResourceRow)
             .values(
@@ -111,7 +120,11 @@ class PersistentExperienceRepository:
                 )
             ).scalars()
             records = [_record_from_payload(dict(row.payload)) for row in rows]
-        return tuple(record for record in records if record.user_id == user_id)
+        return tuple(
+            record
+            for record in records
+            if record.user_id == user_id or record.memory_scope is CognitiveMemoryScope.ROOT
+        )
 
     async def delete(self, record_id: UUID, *, tenant_id: UUID, user_id: UUID) -> bool:
         existing = await self.get(record_id)
@@ -134,7 +147,9 @@ def _resource_id(record_id: UUID) -> str:
 
 
 def _record_from_payload(payload: dict[str, object]) -> ExperienceRecord:
+    record_fields = set(ExperienceRecord.model_fields)
+    normalized = {key: value for key, value in payload.items() if key in record_fields}
     try:
-        return ExperienceRecord.model_validate_json(json.dumps(payload))
+        return ExperienceRecord.model_validate_json(json.dumps(normalized))
     except ValueError as error:
         raise ExperienceRepositoryError("stored cognitive experience is invalid") from error

@@ -7,7 +7,12 @@ import pytest
 
 from agent_hub.cognitive.repository import InMemoryExperienceRepository
 from agent_hub.cognitive.service import ExperienceService
-from agent_hub.cognitive.types import CognitiveEvidence, ExperienceKind, ExperienceStatus
+from agent_hub.cognitive.types import (
+    CognitiveEvidence,
+    CognitiveMemoryScope,
+    ExperienceKind,
+    ExperienceStatus,
+)
 
 
 @pytest.mark.asyncio
@@ -104,3 +109,53 @@ async def test_tenant_user_isolation_blocks_foreign_confirm() -> None:
 
     with pytest.raises(PermissionError):
         await service.confirm(record.id, tenant_id=uuid4(), user_id=uuid4())
+
+
+@pytest.mark.asyncio
+async def test_user_scoped_experience_is_only_listed_for_owner() -> None:
+    repository = InMemoryExperienceRepository()
+    service = ExperienceService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    other_user_id = uuid4()
+    record = await service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        kind=ExperienceKind.USER_PREFERENCE,
+        summary="用户偏好状态报告先给结论。",
+        lesson="该用户明确纠正过冗长过程输出。",
+        strategy="对该用户先输出结论、证据和下一步。",
+        evidence=(CognitiveEvidence(source_type="feedback", source_id="msg-1", note="explicit correction"),),
+        memory_scope=CognitiveMemoryScope.USER,
+    )
+    await service.confirm(record.id, tenant_id=tenant_id, user_id=owner_user_id)
+
+    owner_records = await service.list_records(tenant_id=tenant_id, user_id=owner_user_id)
+    other_records = await service.list_records(tenant_id=tenant_id, user_id=other_user_id)
+
+    assert [item.id for item in owner_records] == [record.id]
+    assert other_records == ()
+
+
+@pytest.mark.asyncio
+async def test_root_scoped_experience_is_listed_for_other_users_in_same_tenant() -> None:
+    repository = InMemoryExperienceRepository()
+    service = ExperienceService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    other_user_id = uuid4()
+    record = await service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        kind=ExperienceKind.ERROR_HANDLING,
+        summary="模型空输出时切换备用路径。",
+        lesson="同一租户内的模型空输出是通用运行经验。",
+        strategy="先重试同模型；仍为空时切换同能力备用模型。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="empty response"),),
+        memory_scope=CognitiveMemoryScope.ROOT,
+    )
+    await service.confirm(record.id, tenant_id=tenant_id, user_id=owner_user_id)
+
+    other_records = await service.list_records(tenant_id=tenant_id, user_id=other_user_id)
+
+    assert [item.id for item in other_records] == [record.id]

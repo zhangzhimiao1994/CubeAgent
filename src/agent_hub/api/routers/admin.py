@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
-from agent_hub.cognitive.types import ExperienceKind, ExperienceStatus
+from agent_hub.cognitive.types import CognitiveMemoryScope, ExperienceKind, ExperienceStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -1646,6 +1646,8 @@ class HermesInsightResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    user_id: str = ""
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     category: str = Field(default="conversation", pattern=r"^(conversation|scheduler)$")
     outcome: str
     lesson: str
@@ -1769,6 +1771,7 @@ class CognitiveEvidencePayload(BaseModel):
 class CognitiveExperienceCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
     kind: ExperienceKind
     summary: str = Field(min_length=1, max_length=240)
     lesson: str = Field(min_length=1, max_length=1200)
@@ -1797,6 +1800,8 @@ class CognitiveExperienceResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    user_id: str
+    memory_scope: CognitiveMemoryScope
     kind: ExperienceKind
     status: ExperienceStatus
     summary: str
@@ -2055,26 +2060,28 @@ class AdminResourceService(Protocol):
 
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
-    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
+    async def confirm_hermes_insight(
+        self, insight_id: str, *, actor_id: UUID | None = None
+    ) -> HermesInsightResponse: ...
 
     async def delete_hermes_insight(self, insight_id: str) -> None: ...
 
     async def record_hermes_feedback(
-        self, request: HermesFeedbackRequest
+        self, request: HermesFeedbackRequest, *, actor_id: UUID | None = None
     ) -> HermesInsightResponse: ...
 
     async def recommend_with_hermes(
-        self, request: HermesRecommendationRequest
+        self, request: HermesRecommendationRequest, *, actor_id: UUID | None = None
     ) -> HermesRecommendationResponse: ...
 
     async def list_cognitive_experiences(self) -> tuple[CognitiveExperienceResponse, ...]: ...
 
     async def create_cognitive_experience(
-        self, request: CognitiveExperienceCreateRequest
+        self, request: CognitiveExperienceCreateRequest, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse: ...
 
     async def confirm_cognitive_experience(
-        self, experience_id: UUID
+        self, experience_id: UUID, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse: ...
 
     async def reject_cognitive_experience(
@@ -2897,6 +2904,8 @@ class InMemoryAdminResourceService:
         if not self.hermes_insights:
             self.hermes_insights["hermes-1"] = HermesInsightResponse(
                 id="hermes-1",
+                user_id="system",
+                memory_scope=CognitiveMemoryScope.USER,
                 category="conversation",
                 outcome="success",
                 lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
@@ -3804,16 +3813,26 @@ class InMemoryAdminResourceService:
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         return self.hermes_insights[insight_id]
 
-    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+    async def confirm_hermes_insight(
+        self, insight_id: str, *, actor_id: UUID | None = None
+    ) -> HermesInsightResponse:
         current = self.hermes_insights[insight_id]
-        updated = current.model_copy(update={"confirmed_at": datetime.now(UTC)})
+        update: dict[str, object] = {"confirmed_at": datetime.now(UTC)}
+        if not current.user_id:
+            update["user_id"] = str(actor_id or "system")
+        updated = current.model_copy(update=update)
         self.hermes_insights[insight_id] = updated
         return updated
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
         del self.hermes_insights[insight_id]
 
-    async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
+    async def record_hermes_feedback(
+        self,
+        request: HermesFeedbackRequest,
+        *,
+        actor_id: UUID | None = None,
+    ) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
             await self.record_log(
                 category="feature_error",
@@ -3826,6 +3845,8 @@ class InMemoryAdminResourceService:
             raise ValueError("sensitive content")
         insight = HermesInsightResponse(
             id=f"hermes-{uuid4().hex}",
+            user_id=str(actor_id or "system"),
+            memory_scope=CognitiveMemoryScope.USER,
             category=_normalized_hermes_feedback_category(request.category, request.lesson),
             outcome=request.outcome,
             lesson=request.lesson,
@@ -3850,11 +3871,14 @@ class InMemoryAdminResourceService:
         self.hermes_insights[insight.id] = insight
         experience_request = _cognitive_experience_request_from_hermes_feedback(insight)
         if experience_request is not None:
-            await self.create_cognitive_experience(experience_request)
+            await self.create_cognitive_experience(experience_request, actor_id=actor_id)
         return insight
 
     async def recommend_with_hermes(
-        self, request: HermesRecommendationRequest
+        self,
+        request: HermesRecommendationRequest,
+        *,
+        actor_id: UUID | None = None,
     ) -> HermesRecommendationResponse:
         normalized_task = request.task.lower()
         reasons: list[str] = []
@@ -3881,6 +3905,7 @@ class InMemoryAdminResourceService:
             insight
             for insight in self.hermes_insights.values()
             if _is_confirmed_conversation_hermes_insight(insight)
+            and _hermes_insight_visible_to_actor(insight, actor_id)
             and any(tag.lower() in normalized_task for tag in insight.tags)
         ]
         if not matching_insights:
@@ -3914,12 +3939,16 @@ class InMemoryAdminResourceService:
         )
 
     async def create_cognitive_experience(
-        self, request: CognitiveExperienceCreateRequest
+        self,
+        request: CognitiveExperienceCreateRequest,
+        *,
+        actor_id: UUID | None = None,
     ) -> CognitiveExperienceResponse:
         now = datetime.now(UTC)
         experience_id = uuid4()
         response = _cognitive_experience_response(
             experience_id=experience_id,
+            user_id=actor_id or "system",
             request=request,
             status=ExperienceStatus.CANDIDATE,
             created_at=now,
@@ -3929,17 +3958,18 @@ class InMemoryAdminResourceService:
         return response
 
     async def confirm_cognitive_experience(
-        self, experience_id: UUID
+        self, experience_id: UUID, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse:
         current = self.cognitive_experiences[str(experience_id)]
         _ensure_cognitive_experience_confirmable(current)
-        updated = current.model_copy(
-            update={
-                "status": ExperienceStatus.CONFIRMED,
-                "active_for_runtime": True,
-                "updated_at": datetime.now(UTC),
-            }
-        )
+        update: dict[str, object] = {
+            "status": ExperienceStatus.CONFIRMED,
+            "active_for_runtime": True,
+            "updated_at": datetime.now(UTC),
+        }
+        if not current.user_id:
+            update["user_id"] = str(actor_id or "system")
+        updated = current.model_copy(update=update)
         self.cognitive_experiences[str(experience_id)] = updated
         return updated
 
@@ -5515,13 +5545,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return _hermes_response_from_payload(payload)
         return await super().get_hermes_insight(insight_id)
 
-    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+    async def confirm_hermes_insight(
+        self, insight_id: str, *, actor_id: UUID | None = None
+    ) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
         if not payload:
-            return await super().confirm_hermes_insight(insight_id)
+            return await super().confirm_hermes_insight(insight_id, actor_id=actor_id)
         payload["confirmed_at"] = datetime.now(UTC).isoformat()
+        payload["memory_scope"] = _cognitive_memory_scope_from_payload(payload.get("memory_scope")).value
+        if not isinstance(payload.get("user_id"), str) or not str(payload.get("user_id", "")).strip():
+            payload["user_id"] = str(actor_id or self._actor_id)
         if not await self._upsert_admin_payload("hermes", insight_id, payload):
-            return await super().confirm_hermes_insight(insight_id)
+            return await super().confirm_hermes_insight(insight_id, actor_id=actor_id)
         await self._record_audit("hermes.confirm", f"hermes:{insight_id}", {"id": insight_id})
         return _hermes_response_from_payload(payload)
 
@@ -5532,7 +5567,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return
         await self._record_audit("hermes.delete", f"hermes:{insight_id}", {"id": insight_id})
 
-    async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
+    async def record_hermes_feedback(
+        self,
+        request: HermesFeedbackRequest,
+        *,
+        actor_id: UUID | None = None,
+    ) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
             await self.record_log(
                 category="feature_error",
@@ -5547,6 +5587,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         category = _normalized_hermes_feedback_category(request.category, request.lesson)
         response = HermesInsightResponse(
             id=insight_id,
+            user_id=str(actor_id or self._actor_id),
+            memory_scope=CognitiveMemoryScope.USER,
             category=category,
             outcome=request.outcome,
             lesson=request.lesson,
@@ -5575,11 +5617,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("hermes.feedback", f"hermes:{insight_id}", {"id": insight_id})
         experience_request = _cognitive_experience_request_from_hermes_feedback(response)
         if experience_request is not None:
-            await self.create_cognitive_experience(experience_request)
+            await self.create_cognitive_experience(experience_request, actor_id=actor_id)
         return response
 
     async def recommend_with_hermes(
-        self, request: HermesRecommendationRequest
+        self,
+        request: HermesRecommendationRequest,
+        *,
+        actor_id: UUID | None = None,
     ) -> HermesRecommendationResponse:
         if self._session_factory is None:
             return await super().recommend_with_hermes(request)
@@ -5596,6 +5641,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             insight
             for insight in previous
             if _is_confirmed_conversation_hermes_insight(insight)
+            and _hermes_insight_visible_to_actor(insight, actor_id)
             and (
                 any(tag.lower() in lowered_task for tag in insight.tags)
                 or any(word in lowered_task for word in insight.lesson.lower().split())
@@ -5634,12 +5680,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(sorted(responses, key=lambda item: item.created_at))
 
     async def create_cognitive_experience(
-        self, request: CognitiveExperienceCreateRequest
+        self,
+        request: CognitiveExperienceCreateRequest,
+        *,
+        actor_id: UUID | None = None,
     ) -> CognitiveExperienceResponse:
         now = datetime.now(UTC)
         experience_id = uuid4()
         response = _cognitive_experience_response(
             experience_id=experience_id,
+            user_id=actor_id or self._actor_id,
             request=request,
             status=ExperienceStatus.CANDIDATE,
             created_at=now,
@@ -5654,17 +5704,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return response
 
     async def confirm_cognitive_experience(
-        self, experience_id: UUID
+        self, experience_id: UUID, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse:
         current = await self._get_cognitive_experience(experience_id)
         _ensure_cognitive_experience_confirmable(current)
-        updated = current.model_copy(
-            update={
-                "status": ExperienceStatus.CONFIRMED,
-                "active_for_runtime": True,
-                "updated_at": datetime.now(UTC),
-            }
-        )
+        update: dict[str, object] = {
+            "status": ExperienceStatus.CONFIRMED,
+            "active_for_runtime": True,
+            "updated_at": datetime.now(UTC),
+        }
+        if not current.user_id:
+            update["user_id"] = str(actor_id or self._actor_id)
+        updated = current.model_copy(update=update)
         await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
         await self._record_audit(
             "cognitive.experience.confirm",
@@ -6868,6 +6919,8 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     raw_confirmed_at = payload.get("confirmed_at")
     return HermesInsightResponse(
         id=str(payload.get("id", "")),
+        user_id=str(payload.get("user_id", "")),
+        memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
         category=category,
         outcome=outcome,
         lesson=lesson,
@@ -6990,6 +7043,7 @@ def _compact_cognitive_text(value: str, *, limit: int) -> str:
 def _cognitive_experience_response(
     *,
     experience_id: UUID,
+    user_id: UUID | str,
     request: CognitiveExperienceCreateRequest,
     status: ExperienceStatus,
     created_at: datetime,
@@ -6997,6 +7051,8 @@ def _cognitive_experience_response(
 ) -> CognitiveExperienceResponse:
     return CognitiveExperienceResponse(
         id=str(experience_id),
+        user_id=str(user_id),
+        memory_scope=request.memory_scope,
         kind=request.kind,
         status=status,
         summary=request.summary,
@@ -7076,6 +7132,17 @@ def _experience_status_from_payload(value: object) -> ExperienceStatus:
     return ExperienceStatus.CANDIDATE
 
 
+def _cognitive_memory_scope_from_payload(value: object) -> CognitiveMemoryScope:
+    if isinstance(value, CognitiveMemoryScope):
+        return value
+    if isinstance(value, str):
+        try:
+            return CognitiveMemoryScope(value)
+        except ValueError:
+            return CognitiveMemoryScope.USER
+    return CognitiveMemoryScope.USER
+
+
 def _cognitive_experience_from_payload(
     payload: dict[str, object],
     *,
@@ -7088,6 +7155,8 @@ def _cognitive_experience_from_payload(
     status = _experience_status_from_payload(payload.get("status"))
     return CognitiveExperienceResponse(
         id=experience_id,
+        user_id=str(payload.get("user_id", "")),
+        memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
         kind=_experience_kind_from_payload(payload.get("kind")),
         status=status,
         summary=str(payload.get("summary", ""))[:240] or "未命名经验",
@@ -7122,6 +7191,19 @@ def _cognitive_experience_from_payload(
 
 def _is_confirmed_conversation_hermes_insight(insight: HermesInsightResponse) -> bool:
     return insight.category == "conversation" and insight.confirmed_at is not None
+
+
+def _hermes_insight_visible_to_actor(
+    insight: HermesInsightResponse,
+    actor_id: UUID | None,
+) -> bool:
+    if insight.memory_scope is CognitiveMemoryScope.ROOT:
+        return True
+    return (
+        actor_id is not None
+        and insight.memory_scope is CognitiveMemoryScope.USER
+        and insight.user_id == str(actor_id)
+    )
 
 
 def _is_runtime_observation_lesson(lesson: str) -> bool:
@@ -9675,7 +9757,7 @@ async def record_hermes_feedback(
 ) -> HermesInsightResponse:
     _require(principal, "hermes:write")
     try:
-        return await service.record_hermes_feedback(body)
+        return await service.record_hermes_feedback(body, actor_id=principal.user_id)
     except ValueError:
         raise PublicAPIError(
             422,
@@ -9695,7 +9777,7 @@ async def recommend_with_hermes(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> HermesRecommendationResponse:
     _require(principal, "hermes:read")
-    return await service.recommend_with_hermes(body)
+    return await service.recommend_with_hermes(body, actor_id=principal.user_id)
 
 
 @router.get(
@@ -9722,7 +9804,7 @@ async def create_cognitive_experience(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> CognitiveExperienceResponse:
     _require(principal, "hermes:write")
-    return await service.create_cognitive_experience(body)
+    return await service.create_cognitive_experience(body, actor_id=principal.user_id)
 
 
 @router.post(
@@ -9737,7 +9819,7 @@ async def confirm_cognitive_experience(
 ) -> CognitiveExperienceResponse:
     _require(principal, "hermes:write")
     try:
-        return await service.confirm_cognitive_experience(experience_id)
+        return await service.confirm_cognitive_experience(experience_id, actor_id=principal.user_id)
     except KeyError:
         raise PublicAPIError(
             404,
@@ -9804,7 +9886,7 @@ async def bulk_confirm_hermes_insights(
     failed: list[BulkFailureResponse] = []
     for insight_id in body.ids:
         try:
-            confirmed.append(await service.confirm_hermes_insight(insight_id))
+            confirmed.append(await service.confirm_hermes_insight(insight_id, actor_id=principal.user_id))
         except KeyError:
             failed.append(
                 BulkFailureResponse(
@@ -9876,7 +9958,7 @@ async def confirm_hermes_insight(
 ) -> HermesInsightResponse:
     _require(principal, "hermes:write")
     try:
-        return await service.confirm_hermes_insight(insight_id)
+        return await service.confirm_hermes_insight(insight_id, actor_id=principal.user_id)
     except KeyError:
         raise PublicAPIError(
             404, "hermes_not_found", "Hermes learning record was not found"

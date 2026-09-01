@@ -67,6 +67,10 @@ function cognitiveStatusLabel(status: CognitiveExperience["status"]) {
   return labels[status];
 }
 
+function cognitiveScopeLabel(scope: CognitiveExperience["memory_scope"]) {
+  return scope === "root" ? "根记忆" : "用户记忆";
+}
+
 function cognitiveSummary(item: CognitiveExperience) {
   return item.summary.trim() || item.lesson.trim() || "未命名经验";
 }
@@ -266,12 +270,9 @@ function HermesLearningTable() {
     bulkDelete.mutate(ids);
   }
 
-  if (insights.isLoading || cognitiveExperiences.isLoading) return <p>正在加载 Hermes...</p>;
+  if (insights.isLoading) return <p>正在加载 Hermes...</p>;
   if (insights.isError) {
     return <p role="alert">{formatApiError(insights.error, "Hermes 加载失败")}</p>;
-  }
-  if (cognitiveExperiences.isError) {
-    return <p role="alert">{formatApiError(cognitiveExperiences.error, "经验候选加载失败")}</p>;
   }
 
   const items = insights.data ?? [];
@@ -284,7 +285,7 @@ function HermesLearningTable() {
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
   const allVisibleConfirmableSelected =
     visibleConfirmableIds.length > 0 && visibleConfirmableIds.every((id) => selectedIds.includes(id));
-  const experienceItems = cognitiveExperiences.data ?? [];
+  const experienceItems = cognitiveExperiences.isSuccess ? cognitiveExperiences.data ?? [] : [];
   const candidateExperiences = experienceItems.filter((item) => item.status === "candidate");
   const activeExperiences = experienceItems.filter((item) => item.active_for_runtime);
   const visibleExperiences = [...candidateExperiences, ...activeExperiences].slice(0, 12);
@@ -315,7 +316,17 @@ function HermesLearningTable() {
         {confirmExperience.isError ? <p role="alert">{formatApiError(confirmExperience.error, "经验确认失败")}</p> : null}
         {rejectExperience.isError ? <p role="alert">{formatApiError(rejectExperience.error, "经验拒绝失败")}</p> : null}
         {deleteExperience.isError ? <p role="alert">{formatApiError(deleteExperience.error, "经验删除失败")}</p> : null}
-        {visibleExperiences.length === 0 ? (
+        {cognitiveExperiences.isLoading ? (
+          <article>
+            <h4>正在加载经验候选</h4>
+            <p>学习台账可继续查看，经验候选加载完成后会在这里显示。</p>
+          </article>
+        ) : cognitiveExperiences.isError ? (
+          <article>
+            <h4>经验候选暂不可用</h4>
+            <p role="alert">{formatApiError(cognitiveExperiences.error, "经验候选加载失败")}</p>
+          </article>
+        ) : visibleExperiences.length === 0 ? (
           <article>
             <h4>暂无经验候选</h4>
             <p>当用户反馈、失败复盘或成功模式具备长期价值时，系统会在这里生成待确认经验。</p>
@@ -324,7 +335,10 @@ function HermesLearningTable() {
           <div className="card-grid compact-grid">
             {visibleExperiences.map((item) => (
               <article key={item.id} className="compact-card">
-                <span className="eyebrow">{cognitiveKindLabel(item.kind)} · {cognitiveStatusLabel(item.status)}</span>
+                <span className="eyebrow">
+                  {cognitiveScopeLabel(item.memory_scope)} · {cognitiveKindLabel(item.kind)} ·{" "}
+                  {cognitiveStatusLabel(item.status)}
+                </span>
                 <h4>{cognitiveSummary(item)}</h4>
                 <p>{item.strategy}</p>
                 <dl className="detail-list compact-detail-list">
@@ -468,6 +482,7 @@ function HermesLearningTable() {
                       <th><SortHeader column="category" label="分类" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>分类</SortHeader></th>
                       <th><SortHeader column="created" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
                       <th><SortHeader column="conversation" label="对话 ID" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>对话 ID</SortHeader></th>
+                      <th>作用域</th>
                       <th><SortHeader column="user_summary" label="中文学习摘要" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>中文学习摘要</SortHeader></th>
                       <th><SortHeader column="outcome" label="结果" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>结果</SortHeader></th>
                       <th><SortHeader column="status" label="确认状态" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>确认状态</SortHeader></th>
@@ -484,6 +499,7 @@ function HermesLearningTable() {
                       </th>
                       <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
                       <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
+                      <th></th>
                       <th><input aria-label="按 Hermes 中文学习摘要筛选" value={columnFilters.user_summary} onChange={(event) => updateColumnFilter("user_summary", event.currentTarget.value)} placeholder="摘要关键词" /></th>
                       <th>
                         <select aria-label="按 Hermes 结果筛选" value={columnFilters.outcome} onChange={(event) => updateColumnFilter("outcome", event.currentTarget.value)}>
@@ -520,6 +536,7 @@ function HermesLearningTable() {
                           <time dateTime={insight.created_at}>{insight.created_at}</time>
                         </td>
                         <td>{insight.conversation_id ?? "未关联"}</td>
+                        <td>{cognitiveScopeLabel(insight.memory_scope)}</td>
                         <td>{hermesReadableSummary(insight)}</td>
                         <td>{insight.outcome}</td>
                         <td>{statusLabel(insight.confirmed_at)}</td>
