@@ -93,6 +93,28 @@ def test_context_router_skips_unsafe_or_low_quality_candidates() -> None:
     }
 
 
+def test_context_router_selects_world_state_for_strong_project_boundary_match() -> None:
+    now = datetime.now(UTC)
+    world = _world(
+        "cubeagent.project",
+        facts=("生产只保留当前 release。",),
+        open_items=("后续合并 Memory/Hermes。",),
+        future_events=("harness 改造走独立项目。",),
+        now=now,
+    )
+
+    result = route_cognitive_context(
+        request="不要改 harness",
+        mode="hybrid",
+        agent_ids=("quality_reviewer",),
+        world_states=(world,),
+        limit=5,
+    )
+
+    assert result.selected[0].source == "world_state"
+    assert "harness" in result.selected[0].summary
+
+
 def _memory(text: str, *, now: datetime) -> MemoryRecord:
     return MemoryRecord(
         id=uuid4(),

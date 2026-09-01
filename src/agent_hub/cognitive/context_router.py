@@ -261,7 +261,7 @@ def _route_world_state(
     score += min(0.1, len(world.evidence) * 0.04)
     if world.last_verified_at is not None:
         score += 0.06
-    if score < 0.42:
+    if score < 0.25:
         return None, _skip(
             id_=world.id,
             source="world_state",
