@@ -1,5 +1,6 @@
 """Cognitive experience layer for durable learning and bounded future guidance."""
 
+from agent_hub.cognitive.context_router import route_cognitive_context
 from agent_hub.cognitive.reflection import reflect_from_feedback
 from agent_hub.cognitive.repository import (
     InMemoryCognitiveRecordRepository,
@@ -47,5 +48,6 @@ __all__ = [
     "SkillPromotionService",
     "WorldStateRecord",
     "reflect_from_feedback",
+    "route_cognitive_context",
     "route_experiences",
 ]
