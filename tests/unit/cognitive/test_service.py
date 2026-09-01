@@ -6,7 +6,12 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.cognitive.repository import InMemoryExperienceRepository
-from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
+from agent_hub.cognitive.service import (
+    CognitiveStateService,
+    ExperienceService,
+    SkillPromotionNotReady,
+    SkillPromotionService,
+)
 from agent_hub.cognitive.types import (
     CognitiveEvidence,
     CognitiveMemoryScope,
@@ -326,3 +331,193 @@ async def test_world_state_merges_facts_and_closes_open_items() -> None:
     assert second.future_events == ("harness 改造走独立项目。",)
     assert len(second.evidence) == 2
     assert second.last_verified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_promote_successful_experiences_to_skill_candidate() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    experience_repository = InMemoryExperienceRepository()
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_service = ExperienceService(experience_repository, now=lambda: datetime.now(UTC))
+    promotion_service = SkillPromotionService(
+        experience_repository,
+        cognitive_repository,
+        now=lambda: datetime.now(UTC),
+    )
+    tenant_id = uuid4()
+    user_id = uuid4()
+    first = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.WORKFLOW_STRATEGY,
+        summary="大输入先压缩再拆分。",
+        lesson="大输入直接审查容易超时。",
+        strategy="先压缩输入，再拆成较小审查块。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="created"),),
+        tags=("review", "timeout"),
+        applies_to_modes=("hybrid",),
+        applies_to_agents=("quality_reviewer",),
+    )
+    first = await experience_service.confirm(first.id, tenant_id=tenant_id, user_id=user_id)
+    await experience_service.record_use_outcome(
+        first.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=True,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-2", note="worked"),
+    )
+    second = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.ERROR_HANDLING,
+        summary="reviewer 超时后重试较小任务。",
+        lesson="分块后 reviewer 更稳定。",
+        strategy="如果 reviewer 超时，降低输入规模后重试。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-3", note="created"),),
+        tags=("review", "timeout"),
+        applies_to_modes=("hybrid",),
+        applies_to_agents=("quality_reviewer",),
+    )
+    second = await experience_service.confirm(second.id, tenant_id=tenant_id, user_id=user_id)
+    await experience_service.record_use_outcome(
+        second.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=True,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-4", note="worked"),
+    )
+
+    skill = await promotion_service.promote_from_experiences(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        experience_ids=(first.id, second.id),
+        name="reviewer-timeout-recovery",
+        purpose="让 reviewer 超时后优先压缩、拆分、重试。",
+        output_contract="输出审查结论、修复建议和无法审查的残余风险。",
+        required_inputs=("审查对象", "失败原因"),
+    )
+
+    assert skill.name == "reviewer-timeout-recovery"
+    assert skill.status == "candidate"
+    assert skill.confidence >= 0.65
+    assert skill.steps == ("先压缩输入，再拆成较小审查块。", "如果 reviewer 超时，降低输入规模后重试。")
+    assert skill.required_inputs == ("审查对象", "失败原因")
+    assert {item.source_id for item in skill.evidence} == {str(first.id), str(second.id)}
+
+
+@pytest.mark.asyncio
+async def test_skill_promotion_requires_enough_successful_experience() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    experience_repository = InMemoryExperienceRepository()
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_service = ExperienceService(experience_repository, now=lambda: datetime.now(UTC))
+    promotion_service = SkillPromotionService(
+        experience_repository,
+        cognitive_repository,
+        now=lambda: datetime.now(UTC),
+    )
+    tenant_id = uuid4()
+    user_id = uuid4()
+    record = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.WORKFLOW_STRATEGY,
+        summary="单次经验不足以晋升技能。",
+        lesson="只有一次成功，证据不足。",
+        strategy="继续收集使用结果。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="created"),),
+    )
+    record = await experience_service.confirm(record.id, tenant_id=tenant_id, user_id=user_id)
+
+    with pytest.raises(SkillPromotionNotReady):
+        await promotion_service.promote_from_experiences(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            experience_ids=(record.id,),
+            name="not-ready",
+            purpose="不应晋升。",
+            output_contract="不应创建 skill。",
+        )
+
+
+@pytest.mark.asyncio
+async def test_skill_promotion_updates_existing_candidate_without_duplicate() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    experience_repository = InMemoryExperienceRepository()
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_service = ExperienceService(experience_repository, now=lambda: datetime.now(UTC))
+    promotion_service = SkillPromotionService(
+        experience_repository,
+        cognitive_repository,
+        now=lambda: datetime.now(UTC),
+    )
+    tenant_id = uuid4()
+    user_id = uuid4()
+    first = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.WORKFLOW_STRATEGY,
+        summary="重复晋升应更新同名 skill。",
+        lesson="同名 skill 不应重复。",
+        strategy="先压缩输入。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="created"),),
+        confidence=0.8,
+    )
+    first = await experience_service.confirm(first.id, tenant_id=tenant_id, user_id=user_id)
+    await experience_service.record_use_outcome(
+        first.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=True,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-2", note="worked"),
+    )
+    second = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.WORKFLOW_STRATEGY,
+        summary="重复晋升补充步骤。",
+        lesson="新经验可补充旧 skill。",
+        strategy="再拆分审查块。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-3", note="created"),),
+        confidence=0.8,
+    )
+    second = await experience_service.confirm(second.id, tenant_id=tenant_id, user_id=user_id)
+    await experience_service.record_use_outcome(
+        second.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=True,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-4", note="worked"),
+    )
+
+    original = await promotion_service.promote_from_experiences(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        experience_ids=(first.id,),
+        name="reviewer-recovery",
+        purpose="审查恢复。",
+        output_contract="输出审查结果。",
+        minimum_successes=1,
+    )
+    updated = await promotion_service.promote_from_experiences(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        experience_ids=(first.id, second.id),
+        name="reviewer-recovery",
+        purpose="审查恢复。",
+        output_contract="输出审查结果。",
+        minimum_successes=1,
+    )
+
+    skills = await cognitive_repository.list_for_user(
+        SkillCandidateRecord,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+    assert len(skills) == 1
+    assert updated.id == original.id
+    assert updated.version == original.version + 1
+    assert updated.steps == ("先压缩输入。", "再拆分审查块。")

@@ -69,6 +69,7 @@ class CognitiveStateRepository(Protocol):
         self, record_type: type[WorldStateRecord], record_id: str | UUID
     ) -> WorldStateRecord | None: ...
 
+    @overload
     async def list_for_user(
         self,
         record_type: type[BeliefRecord],
@@ -76,6 +77,15 @@ class CognitiveStateRepository(Protocol):
         tenant_id: UUID,
         user_id: UUID,
     ) -> tuple[BeliefRecord, ...]: ...
+
+    @overload
+    async def list_for_user(
+        self,
+        record_type: type[SkillCandidateRecord],
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> tuple[SkillCandidateRecord, ...]: ...
 
 
 def _bounded_confidence(value: float) -> float:
@@ -99,6 +109,20 @@ def _merge_unique(existing: tuple[str, ...], incoming: tuple[str, ...]) -> tuple
 def _remove_items(existing: tuple[str, ...], completed: tuple[str, ...]) -> tuple[str, ...]:
     completed_set = set(completed)
     return tuple(item for item in existing if item not in completed_set)
+
+
+def _merge_evidence(
+    existing: tuple[CognitiveEvidence, ...],
+    incoming: tuple[CognitiveEvidence, ...],
+) -> tuple[CognitiveEvidence, ...]:
+    seen: set[tuple[str, str, str]] = set()
+    result: list[CognitiveEvidence] = []
+    for item in (*existing, *incoming):
+        key = (item.source_type, item.source_id, item.note)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return tuple(result)
 
 
 class ExperienceService:
@@ -479,3 +503,165 @@ class CognitiveStateService:
         if success_count >= 2 and confidence >= 0.72:
             return "active"
         return current_status
+
+
+class SkillPromotionNotReady(RuntimeError):
+    pass
+
+
+class SkillPromotionService:
+    def __init__(
+        self,
+        experience_repository: ExperienceRepository,
+        cognitive_repository: CognitiveStateRepository,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._experience_repository = experience_repository
+        self._cognitive_repository = cognitive_repository
+        self._now = now or (lambda: datetime.now(UTC))
+
+    async def promote_from_experiences(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        experience_ids: tuple[UUID, ...],
+        name: str,
+        purpose: str,
+        output_contract: str,
+        required_inputs: tuple[str, ...] = (),
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
+        minimum_successes: int = 2,
+        minimum_confidence: float = 0.65,
+    ) -> SkillCandidateRecord:
+        if not experience_ids:
+            raise SkillPromotionNotReady("at least one experience is required")
+        experiences = await self._owned_experiences(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            experience_ids=experience_ids,
+        )
+        self._validate_ready(
+            experiences,
+            minimum_successes=minimum_successes,
+            minimum_confidence=minimum_confidence,
+        )
+
+        timestamp = self._now()
+        promotion_evidence = tuple(
+            CognitiveEvidence(
+                source_type="experience",
+                source_id=str(experience.id),
+                note=experience.summary,
+            )
+            for experience in experiences
+        )
+        confidence = _bounded_confidence(
+            sum(experience.confidence for experience in experiences) / len(experiences)
+        )
+        steps = _merge_unique((), tuple(experience.strategy for experience in experiences))
+        existing = await self._find_existing_skill(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=name,
+            memory_scope=memory_scope,
+        )
+        if existing is None:
+            record = SkillCandidateRecord(
+                id=uuid5(
+                    NAMESPACE_URL,
+                    f"agent-hub:skill:{tenant_id}:{user_id}:{memory_scope.value}:{name}",
+                ),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                memory_scope=memory_scope,
+                name=name,
+                purpose=purpose,
+                steps=steps,
+                required_inputs=required_inputs,
+                output_contract=output_contract,
+                confidence=confidence,
+                evidence=promotion_evidence,
+                status="candidate",
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            return await self._cognitive_repository.upsert(record)
+
+        updated = existing.model_copy(
+            update={
+                "purpose": purpose,
+                "steps": _merge_unique(existing.steps, steps),
+                "required_inputs": _merge_unique(existing.required_inputs, required_inputs),
+                "output_contract": output_contract,
+                "confidence": max(existing.confidence, confidence),
+                "evidence": _merge_evidence(existing.evidence, promotion_evidence),
+                "version": existing.version + 1,
+                "last_verified_at": timestamp,
+                "updated_at": timestamp,
+            }
+        )
+        return await self._cognitive_repository.upsert(updated)
+
+    async def _owned_experiences(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        experience_ids: tuple[UUID, ...],
+    ) -> tuple[ExperienceRecord, ...]:
+        records = await self._experience_repository.list_for_user(tenant_id, user_id)
+        by_id = {record.id: record for record in records}
+        selected: list[ExperienceRecord] = []
+        for experience_id in experience_ids:
+            record = by_id.get(experience_id)
+            if record is None:
+                raise SkillPromotionNotReady("experience is not available for promotion")
+            if record.tenant_id != tenant_id or record.user_id != user_id:
+                raise PermissionError("experience is not visible to caller")
+            selected.append(record)
+        return tuple(selected)
+
+    @staticmethod
+    def _validate_ready(
+        experiences: tuple[ExperienceRecord, ...],
+        *,
+        minimum_successes: int,
+        minimum_confidence: float,
+    ) -> None:
+        if any(not experience.active_for_runtime for experience in experiences):
+            raise SkillPromotionNotReady("only confirmed or active experiences can be promoted")
+        success_count = sum(experience.success_count for experience in experiences)
+        failure_count = sum(experience.failure_count for experience in experiences)
+        if success_count < minimum_successes:
+            raise SkillPromotionNotReady("not enough successful uses to promote skill")
+        if failure_count > success_count:
+            raise SkillPromotionNotReady("experience failures outweigh successful uses")
+        confidence = sum(experience.confidence for experience in experiences) / len(experiences)
+        if confidence < minimum_confidence:
+            raise SkillPromotionNotReady("experience confidence is too low for promotion")
+
+    async def _find_existing_skill(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        name: str,
+        memory_scope: CognitiveMemoryScope,
+    ) -> SkillCandidateRecord | None:
+        skills = await self._cognitive_repository.list_for_user(
+            SkillCandidateRecord,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        return next(
+            (
+                skill
+                for skill in skills
+                if skill.user_id == user_id
+                and skill.memory_scope is memory_scope
+                and skill.name == name
+            ),
+            None,
+        )
