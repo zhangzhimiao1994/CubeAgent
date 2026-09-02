@@ -16,6 +16,22 @@ def test_outcome_verifier_marks_completed_run_with_output_as_success() -> None:
     assert assessment.confidence >= 0.75
 
 
+def test_outcome_verifier_accepts_nested_text_artifact_content() -> None:
+    assessment = OutcomeVerifier().assess(
+        terminal_status="completed",
+        events=({"kind": "runtime.completed", "message": "run completed"},),
+        artifacts=(
+            {
+                "kind": "text",
+                "title": "final answer",
+                "content": {"text": "真实 artifact payload 输出"},
+            },
+        ),
+    )
+
+    assert assessment.verdict is OutcomeVerdict.SUCCESS
+
+
 def test_outcome_verifier_marks_completed_run_with_recovered_failures_as_partial() -> None:
     assessment = OutcomeVerifier().assess(
         terminal_status="completed",

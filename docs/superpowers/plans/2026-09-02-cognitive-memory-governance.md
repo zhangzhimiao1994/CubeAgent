@@ -76,12 +76,12 @@
 - Test: `tests/unit/cognitive/test_pipeline.py`
 - Test: `tests/unit/runs/test_terminal_hooks.py`
 
-- [ ] Write failing tests for success reflection, failure reflection, outcome critic verdict persistence, candidate experience creation, strategy outcome calibration, and terminal hook non-blocking behavior.
-- [ ] Run the new tests and verify current reflection is too narrow or pipeline missing.
-- [ ] Implement `ReflectionEngine`, `OutcomeCritic`, and `CognitiveLearningPipeline`.
-- [ ] Register the pipeline as an additional terminal hook in app and worker wiring.
-- [ ] Run targeted cognitive and run-hook tests.
-- [ ] Commit as `feat: connect cognitive reflection pipeline`.
+- [x] Write failing tests for success reflection, failure reflection, outcome critic verdict persistence, candidate experience creation, strategy outcome calibration, and terminal hook non-blocking behavior.
+- [x] Run the new tests and verify current reflection is too narrow or pipeline missing.
+- [x] Implement `ReflectionEngine`, `OutcomeCritic`, and `CognitiveLearningPipeline`.
+- [x] Register the pipeline as an additional terminal hook in app and worker wiring.
+- [x] Run targeted cognitive and run-hook tests.
+- [x] Commit as `feat: connect cognitive reflection pipeline`.
 
 ### Task 5: API, verification, and handoff
 

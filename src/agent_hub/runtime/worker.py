@@ -12,6 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
+from agent_hub.cognitive.repository import (
+    PersistentCognitiveRecordRepository,
+    PersistentExperienceRepository,
+)
+from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
@@ -129,13 +135,19 @@ def build_worker_service(
         hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
         runtime_timeout_seconds=settings.runtime_timeout_seconds,
         runtime_token_budget=settings.runtime_token_budget,
-        terminal_run_hooks=_evolution_terminal_hooks(
-            config_service=config_service,
-            secret_service=secret_service,
-            tenant_id=settings.bootstrap_tenant_id,
-            run_repository=run_repository,
-            session_factory=database.session_factory,
-            skill_store_dir=settings.skill_store_dir,
+        terminal_run_hooks=(
+            *_evolution_terminal_hooks(
+                config_service=config_service,
+                secret_service=secret_service,
+                tenant_id=settings.bootstrap_tenant_id,
+                run_repository=run_repository,
+                session_factory=database.session_factory,
+                skill_store_dir=settings.skill_store_dir,
+            ),
+            _cognitive_terminal_hook(
+                run_repository=run_repository,
+                session_factory=database.session_factory,
+            ),
         ),
     )
     return database, redis_client, service, queue
@@ -160,6 +172,22 @@ def _evolution_terminal_hooks(
         skill_store_dir=skill_store_dir,
     )
     return (EvolutionExecutionIngestHook(evolution_service),)
+
+
+def _cognitive_terminal_hook(
+    *,
+    run_repository: RunRepository,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> CognitiveLearningTerminalHook:
+    return CognitiveLearningTerminalHook(
+        CognitiveLearningPipeline(
+            experience_service=ExperienceService(PersistentExperienceRepository(session_factory)),
+            cognitive_service=CognitiveStateService(
+                PersistentCognitiveRecordRepository(session_factory)
+            ),
+            run_repository=run_repository,
+        )
+    )
 
 
 async def _run() -> None:

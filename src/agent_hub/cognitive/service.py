@@ -15,6 +15,7 @@ from agent_hub.cognitive.types import (
     ExperienceStatus,
     OutcomeAssessmentRecord,
     OutcomeVerdict,
+    ReflectionRecord,
     RelationshipStateRecord,
     SkillCandidateRecord,
     StrategyRecord,
@@ -43,6 +44,9 @@ class CognitiveRecordNotFound(LookupError):
 
 class CognitiveStateRepository(Protocol):
     @overload
+    async def upsert(self, record: ReflectionRecord) -> ReflectionRecord: ...
+
+    @overload
     async def upsert(self, record: BeliefRecord) -> BeliefRecord: ...
 
     @overload
@@ -59,6 +63,11 @@ class CognitiveStateRepository(Protocol):
 
     @overload
     async def upsert(self, record: WorldStateRecord) -> WorldStateRecord: ...
+
+    @overload
+    async def get(
+        self, record_type: type[ReflectionRecord], record_id: str | UUID
+    ) -> ReflectionRecord | None: ...
 
     @overload
     async def get(
@@ -89,6 +98,15 @@ class CognitiveStateRepository(Protocol):
     async def get(
         self, record_type: type[WorldStateRecord], record_id: str | UUID
     ) -> WorldStateRecord | None: ...
+
+    @overload
+    async def list_for_user(
+        self,
+        record_type: type[ReflectionRecord],
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> tuple[ReflectionRecord, ...]: ...
 
     @overload
     async def list_for_user(
@@ -586,6 +604,9 @@ class CognitiveStateService:
             created_at=self._now(),
         )
         return await self._repository.upsert(record)
+
+    async def record_reflection(self, reflection: ReflectionRecord) -> ReflectionRecord:
+        return await self._repository.upsert(reflection)
 
     async def update_relationship_state(
         self,

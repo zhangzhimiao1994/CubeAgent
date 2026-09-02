@@ -66,10 +66,22 @@ class OutcomeVerifier:
         events: Sequence[Mapping[str, object]],
         artifacts: Sequence[Mapping[str, object]],
     ) -> bool:
-        if any(str(artifact.get("text", "")).strip() for artifact in artifacts):
+        if any(_artifact_has_text(artifact) for artifact in artifacts):
             return True
         return any(
             str(event.get("kind", "")).casefold() == "message.created"
             and bool(str(event.get("message", "")).strip())
             for event in events
-        )
+        ) or any(_event_artifact_has_text(event) for event in events)
+
+
+def _artifact_has_text(artifact: Mapping[str, object]) -> bool:
+    if str(artifact.get("text", "")).strip():
+        return True
+    content = artifact.get("content")
+    return isinstance(content, Mapping) and bool(str(content.get("text", "")).strip())
+
+
+def _event_artifact_has_text(event: Mapping[str, object]) -> bool:
+    artifact = event.get("artifact")
+    return isinstance(artifact, Mapping) and _artifact_has_text(artifact)

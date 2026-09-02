@@ -14,7 +14,13 @@ from agent_hub.cognitive.metacognition import (
     MetacognitionDecision,
     MetacognitionService,
 )
-from agent_hub.cognitive.reflection import reflect_from_feedback
+from agent_hub.cognitive.pipeline import (
+    CognitiveLearningPipeline,
+    CognitiveLearningResult,
+    CognitiveLearningTerminalHook,
+    OutcomeCritic,
+)
+from agent_hub.cognitive.reflection import ReflectionEngine, reflect_from_feedback
 from agent_hub.cognitive.repository import (
     InMemoryCognitiveRecordRepository,
     InMemoryExperienceRepository,
@@ -50,6 +56,9 @@ __all__ = [
     "BeliefRecord",
     "CognitiveEvidence",
     "CognitiveGateLevel",
+    "CognitiveLearningPipeline",
+    "CognitiveLearningResult",
+    "CognitiveLearningTerminalHook",
     "CognitiveMemoryScope",
     "CognitiveStateService",
     "ConfidenceCalibrationService",
@@ -65,9 +74,11 @@ __all__ = [
     "MetacognitionDecision",
     "MetacognitionService",
     "OutcomeAssessmentRecord",
+    "OutcomeCritic",
     "OutcomeVerdict",
     "PersistentCognitiveRecordRepository",
     "PersistentExperienceRepository",
+    "ReflectionEngine",
     "ReflectionRecord",
     "RelationshipStateRecord",
     "SkillCandidateRecord",

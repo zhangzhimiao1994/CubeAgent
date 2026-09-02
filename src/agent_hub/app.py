@@ -67,6 +67,12 @@ from agent_hub.channels.submitter import (
     RunServiceInboundSubmitter,
     RunSubmissionService,
 )
+from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
+from agent_hub.cognitive.repository import (
+    PersistentCognitiveRecordRepository,
+    PersistentExperienceRepository,
+)
+from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
@@ -786,10 +792,20 @@ def create_app(
                         secret_service=active_secret_service,
                         tenant_id=configured.bootstrap_tenant_id,
                         redis_client=active_redis,
-                    )
+                )
                 queue = task_queue if task_queue is not None else InProcessRunQueue()
+                run_repository = RunRepository(active_sessions)
+                cognitive_pipeline = CognitiveLearningPipeline(
+                    cognitive_service=CognitiveStateService(
+                        PersistentCognitiveRecordRepository(active_sessions)
+                    ),
+                    experience_service=ExperienceService(
+                        PersistentExperienceRepository(active_sessions)
+                    ),
+                    run_repository=run_repository,
+                )
                 application.state.run_service = RunService(
-                    RunRepository(active_sessions),
+                    run_repository,
                     runtime_registry=active_runtime_registry,
                     router=active_mode_router,
                     task_queue=queue,
@@ -804,6 +820,9 @@ def create_app(
                             if admin_resource_service is not None
                             else application.state.admin_resource_service,
                         ).get_main_agent_config
+                    ),
+                    terminal_run_hooks=(
+                        CognitiveLearningTerminalHook(cognitive_pipeline),
                     ),
                 )
                 application.state.run_queue = queue

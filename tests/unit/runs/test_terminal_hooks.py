@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -8,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.cognitive.pipeline import CognitiveLearningTerminalHook
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import HermesRunOutcome, RunService
@@ -231,6 +233,27 @@ class RecordingHook:
             raise RuntimeError("hook failed")
 
 
+class SlowCognitivePipeline:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def process_terminal_run(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        status: RunStatus,
+        mode: TaskMode | None,
+        routing_decision: dict[str, object],
+        actor_id: UUID | None = None,
+    ) -> object:
+        del tenant_id, actor_id, run_id, status, mode, routing_decision
+        self.started.set()
+        await self.release.wait()
+        return None
+
+
 @pytest.mark.asyncio
 async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
     repository = ExecutableFakeRepository(
@@ -278,6 +301,29 @@ async def test_terminal_hook_failure_does_not_fail_completed_run() -> None:
 
     assert submitted.status is RunStatus.COMPLETED
     assert hook.calls
+
+
+@pytest.mark.asyncio
+async def test_cognitive_terminal_hook_does_not_block_completed_run() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    pipeline = SlowCognitivePipeline()
+    hook = CognitiveLearningTerminalHook(pipeline)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        terminal_run_hooks=(hook,),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    await asyncio.wait_for(pipeline.started.wait(), timeout=1)
+    assert hook.pending_count == 1
+    pipeline.release.set()
+    await hook.drain()
+    assert hook.pending_count == 0
 
 
 @pytest.mark.asyncio
