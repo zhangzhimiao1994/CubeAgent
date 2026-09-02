@@ -14,6 +14,7 @@ from agent_hub.memory.types import (
     MemoryLayer,
     MemoryRecord,
     MemorySummaryPeriod,
+    MemoryTier,
 )
 
 _SECRET_PATTERNS = (
@@ -164,9 +165,13 @@ class MemoryService:
         tenant_id: UUID,
         user_id: UUID,
         include_deleted: bool = False,
+        include_archived: bool = False,
     ) -> tuple[MemoryRecord, ...]:
-        if include_deleted:
-            return await self._repository.list_for_user(tenant_id, user_id)
+        if include_deleted or include_archived:
+            records = await self._repository.list_for_user(tenant_id, user_id)
+            if include_archived:
+                return records
+            return tuple(record for record in records if record.archived_at is None)
         return await self._active_records(tenant_id, user_id)
 
     async def edit(
@@ -215,6 +220,37 @@ class MemoryService:
         await self._repository.upsert(deleted)
         await self._audit("memory.forgotten", tenant_id, user_id, memory_id, "forgotten", reason=reason)
         return deleted
+
+    async def archive(
+        self,
+        memory_id: UUID,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        reason: str = "cold_storage",
+    ) -> MemoryRecord:
+        record = await self._owned_record(memory_id, tenant_id, user_id)
+        now = self._now()
+        archived = _validated_update(
+            record,
+            {
+                "archived_at": now,
+                "archive_reason": reason,
+                "updated_at": now,
+            },
+        )
+        await self._repository.upsert(archived)
+        await self._audit("memory.archived", tenant_id, user_id, memory_id, "archived", reason=reason)
+        return archived
+
+    def classify_tier(self, record: MemoryRecord) -> MemoryTier:
+        if record.deleted_at is not None or record.archived_at is not None:
+            return MemoryTier.ARCHIVE
+        if record.locked or record.layer is MemoryLayer.CORE or record.heat >= 0.75:
+            return MemoryTier.HOT
+        if record.heat >= 0.3:
+            return MemoryTier.WARM
+        return MemoryTier.COLD
 
     async def expire_due(self) -> int:
         expired = 0
@@ -295,6 +331,7 @@ class MemoryService:
         project_id: str | None = None,
         conversation_id: str | None = None,
         limit: int = 12,
+        archive_sources: bool = False,
     ) -> MemoryRecord:
         if period is MemorySummaryPeriod.NONE:
             raise ValueError("summary period must be day, week, or month")
@@ -329,9 +366,29 @@ class MemoryService:
             project_id=project_id,
             conversation_id=conversation_id,
             summary_period=period,
+            source_memory_ids=tuple(record.id for record in selected),
             metadata={"source_count": str(len(selected))},
         )
         await self._repository.upsert(summary)
+        if archive_sources:
+            for record in selected:
+                archived = _validated_update(
+                    record,
+                    {
+                        "archived_at": now,
+                        "archive_reason": f"consolidated_into:{summary.id}",
+                        "updated_at": now,
+                    },
+                )
+                await self._repository.upsert(archived)
+                await self._audit(
+                    "memory.archived",
+                    tenant_id,
+                    user_id,
+                    record.id,
+                    "archived",
+                    reason=archived.archive_reason,
+                )
         await self._audit("memory.consolidated", tenant_id, user_id, summary.id, "consolidated")
         return summary
 
@@ -357,7 +414,9 @@ class MemoryService:
         return tuple(
             record
             for record in records
-            if record.deleted_at is None and (record.expires_at is None or record.expires_at > now)
+            if record.deleted_at is None
+            and record.archived_at is None
+            and (record.expires_at is None or record.expires_at > now)
         )
 
     async def _owned_record(self, memory_id: UUID, tenant_id: UUID, user_id: UUID) -> MemoryRecord:

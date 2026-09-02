@@ -13,6 +13,13 @@ class MemoryLayer(StrEnum):
     CORE = "core"
 
 
+class MemoryTier(StrEnum):
+    HOT = "hot"
+    WARM = "warm"
+    COLD = "cold"
+    ARCHIVE = "archive"
+
+
 class MemoryCategory(StrEnum):
     PREFERENCE = "preference"
     FACT = "fact"
@@ -67,6 +74,7 @@ class MemoryRecord(BaseModel):
     heat: float = Field(default=0.5, ge=0, le=1)
     last_recalled_at: datetime | None = None
     recall_count: int = Field(default=0, ge=0)
+    source_memory_ids: tuple[UUID, ...] = ()
     locked: bool = False
     project_id: str | None = Field(default=None, min_length=1, max_length=128)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -75,6 +83,8 @@ class MemoryRecord(BaseModel):
     expires_at: datetime | None = None
     deleted_at: datetime | None = None
     tombstone_reason: str | None = Field(default=None, max_length=256)
+    archived_at: datetime | None = None
+    archive_reason: str | None = Field(default=None, max_length=256)
 
     @field_validator("text")
     @classmethod
@@ -107,7 +117,7 @@ class MemoryRecord(BaseModel):
                 raise ValueError("memory metadata must contain bounded printable strings")
         return value
 
-    @field_validator("created_at", "updated_at", "last_recalled_at", "expires_at", "deleted_at")
+    @field_validator("created_at", "updated_at", "last_recalled_at", "expires_at", "deleted_at", "archived_at")
     @classmethod
     def require_aware_datetime(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
@@ -120,12 +130,18 @@ class MemoryRecord(BaseModel):
             raise ValueError("updated_at cannot be before created_at")
         if self.expires_at is not None and self.expires_at <= self.created_at:
             raise ValueError("expires_at must be after created_at")
+        if self.archived_at is not None and self.archived_at < self.created_at:
+            raise ValueError("archived_at cannot be before created_at")
         return self
 
     @property
     def active(self) -> bool:
         now = datetime.now(UTC)
-        return self.deleted_at is None and (self.expires_at is None or self.expires_at > now)
+        return (
+            self.deleted_at is None
+            and self.archived_at is None
+            and (self.expires_at is None or self.expires_at > now)
+        )
 
 
 class MemoryAddResult(BaseModel):
@@ -134,4 +150,3 @@ class MemoryAddResult(BaseModel):
     status: MemoryAddStatus
     record: MemoryRecord | None = None
     reason: str | None = None
-

@@ -68,6 +68,11 @@ def _candidate_sections(value: ContextBuildInput) -> list[ContextSection]:
     if value.checkpoint:
         sections.append(_section("checkpoint", value.checkpoint, 51))
     sections.extend(
+        _section("working_memory", _render_memory(memory), 55)
+        for memory in value.memories
+        if memory.layer is MemoryLayer.WORKING
+    )
+    sections.extend(
         _section("core_memory", _render_memory(memory), 60)
         for memory in value.memories
         if memory.layer is MemoryLayer.CORE

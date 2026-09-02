@@ -44,24 +44,25 @@
 - [x] Implement `OutcomeVerifier`, `ConflictResolutionEngine`, `ConfidenceCalibrationService`, `AntiLearningService`, and memory-tier scoring types.
 - [x] Wire anti-learning helpers into existing experience/strategy outcome update behavior.
 - [x] Run targeted governance/service tests.
-- [ ] Commit as `feat: add cognitive governance controls`.
+- [x] Commit as `feat: add cognitive governance controls`.
 
 ### Task 3: Metacognition, working set, and hierarchical memory
 
 **Files:**
 - Create: `src/agent_hub/cognitive/metacognition.py`
 - Create: `src/agent_hub/cognitive/hierarchy.py`
-- Modify: `src/agent_hub/cognitive/context_router.py`
+- Modify: `src/agent_hub/context/builder.py`
 - Modify: `src/agent_hub/cognitive/__init__.py`
 - Test: `tests/unit/cognitive/test_metacognition.py`
 - Test: `tests/unit/cognitive/test_hierarchy.py`
-- Test: `tests/unit/cognitive/test_context_router.py`
+- Test: `tests/unit/context/test_builder.py`
+- Test: `tests/unit/memory/test_governance.py`
 
-- [ ] Write failing tests for simple-task lightweight gate, complex-task advanced gate, stale/conflict detection, bounded working set, hot/warm/cold/archive tiering, and hierarchical summary consolidation.
-- [ ] Run the new tests and verify missing module/function failures.
-- [ ] Implement `MetacognitionService` and `HierarchicalMemoryService`.
-- [ ] Extend routing to keep injected context bounded and skip archived/low-confidence/conflicted records.
-- [ ] Run targeted cognitive tests.
+- [x] Write failing tests for simple-task lightweight gate, complex-task advanced gate, stale/conflict detection, bounded working set, hot/warm/cold/archive tiering, and hierarchical summary consolidation.
+- [x] Run the new tests and verify missing module/function failures.
+- [x] Implement `MetacognitionService`, `WorkingSetBuilder`, memory tiering, archive, and source-linked consolidation.
+- [x] Extend context construction to keep working memory bounded ahead of long-term memory and skip archived memory in active retrieval.
+- [x] Run targeted cognitive/memory/context tests plus ruff, strict mypy, and diff check.
 - [ ] Commit as `feat: add cognitive metacognition and memory hierarchy`.
 
 ### Task 4: Reflection pipeline, Outcome Critic, and runtime terminal hook

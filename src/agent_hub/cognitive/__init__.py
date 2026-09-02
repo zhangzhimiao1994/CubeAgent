@@ -8,6 +8,12 @@ from agent_hub.cognitive.governance import (
     ConflictResolutionEngine,
     ConflictResolutionStatus,
 )
+from agent_hub.cognitive.hierarchy import WorkingSetBuilder
+from agent_hub.cognitive.metacognition import (
+    CognitiveGateLevel,
+    MetacognitionDecision,
+    MetacognitionService,
+)
 from agent_hub.cognitive.reflection import reflect_from_feedback
 from agent_hub.cognitive.repository import (
     InMemoryCognitiveRecordRepository,
@@ -43,6 +49,7 @@ __all__ = [
     "AntiLearningService",
     "BeliefRecord",
     "CognitiveEvidence",
+    "CognitiveGateLevel",
     "CognitiveMemoryScope",
     "CognitiveStateService",
     "ConfidenceCalibrationService",
@@ -55,6 +62,8 @@ __all__ = [
     "ExperienceStatus",
     "InMemoryCognitiveRecordRepository",
     "InMemoryExperienceRepository",
+    "MetacognitionDecision",
+    "MetacognitionService",
     "OutcomeAssessmentRecord",
     "OutcomeVerdict",
     "PersistentCognitiveRecordRepository",
@@ -66,6 +75,7 @@ __all__ = [
     "SkillPromotionService",
     "StrategyRecord",
     "StrategyStatus",
+    "WorkingSetBuilder",
     "WorldStateRecord",
     "reflect_from_feedback",
     "route_cognitive_context",

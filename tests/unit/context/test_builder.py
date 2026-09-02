@@ -105,6 +105,23 @@ def test_context_builder_uses_deterministic_priority_order() -> None:
     ]
 
 
+def test_context_builder_renders_working_memory_before_long_term_memory() -> None:
+    value = ContextBuildInput(
+        system_policy="system",
+        current_user_request="request",
+        memories=(
+            memory("episodic task detail", MemoryLayer.EPISODIC),
+            memory("working state for current task", MemoryLayer.WORKING),
+            memory("core preference", MemoryLayer.CORE),
+        ),
+    )
+
+    names = [section.name for section in ContextBuilder().build(value, token_budget=200).sections]
+
+    assert names.index("working_memory") < names.index("core_memory")
+    assert names.index("working_memory") < names.index("episodic_memory")
+
+
 def test_knowledge_prompt_injection_is_labeled_in_context() -> None:
     context = ContextBuilder().build(
         ContextBuildInput(
