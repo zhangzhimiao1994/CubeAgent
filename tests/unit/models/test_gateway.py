@@ -985,6 +985,32 @@ async def test_no_fallback_when_request_disallows_it() -> None:
     assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
 
 
+async def test_capacity_unavailable_names_logical_models_and_deployments() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub(
+        [
+            CapacityWaitTimeout("busy"),
+            CapacityQueueFull("full"),
+        ]
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(CapacityUnavailable) as caught:
+        await gateway.complete(request())
+
+    assert str(caught.value) == (
+        "model capacity unavailable "
+        "(logical_models=primary,backup; deployments=primary-key,backup-key)"
+    )
+
+
 async def test_fallback_must_satisfy_request_capabilities() -> None:
     primary = deployment(
         "primary-key", capabilities=frozenset({ModelCapability.TEXT, ModelCapability.VISION})

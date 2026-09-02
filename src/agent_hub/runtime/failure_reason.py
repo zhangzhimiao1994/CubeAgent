@@ -25,6 +25,11 @@ _STATUS_CODE = re.compile(r"\(status=(?P<status>[1-5][0-9]{2})\)")
 _CREWAI_STEP_TIMEOUT = re.compile(
     r"^CrewAI step timed out: step=(?P<step>[A-Za-z0-9_.-]{1,128}) actor=(?P<actor>[A-Za-z0-9_.-]{1,128})$"
 )
+_CAPACITY_CONTEXT = re.compile(
+    r"model capacity unavailable "
+    r"\(logical_models=(?P<logical_models>[A-Za-z0-9_,:-]{1,512}); "
+    r"deployments=(?P<deployments>[A-Za-z0-9_,:-]{1,1024})\)"
+)
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
     {
@@ -67,6 +72,12 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
     if isinstance(error, CapacityWaitTimeout):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model capacity queue timeout"
     if isinstance(error, CapacityUnavailable):
+        message = normalize_failure_reason(str(error))
+        if (
+            _CAPACITY_CONTEXT.fullmatch(message) is not None
+            and is_safe_failure_reason(message)
+        ):
+            return f"{GENERIC_MODEL_GATEWAY_FAILURE}: {message}"
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model capacity unavailable"
     if isinstance(error, CapacityConfigurationError):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model capacity configuration failed"
@@ -272,7 +283,7 @@ def _model_gateway_diagnostic(
             suggested_action="检查容量后端服务状态；恢复后可重试本次任务。",
         )
     if "capacity unavailable" in lowered:
-        return _base_diagnostic(
+        diagnostic = _base_diagnostic(
             reason,
             error_stage="model_capacity",
             error_category="unavailable",
@@ -280,6 +291,17 @@ def _model_gateway_diagnostic(
             retryable=True,
             suggested_action="当前模型容量不可用；稍后重试，或切换到可用模型。",
         )
+        context = _CAPACITY_CONTEXT.search(reason)
+        if context is not None:
+            logical_models = context.group("logical_models")
+            deployments = context.group("deployments")
+            diagnostic["logical_models"] = context.group("logical_models")
+            diagnostic["deployments"] = context.group("deployments")
+            diagnostic["suggested_action"] = (
+                f"当前模型容量不可用：{logical_models}；候选部署：{deployments}。"
+                "可稍后重试、降低并发，或切换到可用模型。"
+            )
+        return diagnostic
     if "configuration failed" in lowered:
         return _base_diagnostic(
             reason,

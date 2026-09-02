@@ -342,7 +342,28 @@ class ModelGateway:
             )
         if last_retryable_error is not None:
             raise last_retryable_error from None
-        raise CapacityUnavailable("model capacity unavailable") from None
+        raise CapacityUnavailable(
+            self._capacity_unavailable_reason(candidate_groups)
+        ) from None
+
+    @staticmethod
+    def _capacity_unavailable_reason(
+        candidate_groups: Sequence[tuple[str, tuple[Deployment, ...]]],
+    ) -> str:
+        logical_models = ",".join(
+            logical_model for logical_model, _candidates in candidate_groups
+        )
+        deployment_ids = ",".join(
+            deployment.id
+            for _logical_model, candidates in candidate_groups
+            for deployment in candidates
+        )
+        if not logical_models or not deployment_ids:
+            return "model capacity unavailable"
+        return (
+            "model capacity unavailable "
+            f"(logical_models={logical_models}; deployments={deployment_ids})"
+        )
 
     def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)

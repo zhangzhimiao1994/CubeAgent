@@ -2201,15 +2201,73 @@ describe("operational management pages", () => {
     await user.click(within(stream).getByRole("button", { name: /查看子 Agent 工作席/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
-    expect(within(drawer).getAllByText("Planner").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("Reviewer").length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText("规划助手").length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText("审查助手").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("已下班").length).toBeGreaterThanOrEqual(2);
     expect(within(drawer).getAllByText(/计划输出：先拆解/).length).toBeGreaterThan(0);
-    await user.click(within(drawer).getByRole("button", { name: /Reviewer/ }));
+    expect(within(drawer).queryByText("Planner")).toBeNull();
+    expect(within(drawer).queryByText("Reviewer")).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: /审查助手/ }));
     expect(within(drawer).getAllByText(/审查输出：流程可执行/).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("活动轨迹").length).toBeGreaterThan(0);
     expect(within(drawer).queryByText("电脑视图")).toBeNull();
     expect(within(drawer).queryByText(/checkpoint\.saved/)).toBeNull();
+  });
+
+  it("uses fallback Chinese names for unconfigured subagent work-seat cards", async () => {
+    const user = userEvent.setup();
+    const criticRunDetail = {
+      ...runDetail,
+      status: "completed",
+      mode: "discuss",
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "critic",
+          participants: [],
+          tool_name: null,
+          step_id: "critic_step",
+          action: null,
+          decision: null,
+          payload: { role: "Critic", task: "指出方案风险。" },
+        },
+        {
+          sequence: 2,
+          kind: "step.completed",
+          message: "step.completed",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "critic",
+          participants: [],
+          tool_name: null,
+          step_id: "critic_step",
+          action: null,
+          decision: null,
+          payload: { output: "风险点：需要补充验收标准。" },
+        },
+      ],
+      artifacts: [],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "critic",
+      },
+    };
+    visibleRunListItem = { ...runListItem, status: "completed", mode: "discuss" };
+    visibleRunDetail = criticRunDetail;
+    visibleConversationRuns = [criticRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /查看子 Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+
+    expect(within(drawer).getAllByText("质疑审查员").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("Critic")).toBeNull();
   });
 
   it("scopes subagent work seats to the owning conversation and run", async () => {

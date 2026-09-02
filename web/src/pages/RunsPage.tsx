@@ -141,6 +141,49 @@ function displayRoutingReason(reason: string) {
   return labels[normalized] ?? normalized;
 }
 
+const FALLBACK_AGENT_NAMES: Record<string, string> = {
+  main: "主 Agent",
+  main_agent: "主 Agent",
+  planner: "规划助手",
+  planning_agent: "规划助手",
+  reviewer: "审查助手",
+  quality_reviewer: "质量审查员",
+  critic: "质疑审查员",
+  skeptic: "质疑审查员",
+  moderator: "讨论主持人",
+  domain_expert: "领域专家",
+  final_synthesizer: "最终汇总员",
+  decision_recorder: "裁决记录员",
+  decision_maker: "裁决助手",
+  researcher: "研究员",
+  summarizer: "总结助手",
+  operator: "执行员",
+  executor: "执行员",
+  screen_agent: "屏幕助手",
+  copywriter: "文案生成",
+  writer: "文案生成",
+  editor: "剪辑师",
+  director: "导演",
+  engineer: "工程建议助手",
+  web_engineer: "网页工程助手",
+  temp_web_engineer: "临时网页工程助手",
+  qa_tester: "测试审查员",
+  ops_engineer: "运维审查员",
+  security_reviewer: "安全审查员",
+};
+
+function normalizeAgentNameKey(value: string) {
+  return value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function displayAgentName(agentId: string, agentNames: Map<string, string>) {
+  const trimmed = agentId.trim();
+  if (!trimmed) return trimmed;
+  const configured = agentNames.get(trimmed);
+  if (configured?.trim()) return configured;
+  return FALLBACK_AGENT_NAMES[normalizeAgentNameKey(trimmed)] ?? trimmed;
+}
+
 function parseChoiceText(
   text: string,
   options: Array<{ value: string; label: string; aliases?: string[] }>,
@@ -215,7 +258,7 @@ function displayAgentPool(selectedAgentIds: string | undefined, agentNames: Map<
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean)
-    .map((id) => agentNames.get(id) ?? id);
+    .map((id) => displayAgentName(id, agentNames));
   return names.length > 0 ? names.join("、") : null;
 }
 
@@ -291,12 +334,11 @@ function displayEventMessage(event: RunDetail["events"][number]) {
 
 function displayEventActor(actor: string | null | undefined, agentNames: Map<string, string>) {
   if (!actor) return null;
-  if (actor === "main_agent" || actor === "main") return "主 Agent";
-  return agentNames.get(actor) ?? actor;
+  return displayAgentName(actor, agentNames);
 }
 
 function displayEventParticipants(participants: string[], agentNames: Map<string, string>) {
-  const names = participants.map((id) => agentNames.get(id) ?? id).filter(Boolean);
+  const names = participants.map((id) => displayAgentName(id, agentNames)).filter(Boolean);
   return names.length > 0 ? names.join("、") : null;
 }
 
@@ -305,7 +347,7 @@ function displayPayloadParticipants(payload: Record<string, unknown>, agentNames
   if (!Array.isArray(participants)) return null;
   const names = participants
     .filter((item): item is string => typeof item === "string" && item.length > 0)
-    .map((id) => agentNames.get(id) ?? id);
+    .map((id) => displayAgentName(id, agentNames));
   return names.length > 0 ? names.join("、") : null;
 }
 
@@ -314,7 +356,7 @@ function displayPayloadParticipantModels(payload: Record<string, unknown>, agent
   if (!participantModels || typeof participantModels !== "object" || Array.isArray(participantModels)) return null;
   const rows = Object.entries(participantModels)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0)
-    .map(([agentId, model]) => `${agentNames.get(agentId) ?? agentId}：${model}`);
+    .map(([agentId, model]) => `${displayAgentName(agentId, agentNames)}：${model}`);
   return rows.length > 0 ? rows.join("；") : null;
 }
 
@@ -1221,7 +1263,7 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     .map(([key, value]) => {
       const actorId = key.replace(/_opinion$/, "");
       return {
-        actor: agentNames.get(actorId) ?? humanizeEventIdentifier(actorId),
+        actor: displayAgentName(actorId, agentNames),
         label: eventPayloadLabel(key),
         value: formatEventPayloadValue(value),
       };
@@ -1473,16 +1515,60 @@ function agentKeyFromEvent(event: RunEvent) {
 }
 
 function normalizedAgentLabel(agentId: string, agentNames: Map<string, string>) {
-  if (agentId === "main-agent" || agentId === "main_agent" || agentId === "main") return "主 Agent";
-  return agentNames.get(agentId) ?? agentId;
+  return displayAgentName(agentId, agentNames);
 }
 
 function agentRoleFromEvent(event: RunEvent, agentKey: string, agentNames: Map<string, string>) {
-  return (
-    payloadString(event.payload, ["role", "name", "agent_name", "label"]) ||
-    displayEventActor(event.actor, agentNames) ||
-    normalizedAgentLabel(agentKey, agentNames)
-  );
+  const payloadRole = payloadString(event.payload, ["role", "name", "agent_name", "label"]);
+  return payloadRole
+    ? displayAgentName(payloadRole, agentNames)
+    : displayEventActor(event.actor, agentNames) || normalizedAgentLabel(agentKey, agentNames);
+}
+
+function agentPositioning(agentKey: string, role: string) {
+  const labels: Record<string, string> = {
+    main: "主控调度",
+    main_agent: "主控调度",
+    "main-agent": "主控调度",
+    planner: "任务拆解",
+    planning: "任务拆解",
+    task_planner: "任务拆解",
+    reviewer: "质量审查",
+    review: "质量审查",
+    quality_reviewer: "质量审查",
+    copywriter: "内容生成",
+    writer: "内容生成",
+    director: "方案把关",
+    editor: "内容整理",
+    researcher: "信息整理",
+    domain_expert: "专业判断",
+    moderator: "讨论控场",
+    critic: "反方校验",
+    skeptic: "反方校验",
+    summarizer: "总结归纳",
+    operator: "流程执行",
+    executor: "流程执行",
+    screen_agent: "屏幕协助",
+  };
+  const key = normalizeAgentNameKey(agentKey);
+  return labels[key] ?? (role && role !== agentKey ? role : "协作执行");
+}
+
+function agentObjectiveFromEvents(events: RunEvent[], fallback: string) {
+  const objective =
+    events
+      .map((event) =>
+        payloadString(event.payload, [
+          "task",
+          "assigned_task",
+          "instruction",
+          "instructions",
+          "objective",
+          "goal",
+        ]),
+      )
+      .find(Boolean) || fallback;
+  return conciseProcessText(objective, fallback);
 }
 
 function statusLabel(status: AgentWorkStatus) {
@@ -1682,6 +1768,7 @@ function buildAgentWorkItems(
         outputs[0]?.summary ||
         activity.find((item) => item.summary)?.summary ||
         (status === "waiting" ? "等待主 Agent 分配可展示任务。" : "已记录关键活动。");
+      const positioning = agentPositioning(group.key, group.role);
       const availableViews: AgentWorkView[] = ["activity"];
       if (group.events.some(hasComputerEvidence)) availableViews.push("computer");
       return {
@@ -1690,6 +1777,8 @@ function buildAgentWorkItems(
         scopeLabel,
         label: group.label,
         role: group.role,
+        positioning,
+        objective: agentObjectiveFromEvents(group.events, firstSummary),
         status,
         statusLabel: statusLabel(status),
         summary: conciseProcessText(firstSummary, "已记录关键活动"),

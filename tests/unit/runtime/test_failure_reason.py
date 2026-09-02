@@ -107,6 +107,26 @@ def test_safe_runtime_failure_diagnostic_classifies_capacity_timeout() -> None:
     assert "password" not in str(diagnostic)
 
 
+def test_safe_runtime_failure_diagnostic_preserves_capacity_model_context() -> None:
+    diagnostic = safe_runtime_failure_diagnostic(
+        CapacityUnavailable(
+            "model capacity unavailable "
+            "(logical_models=primary,backup; deployments=primary-key,backup-key)"
+        )
+    )
+
+    assert diagnostic["error_summary"] == (
+        "model gateway failed: model capacity unavailable "
+        "(logical_models=primary,backup; deployments=primary-key,backup-key)"
+    )
+    assert diagnostic["error_stage"] == "model_capacity"
+    assert diagnostic["error_category"] == "unavailable"
+    assert diagnostic["error_code"] == "model.capacity_unavailable"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["logical_models"] == "primary,backup"
+    assert diagnostic["deployments"] == "primary-key,backup-key"
+
+
 def test_safe_runtime_failure_reason_preserves_empty_model_response() -> None:
     assert (
         safe_runtime_failure_reason(ModelGatewayError("model response text is empty"))
