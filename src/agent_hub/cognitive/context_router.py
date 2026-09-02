@@ -202,9 +202,10 @@ def _route_memory(
     memory: MemoryRecord,
     request_terms: set[str],
 ) -> tuple[RoutedCognitiveContext | None, SkippedCognitiveContext | None]:
+    route_id = _memory_route_id(memory)
     if not memory.active:
         return None, _skip(
-            id_=f"memory:{memory.id}",
+            id_=route_id,
             source="memory",
             summary=memory.text,
             score=0.0,
@@ -212,7 +213,7 @@ def _route_memory(
         )
     if memory.confidence < 0.45:
         return None, _skip(
-            id_=f"memory:{memory.id}",
+            id_=route_id,
             source="memory",
             summary=memory.text,
             score=memory.confidence,
@@ -222,7 +223,7 @@ def _route_memory(
     tier = _memory_tier(memory)
     if tier is MemoryTier.COLD and text_relevance < 0.48:
         return None, _skip(
-            id_=f"memory:{memory.id}",
+            id_=route_id,
             source="memory",
             summary=memory.text,
             score=text_relevance,
@@ -241,20 +242,27 @@ def _route_memory(
         score -= 0.05
     if score < 0.45:
         return None, _skip(
-            id_=f"memory:{memory.id}",
+            id_=route_id,
             source="memory",
             summary=memory.text,
             score=score,
             reason="当前任务相关性不足",
         )
     return _route(
-        id_=f"memory:{memory.id}",
+        id_=route_id,
         source="memory",
         summary=memory.text,
         target="main_agent",
         score=score,
         reason=f"命中长期记忆，置信度 {memory.confidence:.2f}",
     ), None
+
+
+def _memory_route_id(memory: MemoryRecord) -> str:
+    resource_id = memory.metadata.get("resource_id")
+    if resource_id:
+        return f"memory:{resource_id}"
+    return f"memory:{memory.id}"
 
 
 def _route_belief(

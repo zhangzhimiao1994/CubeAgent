@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
-import { api, formatApiError, type MemoryRecord } from "../api/client";
+import { api, formatApiError, type MemoryCenterItem, type MemoryRecord } from "../api/client";
 
 export function MemoryPage() {
   const queryClient = useQueryClient();
   const memory = useQuery({ queryKey: ["memory"], queryFn: () => api.memory() });
+  const memoryCenter = useQuery({ queryKey: ["memory-center"], queryFn: () => api.memoryCenter() });
   const [memoryId, setMemoryId] = useState("project-policy");
   const [scope, setScope] = useState("tenant");
   const [value, setValue] = useState("Only non-dangerous operations may run without approval.");
@@ -16,23 +17,36 @@ export function MemoryPage() {
     onSuccess: async () => {
       setMessage("记忆已保存。");
       await queryClient.invalidateQueries({ queryKey: ["memory"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const update = useMutation({
     mutationFn: ({ id, value: nextValue }: MemoryRecord) => api.updateMemory(id, nextValue),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+    },
   });
   const forget = useMutation({
     mutationFn: (id: string) => api.forgetMemory(id),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+    },
   });
   const lock = useMutation({
     mutationFn: (id: string) => api.lockMemory(id),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+    },
   });
   const unlock = useMutation({
     mutationFn: (id: string) => api.unlockMemory(id),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["memory"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+    },
   });
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -47,6 +61,7 @@ export function MemoryPage() {
   }
 
   const records = memory.data ?? [];
+  const centerItems = memoryCenter.data ?? [];
 
   return (
     <section>
@@ -96,6 +111,30 @@ export function MemoryPage() {
       {forget.isError ? <p role="alert">{formatApiError(forget.error, "记忆删除失败")}</p> : null}
       {lock.isError ? <p role="alert">{formatApiError(lock.error, "记忆锁定失败")}</p> : null}
       {unlock.isError ? <p role="alert">{formatApiError(unlock.error, "记忆解锁失败")}</p> : null}
+      {memoryCenter.isError ? (
+        <p role="alert">{formatApiError(memoryCenter.error, "统一记忆资产加载失败")}</p>
+      ) : (
+        <section aria-label="统一记忆资产">
+          <h3>统一记忆资产</h3>
+          <p>
+            这里汇总普通记忆、Hermes 学习和 Cognitive 经验/策略/反思，避免误把单个台账为空理解为系统没有学习。
+          </p>
+          {memoryCenter.isLoading ? (
+            <p>正在加载统一记忆资产...</p>
+          ) : centerItems.length === 0 ? (
+            <article>
+              <h4>还没有可展示的记忆资产</h4>
+              <p>普通记忆、已确认 Hermes 学习和 Cognitive 候选都会显示在这里。</p>
+            </article>
+          ) : (
+            <div className="card-grid">
+              {centerItems.slice(0, 12).map((item) => (
+                <MemoryCenterCard key={item.id} item={item} />
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       <section aria-label="已保存记忆">
         <h3>已保存记忆</h3>
@@ -147,4 +186,60 @@ export function MemoryPage() {
       </section>
     </section>
   );
+}
+
+function MemoryCenterCard({ item }: { item: MemoryCenterItem }) {
+  return (
+    <article>
+      <span className="eyebrow">{memoryCenterSourceLabel(item.source)}</span>
+      <h3>{item.summary}</h3>
+      <div className="inline-status-list">
+        <span>{memoryScopeLabel(item.memory_scope)}</span>
+        <span>{memoryCenterStatusLabel(item.status)}</span>
+        {item.active_for_runtime ? <span>可注入运行时</span> : <span>不直接注入</span>}
+        {item.confidence !== null ? <span>置信度 {item.confidence.toFixed(2)}</span> : null}
+        {item.evidence_count > 0 ? <span>证据 {item.evidence_count} 条</span> : null}
+        {item.contradiction_count > 0 ? <span>冲突 {item.contradiction_count} 条</span> : null}
+      </div>
+      {item.detail && item.detail !== item.summary ? <p>{item.detail}</p> : null}
+    </article>
+  );
+}
+
+function memoryCenterSourceLabel(source: MemoryCenterItem["source"]) {
+  const labels: Record<MemoryCenterItem["source"], string> = {
+    memory: "普通记忆",
+    hermes: "Hermes 学习",
+    cognitive_experience: "经验",
+    cognitive_strategy: "策略",
+    cognitive_reflection: "反思",
+    cognitive_outcome: "结果校验",
+    cognitive_belief: "信念",
+    cognitive_relationship: "关系",
+    cognitive_world: "世界状态",
+    cognitive_skill: "技能",
+  };
+  return labels[source];
+}
+
+function memoryScopeLabel(scope: string) {
+  if (scope === "root") return "根记忆";
+  if (scope === "user") return "用户记忆";
+  if (scope === "tenant") return "租户记忆";
+  return scope;
+}
+
+function memoryCenterStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    active: "已激活",
+    locked: "已锁定",
+    candidate: "待确认",
+    confirmed: "已确认",
+    rejected: "已拒绝",
+    deprecated: "已降级",
+    superseded: "已替代",
+    success: "成功",
+    failure: "失败",
+  };
+  return labels[status] ?? status;
 }

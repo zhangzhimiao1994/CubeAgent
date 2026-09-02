@@ -22,11 +22,13 @@ describe("ModelsPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let failModelSave = false;
   let modelDeleted = false;
+  let includeMultimediaModel = false;
 
   beforeEach(() => {
     requests.length = 0;
     failModelSave = false;
     modelDeleted = false;
+    includeMultimediaModel = false;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -65,6 +67,28 @@ describe("ModelsPage", () => {
               saturation_policy: "queue_first_then_fallback",
             },
           ];
+          if (includeMultimediaModel) {
+            savedModels.push({
+              id: "22222222-2222-4222-8222-222222222222",
+              provider: "minimax",
+              api_base: "https://api.minimaxi.com/v1",
+              upstream_model: "MiniMax-Hailuo-02",
+              logical_model: "video_primary",
+              capabilities: ["video_generation"],
+              credential_ref: "secret_video",
+              quota_scope: "minimax-video-account",
+              max_concurrency: 1,
+              target_utilization: 0.8,
+              reserved_capacity: 0,
+              rpm: 3,
+              tpm: 100000,
+              queue_timeout_seconds: 60,
+              fallback: null,
+              weight: 100,
+              effective_slots: 1,
+              saturation_policy: "queue_first_then_fallback",
+            });
+          }
           return jsonResponse(modelDeleted ? [] : savedModels);
         }
         if (path === "/api/v1/admin/models/11111111-1111-4111-8111-111111111111" && method === "DELETE") {
@@ -108,6 +132,15 @@ describe("ModelsPage", () => {
           const body = JSON.parse(String(init?.body));
           return jsonResponse({
             id: "11111111-1111-4111-8111-111111111111",
+            ...body,
+            effective_slots: body.max_concurrency,
+            saturation_policy: "queue_first_then_fallback",
+          });
+        }
+        if (path === "/api/v1/admin/models/22222222-2222-4222-8222-222222222222" && method === "PUT") {
+          const body = JSON.parse(String(init?.body));
+          return jsonResponse({
+            id: "22222222-2222-4222-8222-222222222222",
             ...body,
             effective_slots: body.max_concurrency,
             saturation_policy: "queue_first_then_fallback",
@@ -591,6 +624,57 @@ describe("ModelsPage", () => {
         fallback: null,
         weight: 100,
       },
+    });
+  });
+
+  it("switches normal and multimedia model setup from the page header", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    expect(view.container.querySelector('input[value="text"]')).not.toBeNull();
+    expect(view.container.querySelector('input[value="video_generation"]')).toBeNull();
+
+    await user.click(screen.getByRole("tab", { name: "多媒体模型配置" }));
+
+    expect((view.container.querySelector("#model-category") as HTMLSelectElement).value).toBe("multimedia");
+    expect(view.container.querySelector('input[value="text"]')).toBeNull();
+    expect(view.container.querySelector('input[value="video_generation"]')).not.toBeNull();
+    expect(screen.getByRole("tab", { name: "多媒体模型配置" }).getAttribute("aria-selected")).toBe("true");
+
+    await user.click(screen.getByRole("tab", { name: "普通模型配置" }));
+
+    expect((view.container.querySelector("#model-category") as HTMLSelectElement).value).toBe("normal");
+    expect(view.container.querySelector('input[value="text"]')).not.toBeNull();
+    expect(view.container.querySelector('input[value="video_generation"]')).toBeNull();
+    expect(screen.getByRole("tab", { name: "普通模型配置" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("keeps multimedia edit state when opened from the normal model category url", async () => {
+    includeMultimediaModel = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models?category=text" />);
+
+    expect(await screen.findByText("video_primary")).not.toBeNull();
+    await user.click(screen.getByTestId("edit-model-22222222-2222-4222-8222-222222222222"));
+
+    expect((screen.getByLabelText("模型大类") as HTMLSelectElement).value).toBe("multimedia");
+    expect((screen.getByLabelText("逻辑模型名") as HTMLInputElement).value).toBe("video_primary");
+    expect(screen.getByRole("tab", { name: "多媒体模型配置" }).getAttribute("aria-selected")).toBe("true");
+
+    await user.clear(screen.getByLabelText("RPM"));
+    await user.type(screen.getByLabelText("RPM"), "4");
+    await user.click(screen.getByRole("button", { name: "更新多媒体模型配置" }));
+
+    expect(requests.find((request) => request.path.includes("22222222") && request.method === "PUT")).toMatchObject({
+      path: "/api/v1/admin/models/22222222-2222-4222-8222-222222222222",
+      method: "PUT",
+      body: expect.objectContaining({
+        logical_model: "video_primary",
+        capabilities: ["video_generation"],
+        credential_ref: "secret_video",
+        rpm: 4,
+      }),
     });
   });
 

@@ -5107,6 +5107,66 @@ def test_cognitive_experience_api_can_create_root_scoped_experience() -> None:
     assert body["user_id"]
 
 
+def test_memory_center_lists_memory_and_deduplicated_cognitive_records() -> None:
+    api = client()
+
+    memory = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "project-boundary",
+            "scope": "root",
+            "value": "CubeAgent 当前仓库只实现对话 Agent，不做 harness 改造。",
+            "heat": 0.9,
+            "locked": True,
+        },
+    )
+    hermes = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "用户希望技术结论先给明确判断，再给证据。",
+            "conversation_id": "conv-memory-center",
+            "tags": ["表达偏好"],
+            "weight": 6,
+        },
+    )
+    experience = api.post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "模型网络错误需要显示模型/部署信息。",
+            "lesson": "provider transport failed 需要暴露供应商和部署名。",
+            "strategy": "失败提示中附带模型、部署、API base 和可重试建议。",
+            "confidence": 0.76,
+            "evidence": [
+                {"source_type": "run", "source_id": "run-model-error", "note": "user requested diagnostics"}
+            ],
+            "tags": ["模型错误", "部署信息"],
+            "applies_to_modes": ["direct", "hybrid"],
+            "applies_to_agents": ["main_agent"],
+        },
+    )
+    assert memory.status_code == 200
+    assert hermes.status_code == 200
+    assert experience.status_code == 200
+
+    response = api.get("/api/v1/admin/memory-center", headers=headers())
+
+    assert response.status_code == 200
+    items = response.json()
+    by_id = {item["id"]: item for item in items}
+    assert by_id["memory:project-boundary"]["source"] == "memory"
+    assert by_id["memory:project-boundary"]["memory_scope"] == "root"
+    assert f"hermes:{hermes.json()['id']}" not in by_id
+    assert any(item["source"] == "hermes" for item in items)
+    assert by_id[f"cognitive_experience:{experience.json()['id']}"]["source"] == "cognitive_experience"
+    assert by_id[f"cognitive_experience:{experience.json()['id']}"]["evidence_count"] == 1
+    assert "模型网络错误" in by_id[f"cognitive_experience:{experience.json()['id']}"]["summary"]
+
+
 def test_cognitive_governance_api_lists_records_and_updates_strategy() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)

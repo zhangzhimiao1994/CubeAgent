@@ -870,6 +870,38 @@ const MemoryRecordSchema = z.object({
 
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
 
+const MemoryCenterItemSchema = z.object({
+  id: z.string(),
+  source: z.enum([
+    "memory",
+    "hermes",
+    "cognitive_experience",
+    "cognitive_strategy",
+    "cognitive_reflection",
+    "cognitive_outcome",
+    "cognitive_belief",
+    "cognitive_relationship",
+    "cognitive_world",
+    "cognitive_skill",
+  ]),
+  status: z.string(),
+  summary: z.string(),
+  detail: z.string(),
+  memory_scope: z.string(),
+  user_id: z.string().nullable(),
+  confidence: z.number().nullable(),
+  active_for_runtime: z.boolean(),
+  evidence_count: z.number(),
+  contradiction_count: z.number(),
+  use_count: z.number(),
+  success_count: z.number(),
+  failure_count: z.number(),
+  created_at: z.string().nullable(),
+  updated_at: z.string().nullable(),
+});
+
+export type MemoryCenterItem = z.infer<typeof MemoryCenterItemSchema>;
+
 const AuditEventSchema = z.object({
   id: z.string(),
   actor: z.string(),
@@ -1717,6 +1749,9 @@ export const api = {
   },
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));
+  },
+  memoryCenter(): Promise<MemoryCenterItem[]> {
+    return request("/api/v1/admin/memory-center", { method: "GET" }, z.array(MemoryCenterItemSchema));
   },
   createMemory(payload: { id: string; scope: string; value: string }): Promise<MemoryRecord> {
     return request(

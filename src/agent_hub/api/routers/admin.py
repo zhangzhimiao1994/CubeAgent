@@ -678,6 +678,32 @@ class MemoryRecordResponse(BaseModel):
     last_recalled_at: str | None = None
 
 
+class MemoryCenterItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source: str = Field(
+        pattern=(
+            r"^(memory|hermes|cognitive_experience|cognitive_strategy|cognitive_reflection|"
+            r"cognitive_outcome|cognitive_belief|cognitive_relationship|cognitive_world|cognitive_skill)$"
+        )
+    )
+    status: str
+    summary: str
+    detail: str
+    memory_scope: str
+    user_id: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    active_for_runtime: bool = False
+    evidence_count: int = Field(default=0, ge=0)
+    contradiction_count: int = Field(default=0, ge=0)
+    use_count: int = Field(default=0, ge=0)
+    success_count: int = Field(default=0, ge=0)
+    failure_count: int = Field(default=0, ge=0)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class AuditEventResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2077,6 +2103,8 @@ class AdminResourceService(Protocol):
     async def channel_runtime_config(self) -> dict[str, str]: ...
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]: ...
+
+    async def list_memory_center(self) -> tuple[MemoryCenterItemResponse, ...]: ...
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse: ...
 
@@ -3668,6 +3696,38 @@ class InMemoryAdminResourceService:
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         return tuple(self.memory.values())
+
+    async def list_memory_center(self) -> tuple[MemoryCenterItemResponse, ...]:
+        items: list[MemoryCenterItemResponse] = []
+        experiences = await self.list_cognitive_experiences()
+        derived_hermes_ids = {
+            source_id
+            for experience in experiences
+            for source_id in experience.source_memory_ids
+        }
+        items.extend(_memory_center_item_from_memory(item) for item in await self.list_memory())
+        items.extend(
+            _memory_center_item_from_hermes(item)
+            for item in await self.list_hermes_insights()
+            if item.id not in derived_hermes_ids
+        )
+        items.extend(
+            _memory_center_item_from_cognitive_experience(item)
+            for item in experiences
+        )
+        items.extend(
+            _memory_center_item_from_cognitive_strategy(item)
+            for item in await self.list_cognitive_strategies()
+        )
+        items.extend(
+            _memory_center_item_from_cognitive_reflection(item)
+            for item in await self.list_cognitive_reflections()
+        )
+        items.extend(
+            _memory_center_item_from_cognitive_outcome(item)
+            for item in await self.list_cognitive_outcomes()
+        )
+        return tuple(sorted(items, key=_memory_center_sort_key, reverse=True))
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
         response = MemoryRecordResponse(**request.model_dump())
@@ -5607,6 +5667,24 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if config is None:
             return await super().channel_runtime_config()
         return _flatten_channel_config(config)
+
+    async def list_memory_center(self) -> tuple[MemoryCenterItemResponse, ...]:
+        items = list(await super().list_memory_center())
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
+            return tuple(items)
+        existing_ids = {item.id for item in items}
+        for resource_id, payload, created_at, updated_at in rows:
+            extra = _memory_center_item_from_cognitive_payload(
+                resource_id=resource_id,
+                payload=payload,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+            if extra is not None and extra.id not in existing_ids:
+                items.append(extra)
+                existing_ids.add(extra.id)
+        return tuple(sorted(items, key=_memory_center_sort_key, reverse=True))
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         resources = await self._list_admin_payloads("memory")
@@ -9986,6 +10064,20 @@ async def list_memory(
     return list(await service.list_memory())
 
 
+@router.get(
+    "/memory-center",
+    response_model=list[MemoryCenterItemResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_memory_center(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[MemoryCenterItemResponse]:
+    _require(principal, "memory:read")
+    _require(principal, "hermes:read")
+    return list(await service.list_memory_center())
+
+
 @router.post(
     "/memory", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 422)
 )
@@ -10082,6 +10174,294 @@ def _memory_request_from_response(
     data.pop("scope", None)
     data.update(updates)
     return MemoryRecordRequest.model_validate(data)
+
+
+def _memory_center_item_from_memory(item: MemoryRecordResponse) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"memory:{item.id}",
+        source="memory",
+        status="locked" if item.locked else "active",
+        summary=_memory_center_summary(item.value),
+        detail=item.value,
+        memory_scope=item.scope,
+        user_id=None,
+        confidence=None,
+        active_for_runtime=True,
+        evidence_count=0,
+        contradiction_count=0,
+        use_count=item.recall_count,
+        success_count=0,
+        failure_count=0,
+        created_at=None,
+        updated_at=None,
+    )
+
+
+def _memory_center_item_from_hermes(item: HermesInsightResponse) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"hermes:{item.id}",
+        source="hermes",
+        status="confirmed" if item.confirmed_at is not None else "candidate",
+        summary=_memory_center_summary(item.user_summary or item.lesson),
+        detail=item.lesson,
+        memory_scope=item.memory_scope.value,
+        user_id=item.user_id or None,
+        confidence=None,
+        active_for_runtime=item.confirmed_at is not None and item.category == "conversation",
+        evidence_count=1 if item.run_id or item.conversation_id else 0,
+        contradiction_count=0,
+        use_count=0,
+        success_count=1 if item.outcome == "success" else 0,
+        failure_count=1 if item.outcome == "failure" else 0,
+        created_at=item.created_at,
+        updated_at=None,
+    )
+
+
+def _memory_center_item_from_cognitive_experience(
+    item: CognitiveExperienceResponse,
+) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"cognitive_experience:{item.id}",
+        source="cognitive_experience",
+        status=item.status.value,
+        summary=_memory_center_summary(item.summary),
+        detail=item.lesson,
+        memory_scope=item.memory_scope.value,
+        user_id=item.user_id or None,
+        confidence=item.confidence,
+        active_for_runtime=item.active_for_runtime,
+        evidence_count=len(item.evidence),
+        contradiction_count=len(item.contradictions),
+        use_count=item.use_count,
+        success_count=item.success_count,
+        failure_count=item.failure_count,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _memory_center_item_from_cognitive_strategy(
+    item: CognitiveStrategyResponse,
+) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"cognitive_strategy:{item.id}",
+        source="cognitive_strategy",
+        status=item.status.value,
+        summary=_memory_center_summary(item.name),
+        detail=item.strategy,
+        memory_scope=item.memory_scope.value,
+        user_id=item.user_id or None,
+        confidence=item.confidence,
+        active_for_runtime=item.active_for_runtime,
+        evidence_count=len(item.evidence),
+        contradiction_count=len(item.contradictions),
+        use_count=item.use_count,
+        success_count=item.success_count,
+        failure_count=item.failure_count,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
+
+
+def _memory_center_item_from_cognitive_reflection(
+    item: CognitiveReflectionResponse,
+) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"cognitive_reflection:{item.id}",
+        source="cognitive_reflection",
+        status=item.outcome,
+        summary=_memory_center_summary(item.causal_analysis),
+        detail=item.counterfactual,
+        memory_scope=item.memory_scope.value,
+        user_id=item.user_id or None,
+        confidence=item.confidence,
+        active_for_runtime=False,
+        evidence_count=1,
+        contradiction_count=len(item.negative_patterns),
+        use_count=0,
+        success_count=1 if item.outcome == "success" else 0,
+        failure_count=1 if item.outcome == "failure" else 0,
+        created_at=item.created_at,
+        updated_at=None,
+    )
+
+
+def _memory_center_item_from_cognitive_outcome(
+    item: CognitiveOutcomeResponse,
+) -> MemoryCenterItemResponse:
+    return MemoryCenterItemResponse(
+        id=f"cognitive_outcome:{item.id}",
+        source="cognitive_outcome",
+        status=item.verdict.value,
+        summary=_memory_center_summary(item.note),
+        detail=item.note,
+        memory_scope=item.memory_scope.value,
+        user_id=item.user_id or None,
+        confidence=None,
+        active_for_runtime=False,
+        evidence_count=len(item.evidence),
+        contradiction_count=1 if item.confidence_delta < 0 else 0,
+        use_count=0,
+        success_count=1 if item.confidence_delta > 0 else 0,
+        failure_count=1 if item.confidence_delta < 0 else 0,
+        created_at=item.created_at,
+        updated_at=None,
+    )
+
+
+def _memory_center_item_from_cognitive_payload(
+    *,
+    resource_id: str,
+    payload: dict[str, object],
+    created_at: datetime | None,
+    updated_at: datetime | None,
+) -> MemoryCenterItemResponse | None:
+    source = _memory_center_cognitive_source(resource_id)
+    if source is None:
+        return None
+    summary, detail = _memory_center_cognitive_summary(source, payload)
+    return MemoryCenterItemResponse(
+        id=f"{source}:{resource_id.split(':', 1)[1] if ':' in resource_id else resource_id}",
+        source=source,
+        status=_memory_center_payload_text(payload.get("status"), default="active"),
+        summary=_memory_center_summary(summary),
+        detail=detail,
+        memory_scope=_memory_center_payload_text(payload.get("memory_scope"), default="user"),
+        user_id=_memory_center_optional_payload_text(payload.get("user_id")),
+        confidence=_memory_center_payload_float(payload.get("confidence")),
+        active_for_runtime=_memory_center_payload_bool(payload.get("active_for_runtime")),
+        evidence_count=_memory_center_payload_count(payload.get("evidence")),
+        contradiction_count=_memory_center_payload_count(payload.get("contradictions")),
+        use_count=_memory_center_payload_int(payload.get("use_count")),
+        success_count=_memory_center_payload_int(payload.get("success_count")),
+        failure_count=_memory_center_payload_int(payload.get("failure_count")),
+        created_at=_memory_center_payload_datetime(payload.get("created_at")) or created_at,
+        updated_at=_memory_center_payload_datetime(payload.get("updated_at")) or updated_at,
+    )
+
+
+def _memory_center_cognitive_source(resource_id: str) -> str | None:
+    mapping = {
+        "cognitive_belief:": "cognitive_belief",
+        "cognitive_relationship:": "cognitive_relationship",
+        "cognitive_world:": "cognitive_world",
+        "cognitive_skill:": "cognitive_skill",
+    }
+    for prefix, source in mapping.items():
+        if resource_id.startswith(prefix):
+            return source
+    return None
+
+
+def _memory_center_cognitive_summary(
+    source: str,
+    payload: dict[str, object],
+) -> tuple[str, str]:
+    if source == "cognitive_belief":
+        subject = _memory_center_payload_text(payload.get("subject"), default="信念")
+        claim = _memory_center_payload_text(payload.get("claim"), default="暂无信念内容。")
+        return f"{subject}: {claim}", claim
+    if source == "cognitive_relationship":
+        language = _memory_center_payload_text(payload.get("preferred_language"), default="zh-CN")
+        confirmation = _memory_center_payload_text(
+            payload.get("preferred_confirmation_style"),
+            default="minimal",
+        )
+        milestones = _memory_center_payload_text_list(payload.get("shared_milestones"), limit=2)
+        detail = "；".join([f"语言={language}", f"确认方式={confirmation}", *milestones])
+        return "用户关系模型", detail
+    if source == "cognitive_world":
+        scope = _memory_center_payload_text(payload.get("scope"), default="world")
+        facts = _memory_center_payload_text_list(payload.get("facts"), limit=3)
+        open_items = _memory_center_payload_text_list(payload.get("open_items"), limit=2)
+        detail = "；".join([*facts, *open_items]) or "暂无世界状态内容。"
+        return f"世界状态：{scope}", detail
+    if source == "cognitive_skill":
+        name = _memory_center_payload_text(payload.get("name"), default="未命名技能")
+        purpose = _memory_center_payload_text(payload.get("purpose"), default="暂无技能目标。")
+        return name, purpose
+    return "认知记录", "暂无详情。"
+
+
+def _memory_center_summary(value: str) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= 120:
+        return cleaned
+    return f"{cleaned[:117]}..."
+
+
+def _memory_center_payload_text(value: object, *, default: str = "") -> str:
+    if not isinstance(value, str):
+        return default
+    stripped = " ".join(value.split())
+    return stripped or default
+
+
+def _memory_center_optional_payload_text(value: object) -> str | None:
+    text = _memory_center_payload_text(value)
+    return text or None
+
+
+def _memory_center_payload_text_list(value: object, *, limit: int) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = _memory_center_payload_text(item)
+        if text:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _memory_center_payload_float(value: object) -> float | None:
+    if isinstance(value, int | float):
+        return max(0.0, min(1.0, float(value)))
+    if isinstance(value, str):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except ValueError:
+            return None
+    return None
+
+
+def _memory_center_payload_bool(value: object) -> bool:
+    return value is True
+
+
+def _memory_center_payload_count(value: object) -> int:
+    if isinstance(value, list | tuple):
+        return len(value)
+    return 0
+
+
+def _memory_center_payload_int(value: object) -> int:
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _memory_center_payload_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def _memory_center_sort_key(item: MemoryCenterItemResponse) -> tuple[datetime, str]:
+    return (item.updated_at or item.created_at or datetime.min.replace(tzinfo=UTC), item.id)
 
 
 @router.get(

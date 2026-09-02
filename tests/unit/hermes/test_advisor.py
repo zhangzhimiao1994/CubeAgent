@@ -6,6 +6,7 @@ from typing import Self, cast
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes.advisor import (
@@ -20,6 +21,9 @@ from agent_hub.runs.service import HermesRunOutcome
 @dataclass(slots=True)
 class FakeRow:
     payload: dict[str, object]
+    resource_id: str = "resource"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class FakeResult:
@@ -56,6 +60,28 @@ class FakeSessionFactory:
 
     def __call__(self) -> FakeSession:
         return FakeSession(self._result_sets)
+
+
+class CountingFakeSession(FakeSession):
+    def __init__(self, factory: CountingFakeSessionFactory) -> None:
+        super().__init__(factory.result_sets)
+        self._factory = factory
+
+    async def execute(self, statement: object) -> FakeResult:
+        self._factory.calls += 1
+        if self._factory.calls == self._factory.fail_on_call:
+            raise SQLAlchemyError("simulated admin memory read failure")
+        return await super().execute(statement)
+
+
+class CountingFakeSessionFactory:
+    def __init__(self, result_sets: list[list[FakeRow]], *, fail_on_call: int) -> None:
+        self.result_sets = result_sets
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __call__(self) -> CountingFakeSession:
+        return CountingFakeSession(self)
 
 
 @pytest.mark.asyncio
@@ -983,6 +1009,170 @@ async def test_runtime_advice_injects_relevant_cognitive_state_without_hermes_le
 
 
 @pytest.mark.asyncio
+async def test_runtime_advice_injects_relevant_persistent_memory() -> None:
+    actor_id = uuid4()
+    tenant_id = uuid4()
+    now = datetime.now(UTC)
+    root_memory = {
+        "id": "cubeagent-project-boundary",
+        "scope": "root",
+        "value": "CubeAgent 当前仓库只实现对话 Agent，不做 harness 改造。",
+        "heat": 0.9,
+        "locked": True,
+        "project_id": "cubeagent",
+        "conversation_id": None,
+        "summary_period": "none",
+        "recall_count": 0,
+        "last_recalled_at": None,
+    }
+    other_user_memory = {
+        "id": "other-user-style",
+        "scope": "user",
+        "user_id": str(uuid4()),
+        "value": "用户要求所有回答都展开成长篇解释。",
+        "heat": 1.0,
+        "locked": True,
+        "project_id": "cubeagent",
+        "conversation_id": None,
+        "summary_period": "none",
+        "recall_count": 0,
+        "last_recalled_at": None,
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [
+                FakeRow(root_memory, resource_id="cubeagent-project-boundary", created_at=now),
+                FakeRow(other_user_memory, resource_id="other-user-style", created_at=now),
+            ],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="继续 CubeAgent 记忆系统，注意不要改 harness",
+        mode=TaskMode.HYBRID,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    injected = {item.id: item for item in advice.injected_memories}
+    assert "memory:cubeagent-project-boundary" in injected
+    assert injected["memory:cubeagent-project-boundary"].memory_type == "memory"
+    assert all("other-user-style" not in item.id for item in advice.injected_memories)
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_injects_tenant_and_same_user_persistent_memory() -> None:
+    actor_id = uuid4()
+    tenant_id = uuid4()
+    now = datetime.now(UTC)
+    tenant_memory = {
+        "id": "tenant-error-style",
+        "scope": "tenant",
+        "value": "模型错误提示必须展示模型和部署信息。",
+        "heat": 0.85,
+        "locked": True,
+    }
+    user_memory = {
+        "id": "user-memory-style",
+        "scope": "user",
+        "user_id": str(actor_id),
+        "value": "用户偏好先给结论，再给排查证据。",
+        "heat": 0.8,
+        "locked": False,
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [
+                FakeRow(tenant_memory, resource_id="tenant-error-style", created_at=now),
+                FakeRow(user_memory, resource_id="user-memory-style", created_at=now),
+            ],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="模型错误提示需要先给结论，并展示模型部署信息",
+        mode=TaskMode.DIRECT,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    injected_ids = {item.id for item in advice.injected_memories}
+    assert "memory:tenant-error-style" in injected_ids
+    assert "memory:user-memory-style" in injected_ids
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_keeps_cognitive_context_when_memory_read_fails() -> None:
+    actor_id = uuid4()
+    tenant_id = uuid4()
+    now = datetime.now(UTC).isoformat()
+    world_state: dict[str, object] = {
+        "id": "world:model-errors",
+        "tenant_id": str(tenant_id),
+        "user_id": str(actor_id),
+        "memory_scope": "user",
+        "scope": "model.errors",
+        "facts": ["模型错误提示需要展示模型和部署信息。"],
+        "open_items": [],
+        "future_events": [],
+        "last_verified_at": now,
+        "evidence": [{"source_type": "test", "source_id": "memory-read-failed", "note": "world still useful"}],
+        "created_at": now,
+        "updated_at": now,
+    }
+    session_factory = CountingFakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [],
+            [],
+            [],
+            [],
+            [FakeRow(world_state)],
+            [],
+        ],
+        fail_on_call=9,
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="模型错误提示要显示模型部署信息",
+        mode=TaskMode.DIRECT,
+        agent_ids=("main_agent",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.injected_memories[0].memory_type == "world_state"
+
+
+@pytest.mark.asyncio
 async def test_runtime_advice_bounds_combined_hermes_and_cognitive_context() -> None:
     actor_id = uuid4()
     tenant_id = uuid4()
@@ -1066,3 +1256,33 @@ def test_successful_runtime_outcome_without_notice_does_not_create_cognitive_can
     )
 
     assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_skips_learning_without_actor_id() -> None:
+    result_sets: list[list[FakeRow]] = []
+    advisor = PersistentHermesRunAdvisor(FakeSessionFactory(result_sets))  # type: ignore[arg-type]
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=None,
+            run_id=uuid4(),
+            status=RunStatus.FAILED,
+            mode=TaskMode.HYBRID,
+            workflow_id="quality-review",
+            conversation_id="conv-no-actor",
+            agent_ids=("quality_reviewer",),
+            scheduler_notices=(
+                {
+                    "trigger": "empty_model_response",
+                    "action": "retry_fallback_or_reassign_model",
+                    "severity": "warning",
+                    "source_kind": "runtime.failed",
+                    "actor": "quality_reviewer",
+                },
+            ),
+        )
+    )
+
+    assert result_sets == []

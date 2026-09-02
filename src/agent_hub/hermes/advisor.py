@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from pydantic import ValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.cognitive.context_router import CognitiveContextRouteResult, route_cognitive_context
@@ -23,6 +25,7 @@ from agent_hub.cognitive.types import (
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes.runtime_observation import is_runtime_observation_lesson
+from agent_hub.memory.types import MemoryCategory, MemoryLayer, MemoryRecord, MemorySummaryPeriod
 from agent_hub.runs.service import (
     HermesMemoryInjection,
     HermesRunAdvice,
@@ -212,6 +215,8 @@ class PersistentHermesRunAdvisor:
     async def record_outcome(self, outcome: HermesRunOutcome) -> None:
         if outcome.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             return
+        if outcome.actor_id is None:
+            return
         if not await self._enabled(outcome.tenant_id):
             return
         lesson_id = f"hermes_run_{uuid4().hex}"
@@ -357,6 +362,10 @@ class PersistentHermesRunAdvisor:
                 tenant_id=tenant_id,
                 user_id=actor_id,
             )
+            memories = await self._persistent_memories(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
         except ExperienceRepositoryError:
             return route_cognitive_context(
                 request=message,
@@ -372,8 +381,189 @@ class PersistentHermesRunAdvisor:
             relationship_states=relationships,
             world_states=worlds,
             skill_candidates=skills,
+            memories=memories,
             limit=3,
         )
+
+    async def _persistent_memories(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+    ) -> tuple[MemoryRecord, ...]:
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(AdminResourceRow)
+                        .where(AdminResourceRow.tenant_id == tenant_id)
+                        .where(AdminResourceRow.kind == "memory")
+                        .order_by(AdminResourceRow.created_at.desc())
+                        .limit(200)
+                    )
+                ).scalars()
+                now = datetime.now(UTC)
+                memories: list[MemoryRecord] = []
+                for row in rows:
+                    payload = dict(row.payload)
+                    if not _memory_visible_to_actor(payload, actor_id):
+                        continue
+                    memory = _memory_record_from_admin_payload(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        resource_id=row.resource_id,
+                        payload=payload,
+                        created_at=row.created_at or now,
+                        updated_at=row.updated_at or row.created_at or now,
+                    )
+                    if memory is not None:
+                        memories.append(memory)
+                return tuple(memories)
+        except SQLAlchemyError:
+            return ()
+
+
+def _memory_visible_to_actor(payload: dict[str, object], actor_id: UUID) -> bool:
+    scope = str(payload.get("scope") or payload.get("memory_scope") or "tenant")
+    if scope in {"root", "tenant"}:
+        return True
+    if scope != "user":
+        return False
+    return str(payload.get("user_id") or "") == str(actor_id)
+
+
+def _memory_record_from_admin_payload(
+    *,
+    tenant_id: UUID,
+    actor_id: UUID,
+    resource_id: str,
+    payload: dict[str, object],
+    created_at: datetime,
+    updated_at: datetime,
+) -> MemoryRecord | None:
+    value = payload.get("value") or payload.get("text")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    scope = str(payload.get("scope") or payload.get("memory_scope") or "tenant")
+    owner_id = _uuid_or_default(payload.get("user_id"), actor_id)
+    layer = MemoryLayer.CORE if bool(payload.get("locked")) or scope in {"root", "tenant"} else MemoryLayer.EPISODIC
+    category = _memory_category_from_payload(payload.get("category"))
+    summary_period = _memory_summary_period_from_payload(payload.get("summary_period"))
+    try:
+        return MemoryRecord(
+            id=_memory_uuid(tenant_id, resource_id),
+            tenant_id=tenant_id,
+            user_id=owner_id,
+            layer=layer,
+            category=category,
+            text=_compact_sentence(value, limit=4096),
+            confidence=_float_or_default(payload.get("confidence"), 0.72),
+            source_run_id=_uuid_or_none(payload.get("source_run_id")),
+            source_event_id=_uuid_or_none(payload.get("source_event_id")),
+            created_at=_datetime_or_default(payload.get("created_at"), created_at),
+            updated_at=_datetime_or_default(payload.get("updated_at"), updated_at),
+            heat=_float_or_default(payload.get("heat"), 0.5),
+            last_recalled_at=_datetime_or_none(payload.get("last_recalled_at")),
+            recall_count=_int_or_default(payload.get("recall_count"), 0),
+            locked=bool(payload.get("locked")),
+            project_id=_optional_str(payload.get("project_id"), limit=128),
+            conversation_id=_optional_str(payload.get("conversation_id"), limit=128),
+            summary_period=summary_period,
+            metadata={"resource_id": resource_id, "scope": scope},
+            expires_at=_datetime_or_none(payload.get("expires_at")),
+            deleted_at=_datetime_or_none(payload.get("deleted_at")),
+            tombstone_reason=_optional_str(payload.get("tombstone_reason"), limit=256),
+            archived_at=_datetime_or_none(payload.get("archived_at")),
+            archive_reason=_optional_str(payload.get("archive_reason"), limit=256),
+        )
+    except (ValidationError, ValueError):
+        return None
+
+
+def _memory_uuid(tenant_id: UUID, resource_id: str) -> UUID:
+    try:
+        return UUID(resource_id)
+    except ValueError:
+        return uuid5(NAMESPACE_URL, f"agent-hub:{tenant_id}:memory:{resource_id}")
+
+
+def _uuid_or_default(value: object, default: UUID) -> UUID:
+    parsed = _uuid_or_none(value)
+    return parsed if parsed is not None else default
+
+
+def _uuid_or_none(value: object) -> UUID | None:
+    if isinstance(value, UUID):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return UUID(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _datetime_or_default(value: object, default: datetime) -> datetime:
+    parsed = _datetime_or_none(value)
+    if parsed is not None:
+        return parsed
+    if default.tzinfo is None:
+        return default.replace(tzinfo=UTC)
+    return default
+
+
+def _datetime_or_none(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return None
+
+
+def _memory_category_from_payload(value: object) -> MemoryCategory:
+    if isinstance(value, MemoryCategory):
+        return value
+    if isinstance(value, str):
+        try:
+            return MemoryCategory(value)
+        except ValueError:
+            return MemoryCategory.OTHER
+    return MemoryCategory.OTHER
+
+
+def _memory_summary_period_from_payload(value: object) -> MemorySummaryPeriod:
+    if isinstance(value, MemorySummaryPeriod):
+        return value
+    if isinstance(value, str):
+        try:
+            return MemorySummaryPeriod(value)
+        except ValueError:
+            return MemorySummaryPeriod.NONE
+    return MemorySummaryPeriod.NONE
+
+
+def _int_or_default(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _optional_str(value: object, *, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped[:limit]
 
 
 def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:

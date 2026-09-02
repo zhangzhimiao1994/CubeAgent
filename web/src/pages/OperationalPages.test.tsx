@@ -1066,6 +1066,64 @@ describe("operational management pages", () => {
             },
           ]);
         }
+        if (path === "/api/v1/admin/memory-center") {
+          return jsonResponse([
+            {
+              id: "memory:project-policy",
+              source: "memory",
+              status: "locked",
+              summary: "Only non-dangerous operations may run without approval.",
+              detail: "Only non-dangerous operations may run without approval.",
+              memory_scope: "tenant",
+              user_id: null,
+              confidence: null,
+              active_for_runtime: true,
+              evidence_count: 0,
+              contradiction_count: 0,
+              use_count: 3,
+              success_count: 0,
+              failure_count: 0,
+              created_at: null,
+              updated_at: null,
+            },
+            {
+              id: "cognitive_experience:exp-runtime-errors",
+              source: "cognitive_experience",
+              status: "candidate",
+              summary: "模型网络错误需要显示模型/部署信息。",
+              detail: "provider transport failed 需要暴露供应商和部署名。",
+              memory_scope: "user",
+              user_id: "11111111-1111-4111-8111-111111111111",
+              confidence: 0.76,
+              active_for_runtime: false,
+              evidence_count: 1,
+              contradiction_count: 0,
+              use_count: 0,
+              success_count: 0,
+              failure_count: 0,
+              created_at: "2026-08-30T09:00:00Z",
+              updated_at: "2026-08-30T09:00:00Z",
+            },
+            {
+              id: "hermes:hermes-style",
+              source: "hermes",
+              status: "confirmed",
+              summary: "用户希望技术结论先给明确判断，再给证据。",
+              detail: "用户希望技术结论先给明确判断，再给证据。",
+              memory_scope: "user",
+              user_id: "11111111-1111-4111-8111-111111111111",
+              confidence: null,
+              active_for_runtime: true,
+              evidence_count: 1,
+              contradiction_count: 0,
+              use_count: 0,
+              success_count: 1,
+              failure_count: 0,
+              created_at: "2026-08-29T09:00:00Z",
+              updated_at: null,
+            },
+          ]);
+        }
         if (path.startsWith("/api/v1/admin/logs")) {
           const logs = [
             {
@@ -3836,10 +3894,13 @@ describe("operational management pages", () => {
     expect(await screen.findByText("project-policy")).not.toBeNull();
     expect(screen.getByText("tenant")).not.toBeNull();
     expect(await screen.findByText("热度 0.82")).not.toBeNull();
-    expect(screen.getByText("已锁定")).not.toBeNull();
+    expect(screen.getAllByText("已锁定").length).toBeGreaterThan(0);
     expect(screen.getByText("项目 cube-agent")).not.toBeNull();
     expect(screen.getByText("摘要 week")).not.toBeNull();
     expect(screen.getByText("召回 3 次")).not.toBeNull();
+    expect(await screen.findByText("统一记忆资产")).not.toBeNull();
+    expect(screen.getByText("模型网络错误需要显示模型/部署信息。")).not.toBeNull();
+    expect(screen.getByText("用户希望技术结论先给明确判断，再给证据。")).not.toBeNull();
 
     cleanup();
     const logsView = render(<TestApp initialPath="/logs" />);

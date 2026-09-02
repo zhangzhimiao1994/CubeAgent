@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
 import { useNavSection } from "../app/navSections";
@@ -633,6 +634,7 @@ function sortedSavedModels(models: ModelDeployment[], sort: SortState<ModelSortK
 export function ModelsPage() {
   const queryClient = useQueryClient();
   const { activeSection, navTargetProps } = useNavSection(["category", "section"]);
+  const [searchParams, setSearchParams] = useSearchParams();
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const [modelCategory, setModelCategory] = useState<ModelCategory>("normal");
   const [provider, setProvider] = useState(NORMAL_PROVIDERS[0].value);
@@ -692,9 +694,10 @@ export function ModelsPage() {
   }
 
   useEffect(() => {
+    if (editingModel) return;
     if (activeSection === "text" && modelCategory !== "normal") resetModelForm("normal");
     if (activeSection === "multimedia" && modelCategory !== "multimedia") resetModelForm("multimedia");
-  }, [activeSection, modelCategory]);
+  }, [activeSection, editingModel, modelCategory]);
 
   const saveModel = useMutation({
     mutationFn: async () => {
@@ -787,10 +790,18 @@ export function ModelsPage() {
     setTpm(String(preset.defaultTpm ?? 100000));
   }
 
+  function syncModelCategorySearchParams(nextCategory: ModelCategory) {
+    const nextSearchParams = new URLSearchParams(searchParams);
+    nextSearchParams.set("category", nextCategory === "multimedia" ? "multimedia" : "text");
+    nextSearchParams.delete("section");
+    setSearchParams(nextSearchParams, { replace: true });
+  }
+
   function changeModelCategory(nextCategory: ModelCategory) {
     setSaveMessage(null);
     setEditingModel(null);
     resetModelForm(nextCategory);
+    syncModelCategorySearchParams(nextCategory);
   }
 
   function changeModel(nextModel: string) {
@@ -810,6 +821,7 @@ export function ModelsPage() {
     setSaveMessage(null);
     if (preset) {
       setModelCategory(preset.category);
+      syncModelCategorySearchParams(preset.category);
       setProvider(preset.value);
       setCustomProvider("");
       const presetModel = preset.models.find((item) => item.value === model.upstream_model);
@@ -828,6 +840,7 @@ export function ModelsPage() {
         ? "multimedia"
         : "normal";
       setModelCategory(inferredCategory);
+      syncModelCategorySearchParams(inferredCategory);
       setProvider(CUSTOM_PROVIDER);
       setCustomProvider(model.provider);
       setSelectedModel(CUSTOM_MODEL);
@@ -895,6 +908,26 @@ export function ModelsPage() {
           : "保存普通模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。"}
       </p>
       <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
+      <div className="inline-status-list" role="tablist" aria-label="模型配置类型">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={modelCategory === "normal"}
+          className={modelCategory === "normal" ? undefined : "secondary-action"}
+          onClick={() => changeModelCategory("normal")}
+        >
+          普通模型配置
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={modelCategory === "multimedia"}
+          className={modelCategory === "multimedia" ? undefined : "secondary-action"}
+          onClick={() => changeModelCategory("multimedia")}
+        >
+          多媒体模型配置
+        </button>
+      </div>
 
       <article {...navTargetProps("presets")}>
         <h3>填写指引</h3>
