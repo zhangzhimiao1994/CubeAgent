@@ -1251,6 +1251,46 @@ describe("operational management pages", () => {
     expect(screen.getByText(/检查模型 API Key/)).not.toBeNull();
   });
 
+  it("shows concrete model capacity fields on the detail page", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      status: "failed",
+      mode: "hybrid",
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 6,
+          kind: "runtime.failed",
+          message:
+            "hybrid dispatch failed: model gateway failed: model capacity unavailable (logical_models=deepseek,backup; deployments=deepseek-main,backup-main)",
+          created_at: "2026-08-07T00:00:03Z",
+          participants: [],
+          payload: {
+            error_summary:
+              "hybrid dispatch failed: model gateway failed: model capacity unavailable (logical_models=deepseek,backup; deployments=deepseek-main,backup-main)",
+            error_stage: "model_capacity",
+            error_category: "unavailable",
+            error_code: "model.capacity_unavailable",
+            retryable: true,
+            logical_models: "deepseek,backup",
+            deployments: "deepseek-main,backup-main",
+            suggested_action:
+              "当前模型容量不可用：deepseek,backup；候选部署：deepseek-main,backup-main。可稍后重试、降低并发，或切换到可用模型。",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "失败诊断" })).not.toBeNull();
+    expect(screen.getByText("错误码：model.capacity_unavailable")).not.toBeNull();
+    expect(screen.getByText("不可用模型：deepseek,backup")).not.toBeNull();
+    expect(screen.getByText("候选部署：deepseek-main,backup-main")).not.toBeNull();
+    expect(screen.getByText("可重试：是")).not.toBeNull();
+  });
+
   it("offers artifact downloads on the run detail page", async () => {
     visibleRunDetail = {
       ...runDetail,

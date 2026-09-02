@@ -45,6 +45,48 @@ class MemoryAddStatus(StrEnum):
     REJECTED_UNCONFIRMED_CORE = "rejected_unconfirmed_core"
 
 
+class MemoryRetentionAction(StrEnum):
+    KEEP = "keep"
+    COMPRESS = "compress"
+    COOL_DOWN = "cool_down"
+    ARCHIVE = "archive"
+    TOMBSTONE = "tombstone"
+    PURGE = "purge"
+
+
+class MemoryRetentionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    stale_candidate_days: int = Field(default=30, ge=1, le=3650)
+    cold_archive_days: int = Field(default=180, ge=1, le=3650)
+    tombstone_purge_days: int = Field(default=90, ge=1, le=3650)
+    archive_purge_days: int = Field(default=365, ge=1, le=3650)
+    min_retention_score: float = Field(default=0.22, ge=0, le=1)
+    compress_after_source_count: int = Field(default=3, ge=2, le=100)
+    max_active_records_per_user: int = Field(default=1000, ge=1, le=100000)
+
+
+class MemoryRetentionDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    memory_id: UUID
+    action: MemoryRetentionAction
+    score: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=256)
+    protected: bool = False
+
+
+class MemoryMaintenanceResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    decisions: tuple[MemoryRetentionDecision, ...]
+    compressed: int = Field(default=0, ge=0)
+    archived: int = Field(default=0, ge=0)
+    tombstoned: int = Field(default=0, ge=0)
+    purged: int = Field(default=0, ge=0)
+    cooled_down: int = Field(default=0, ge=0)
+
+
 class MemoryAuditEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 

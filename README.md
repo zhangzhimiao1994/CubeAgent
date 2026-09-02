@@ -9,7 +9,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 ## What You Can Do
 
 - Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration. Without that harness, Cube Agent can analyze code and provide modification plans or patch suggestions, but it cannot directly edit a repository, run the resulting tests, review the changes, and debug them end to end.
-- Inspect dispatch and discussion runs from the child-agent work seats. Each seat shows name, role, model, status, categorized summaries, and compact cards; click a card to open the detailed drawer. Open drawers stay synced with live run updates, close from the backdrop, and lock background scrolling while active.
+- Inspect dispatch and discussion runs from compact child-agent work seats. Each seat uses a Chinese display name and status first; long activity and output content is summarized into cards, and detailed fields open only in the drawer. Open drawers stay synced with live run updates, close from the backdrop, and lock background scrolling while active.
 - Configure normal chat/tool models separately from multimedia AI models.
 - Route image/video/audio generation only to models marked with the matching generation capability.
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
@@ -207,6 +207,14 @@ Cube Agent uses Hermes for conversation learning and a separate Cognitive layer 
 The default learning policy is candidate-first: new experiences and strategies can be collected automatically, but they should be reviewed before becoming active runtime guidance. Reflection can update ordinary experience quality, but it cannot modify core persona/SOUL, safety policy, model permissions, or tool permissions.
 
 The runtime does not inject all memory into the prompt. It builds a bounded working set from user-scoped confirmed memory plus confirmed root memory, then skips archived or low-quality records so long-term use should make guidance more compact rather than larger.
+
+Memory lifecycle is policy driven: `Candidate` records must be confirmed or proven by outcomes before they become active guidance; active memories are ranked as `Hot`, `Warm`, or `Cold`; repeated ordinary records are compressed into a locked summary before their sources are archived; old tombstones and archives are physically purged only after retention windows. Root/core or locked records are protected from automatic compression, tombstoning, and purging.
+
+The maintenance policy is compression-first, archive-second, purge-last. It tracks provenance, confidence, source links, recall count, success/failure counts, contradictions, and last verification time. Periodic calibration can lower confidence or mark stale/contradicted experiences, beliefs, strategies, and skill candidates as contested/deprecated, but it does not rewrite core persona/SOUL, safety policy, model permissions, or tool permissions.
+
+Context injection has an adaptive budget. Hot memories and highly relevant confirmed experiences rank first; Cold memories are injected only when strongly relevant; Archive/Tombstone records are skipped in ordinary runtime context; per-source limits prevent one memory class from crowding out other useful context.
+
+Model-capacity failures include safe diagnostic fields for the affected logical models and candidate deployments. Run detail pages and mode-error logs surface those fields so operators can tell which model route is unavailable instead of seeing only a generic gateway failure.
 
 Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
 

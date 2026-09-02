@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol, overload
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from agent_hub.cognitive.governance import AntiLearningService
+from agent_hub.cognitive.governance import AntiLearningService, ConfidenceCalibrationService
 from agent_hub.cognitive.types import (
     BeliefRecord,
     CognitiveEvidence,
@@ -276,6 +276,43 @@ class ExperienceService:
 
     async def list_records(self, *, tenant_id: UUID, user_id: UUID) -> tuple[ExperienceRecord, ...]:
         return await self._repository.list_for_user(tenant_id, user_id)
+
+    async def calibrate_records(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        changed = 0
+        timestamp = self._now()
+        calibrator = ConfidenceCalibrationService()
+        anti_learning = AntiLearningService()
+        for record in await self._repository.list_for_user(tenant_id, user_id):
+            if record.status is ExperienceStatus.REJECTED:
+                continue
+            confidence = calibrator.calibrate(
+                confidence=record.confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                contradiction_count=len(record.contradictions),
+                last_verified_at=record.last_verified_at,
+                now=timestamp,
+            )
+            status = anti_learning.experience_status(
+                current_status=record.status,
+                confidence=confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+            )
+            if confidence == record.confidence and status is record.status:
+                continue
+            await self._repository.upsert(
+                record.model_copy(
+                    update={
+                        "confidence": confidence,
+                        "status": status,
+                        "version": record.version + 1,
+                        "updated_at": timestamp,
+                    }
+                )
+            )
+            changed += 1
+        return changed
 
     async def record_use_outcome(
         self,
@@ -608,6 +645,13 @@ class CognitiveStateService:
     async def record_reflection(self, reflection: ReflectionRecord) -> ReflectionRecord:
         return await self._repository.upsert(reflection)
 
+    async def calibrate_records(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        changed = 0
+        changed += await self._calibrate_beliefs(tenant_id=tenant_id, user_id=user_id)
+        changed += await self._calibrate_strategies(tenant_id=tenant_id, user_id=user_id)
+        changed += await self._calibrate_skills(tenant_id=tenant_id, user_id=user_id)
+        return changed
+
     async def update_relationship_state(
         self,
         *,
@@ -759,6 +803,16 @@ class CognitiveStateService:
         return "active"
 
     @staticmethod
+    def _calibrated_belief_status(record: BeliefRecord, *, confidence: float) -> str:
+        if record.status == "rejected":
+            return "rejected"
+        if confidence <= 0.24:
+            return "deprecated"
+        if record.contradictions or (record.failure_count > record.success_count and confidence < 0.55):
+            return "contested"
+        return record.status
+
+    @staticmethod
     def _skill_status(
         *,
         confidence: float,
@@ -821,6 +875,122 @@ class CognitiveStateService:
             success_count=success_count,
             failure_count=failure_count,
         )
+
+    async def _calibrate_beliefs(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        changed = 0
+        timestamp = self._now()
+        calibrator = ConfidenceCalibrationService()
+        records = await self._repository.list_for_user(
+            BeliefRecord,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        for record in records:
+            if record.status == "rejected":
+                continue
+            confidence = calibrator.calibrate(
+                confidence=record.confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                contradiction_count=len(record.contradictions),
+                last_verified_at=record.last_verified_at,
+                now=timestamp,
+            )
+            status = self._calibrated_belief_status(record, confidence=confidence)
+            if confidence == record.confidence and status == record.status:
+                continue
+            await self._repository.upsert(
+                record.model_copy(
+                    update={
+                        "confidence": confidence,
+                        "status": status,
+                        "version": record.version + 1,
+                        "updated_at": timestamp,
+                    }
+                )
+            )
+            changed += 1
+        return changed
+
+    async def _calibrate_strategies(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        changed = 0
+        timestamp = self._now()
+        calibrator = ConfidenceCalibrationService()
+        records = await self._repository.list_for_user(
+            StrategyRecord,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        for record in records:
+            confidence = calibrator.calibrate(
+                confidence=record.confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                contradiction_count=len(record.contradictions),
+                last_verified_at=record.last_verified_at,
+                now=timestamp,
+            )
+            status = self._strategy_status(
+                confidence=confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                current_status=record.status,
+            )
+            if confidence == record.confidence and status is record.status:
+                continue
+            await self._repository.upsert(
+                record.model_copy(
+                    update={
+                        "confidence": confidence,
+                        "status": status,
+                        "version": record.version + 1,
+                        "updated_at": timestamp,
+                    }
+                )
+            )
+            changed += 1
+        return changed
+
+    async def _calibrate_skills(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        changed = 0
+        timestamp = self._now()
+        calibrator = ConfidenceCalibrationService()
+        records = await self._repository.list_for_user(
+            SkillCandidateRecord,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        for record in records:
+            if record.status == "rejected":
+                continue
+            confidence = calibrator.calibrate(
+                confidence=record.confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                contradiction_count=len(record.contradictions),
+                last_verified_at=record.last_verified_at,
+                now=timestamp,
+            )
+            status = self._skill_status(
+                confidence=confidence,
+                success_count=record.success_count,
+                failure_count=record.failure_count,
+                current_status=record.status,
+            )
+            if confidence == record.confidence and status == record.status:
+                continue
+            await self._repository.upsert(
+                record.model_copy(
+                    update={
+                        "confidence": confidence,
+                        "status": status,
+                        "version": record.version + 1,
+                        "updated_at": timestamp,
+                    }
+                )
+            )
+            changed += 1
+        return changed
 
 
 class SkillPromotionNotReady(RuntimeError):

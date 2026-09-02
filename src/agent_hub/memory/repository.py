@@ -21,6 +21,10 @@ class InMemoryMemoryRepository:
         async with self._lock:
             return self._records.get(memory_id)
 
+    async def delete(self, memory_id: UUID) -> bool:
+        async with self._lock:
+            return self._records.pop(memory_id, None) is not None
+
     async def list_for_user(self, tenant_id: UUID, user_id: UUID) -> tuple[MemoryRecord, ...]:
         async with self._lock:
             return tuple(

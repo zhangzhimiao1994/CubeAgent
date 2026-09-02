@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.cognitive.context_router import route_cognitive_context
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, OutcomeCritic
 from agent_hub.cognitive.repository import (
     InMemoryCognitiveRecordRepository,
@@ -13,6 +14,10 @@ from agent_hub.cognitive.repository import (
 from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.cognitive.types import OutcomeAssessmentRecord, OutcomeVerdict, ReflectionRecord
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.memory.maintenance import MemoryMaintenanceService
+from agent_hub.memory.repository import InMemoryMemoryRepository
+from agent_hub.memory.service import MemoryService
+from agent_hub.memory.types import MemoryCategory, MemoryLayer, MemoryRecord
 
 
 class FakeRunEvidenceRepository:
@@ -149,3 +154,196 @@ async def test_learning_pipeline_skips_candidate_learning_without_visible_eviden
     assert result.experience is None
     assert reflections == ()
     assert experiences == ()
+
+
+@pytest.mark.asyncio
+async def test_learning_injection_failure_feedback_and_memory_maintenance_closed_loop() -> None:
+    now = [datetime(2026, 9, 2, tzinfo=UTC)]
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_repository = InMemoryExperienceRepository()
+    memory_repository = InMemoryMemoryRepository()
+    cognitive_service = CognitiveStateService(cognitive_repository, now=lambda: now[0])
+    experience_service = ExperienceService(experience_repository, now=lambda: now[0])
+    memory_service = MemoryService(memory_repository, now=lambda: now[0])
+    pipeline = CognitiveLearningPipeline(
+        cognitive_service=cognitive_service,
+        experience_service=experience_service,
+    )
+    tenant_id = uuid4()
+    user_id = uuid4()
+
+    learned = await pipeline.process_terminal_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=uuid4(),
+        status=RunStatus.COMPLETED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"used_experience_ids": []},
+        events=(
+            {
+                "kind": "runtime.completed",
+                "message": "hybrid reviewer timeout recovery completed with visible output",
+            },
+        ),
+        artifacts=({"kind": "text", "title": "answer", "text": "压缩上下文后完成审查"},),
+    )
+    assert learned is not None
+    assert learned.experience is not None
+
+    confirmed = await experience_service.confirm(learned.experience.id, tenant_id=tenant_id, user_id=user_id)
+    routed = route_cognitive_context(
+        request="runtime_outcome success hybrid",
+        mode=TaskMode.HYBRID.value,
+        agent_ids=("quality_reviewer",),
+        experiences=(confirmed,),
+        limit=3,
+    )
+    assert routed.selected
+    assert routed.selected[0].source == "experience"
+
+    now[0] += timedelta(minutes=5)
+    failed = await pipeline.process_terminal_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=uuid4(),
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"injected_experience_ids": [str(confirmed.id)]},
+        events=(
+            {
+                "kind": "runtime.failed",
+                "message": "hybrid dispatch failed: reviewer step timed out",
+            },
+        ),
+        artifacts=(),
+    )
+    assert failed is not None
+    updated_experience = (await experience_repository.list_for_user(tenant_id, user_id))[0]
+    assert updated_experience.failure_count == 1
+    assert updated_experience.confidence < confirmed.confidence
+    assert updated_experience.contradictions
+
+    for index in range(3):
+        added = await memory_service.add_candidate(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            text=f"reviewer 超时经验原始片段 {index}：先压缩上下文。",
+            category=MemoryCategory.LESSON,
+            project_id="cubeagent",
+            conversation_id="conv-review",
+            confidence=0.72,
+        )
+        assert added.record is not None
+    maintained = await MemoryMaintenanceService(memory_repository, now=lambda: now[0]).maintain(apply=True)
+    assert maintained.compressed == 1
+    all_memories = await memory_repository.list_all()
+    summaries = [record for record in all_memories if record.category is MemoryCategory.SUMMARY]
+    assert len(summaries) == 1
+    assert len(summaries[0].source_memory_ids) == 3
+    for source_id in summaries[0].source_memory_ids:
+        source = await memory_repository.get(source_id)
+        assert source is not None
+        assert source.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_learning_injection_outcome_and_memory_maintenance_loop() -> None:
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_repository = InMemoryExperienceRepository()
+    cognitive_service = CognitiveStateService(cognitive_repository, now=lambda: now)
+    experience_service = ExperienceService(experience_repository, now=lambda: now)
+    tenant_id = uuid4()
+    user_id = uuid4()
+    run_id = uuid4()
+
+    learned = await CognitiveLearningPipeline(
+        cognitive_service=cognitive_service,
+        experience_service=experience_service,
+        run_repository=FakeRunEvidenceRepository(
+            events=(
+                {
+                    "kind": "runtime.failed",
+                    "message": "hybrid direct failed: model response budget is unverifiable",
+                },
+            ),
+        ),
+    ).process_terminal_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=run_id,
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"workflow_id": "no-workflow"},
+    )
+    assert learned is not None
+    assert learned.experience is not None
+    confirmed = await experience_service.confirm(learned.experience.id, tenant_id=tenant_id, user_id=user_id)
+
+    routed = route_cognitive_context(
+        request="runtime_outcome failure hybrid 怎么处理",
+        mode="hybrid",
+        agent_ids=("main_agent",),
+        experiences=(confirmed,),
+        limit=3,
+        total_context_budget=2,
+    )
+    unrelated = route_cognitive_context(
+        request="帮我写一首生日诗",
+        mode="direct",
+        agent_ids=("main_agent",),
+        experiences=(confirmed,),
+        limit=3,
+    )
+    assert [item.id for item in routed.selected] == [f"cognitive_experience:{confirmed.id}"]
+    assert unrelated.selected == ()
+
+    second_run_id = uuid4()
+    await CognitiveLearningPipeline(
+        cognitive_service=cognitive_service,
+        experience_service=experience_service,
+        run_repository=FakeRunEvidenceRepository(
+            events=(
+                {
+                    "kind": "runtime.failed",
+                    "message": "same strategy failed again after injection",
+                },
+            ),
+        ),
+    ).process_terminal_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=second_run_id,
+        status=RunStatus.FAILED,
+        mode=TaskMode.HYBRID,
+        routing_decision={"injected_experience_ids": [str(confirmed.id)]},
+    )
+    updated = await experience_repository.get(confirmed.id)
+    assert updated is not None
+    assert updated.failure_count == 1
+    assert updated.confidence < confirmed.confidence
+
+    memory_repository = InMemoryMemoryRepository()
+    for index in range(3):
+        await memory_repository.upsert(
+            MemoryRecord(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                layer=MemoryLayer.EPISODIC,
+                category=MemoryCategory.LESSON,
+                text=f"重复运行记忆 {index}：runtime failure 需要压缩。",
+                confidence=0.72,
+                created_at=now,
+                updated_at=now,
+                heat=0.62,
+                project_id="cubeagent",
+                conversation_id="conv-loop",
+            )
+        )
+    maintained = await MemoryMaintenanceService(memory_repository, now=lambda: now).maintain(apply=True)
+    memory_records = await memory_repository.list_for_user(tenant_id, user_id)
+
+    assert maintained.compressed == 1
+    assert sum(1 for record in memory_records if record.category is MemoryCategory.SUMMARY) == 1
+    assert sum(1 for record in memory_records if record.archived_at is not None) == 3

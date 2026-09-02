@@ -6910,6 +6910,8 @@ def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
         "error_category",
         "retryable",
         "status_code",
+        "logical_models",
+        "deployments",
         "suggested_action",
     ):
         value = diagnostic.get(key)
@@ -6979,6 +6981,8 @@ def _failure_diagnostic_from_run_events(
             "error_code",
             "retryable",
             "status_code",
+            "logical_models",
+            "deployments",
             "suggested_action",
         }
     }

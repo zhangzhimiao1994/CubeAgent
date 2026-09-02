@@ -11,7 +11,7 @@ from agent_hub.cognitive.types import (
     SkillCandidateRecord,
     WorldStateRecord,
 )
-from agent_hub.memory.types import MemoryLayer, MemoryRecord
+from agent_hub.memory.types import MemoryLayer, MemoryRecord, MemoryTier
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +51,15 @@ def route_cognitive_context(
     world_states: tuple[WorldStateRecord, ...] = (),
     skill_candidates: tuple[SkillCandidateRecord, ...] = (),
     limit: int = 5,
+    total_context_budget: int | None = None,
+    per_source_budget: int | None = None,
 ) -> CognitiveContextRouteResult:
     if limit < 1 or limit > 20:
         raise ValueError("context route limit must be between 1 and 20")
+    if total_context_budget is not None and not 1 <= total_context_budget <= 20:
+        raise ValueError("total context budget must be between 1 and 20")
+    if per_source_budget is not None and not 1 <= per_source_budget <= 20:
+        raise ValueError("per-source context budget must be between 1 and 20")
     request_terms = _terms(request)
     selected: list[RoutedCognitiveContext] = []
     skipped: list[SkippedCognitiveContext] = []
@@ -104,9 +110,16 @@ def route_cognitive_context(
         _append_route(selected, skipped, routed, skip)
 
     selected.sort(key=lambda item: item.score, reverse=True)
+    selected, budget_skipped = _apply_budgets(
+        selected,
+        limit=limit,
+        total_context_budget=total_context_budget,
+        per_source_budget=per_source_budget,
+    )
+    skipped.extend(budget_skipped)
     skipped.sort(key=lambda item: item.score, reverse=True)
     return CognitiveContextRouteResult(
-        selected=tuple(selected[:limit]),
+        selected=tuple(selected),
         skipped=tuple(skipped[:10]),
     )
 
@@ -121,6 +134,68 @@ def _append_route(
         selected.append(routed)
     if skip is not None:
         skipped.append(skip)
+
+
+def _apply_budgets(
+    selected: list[RoutedCognitiveContext],
+    *,
+    limit: int,
+    total_context_budget: int | None,
+    per_source_budget: int | None,
+) -> tuple[list[RoutedCognitiveContext], list[SkippedCognitiveContext]]:
+    max_total = min(limit, total_context_budget or limit)
+    if per_source_budget is None:
+        return selected[:max_total], [
+            _skip(
+                id_=item.id,
+                source=item.source,
+                summary=item.summary,
+                score=item.score,
+                reason="总上下文预算已满",
+            )
+            for item in selected[max_total:]
+        ]
+
+    kept: list[RoutedCognitiveContext] = []
+    skipped: list[SkippedCognitiveContext] = []
+    source_counts: dict[str, int] = {}
+    for item in selected:
+        if len(kept) >= max_total:
+            skipped.append(
+                _skip(
+                    id_=item.id,
+                    source=item.source,
+                    summary=item.summary,
+                    score=item.score,
+                    reason="总上下文预算已满",
+                )
+            )
+            continue
+        count = source_counts.get(item.source, 0)
+        if count >= per_source_budget:
+            skipped.append(
+                _skip(
+                    id_=item.id,
+                    source=item.source,
+                    summary=item.summary,
+                    score=item.score,
+                    reason="来源上下文预算已满",
+                )
+            )
+            continue
+        kept.append(item)
+        source_counts[item.source] = count + 1
+    return kept, skipped
+
+
+def _memory_tier(memory: MemoryRecord) -> MemoryTier:
+    if memory.deleted_at is not None or memory.archived_at is not None:
+        return MemoryTier.ARCHIVE
+    if memory.locked or memory.layer is MemoryLayer.CORE or memory.heat >= 0.75:
+        return MemoryTier.HOT
+    if memory.heat >= 0.3:
+        return MemoryTier.WARM
+    return MemoryTier.COLD
 
 
 def _route_memory(
@@ -143,11 +218,27 @@ def _route_memory(
             score=memory.confidence,
             reason="记忆置信度不足",
         )
-    score = _text_score(request_terms, memory.text)
+    text_relevance = _text_score(request_terms, memory.text)
+    tier = _memory_tier(memory)
+    if tier is MemoryTier.COLD and text_relevance < 0.48:
+        return None, _skip(
+            id_=f"memory:{memory.id}",
+            source="memory",
+            summary=memory.text,
+            score=text_relevance,
+            reason="冷记忆相关性不足",
+        )
+    score = text_relevance
     score += min(0.16, memory.confidence * 0.16)
     score += min(0.14, memory.heat * 0.14)
     if memory.layer is MemoryLayer.CORE:
         score += 0.1
+    if tier is MemoryTier.HOT:
+        score += 0.09
+    elif tier is MemoryTier.WARM:
+        score += 0.03
+    elif tier is MemoryTier.COLD:
+        score -= 0.05
     if score < 0.45:
         return None, _skip(
             id_=f"memory:{memory.id}",

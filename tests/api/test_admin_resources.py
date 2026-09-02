@@ -1239,6 +1239,8 @@ def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
                     "error_code": "model.provider_auth_failed",
                     "retryable": False,
                     "status_code": 401,
+                    "logical_models": "primary,backup",
+                    "deployments": "primary-key,backup-key",
                     "suggested_action": "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
                 },
             )
@@ -1254,6 +1256,8 @@ def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
     assert log.details["error_category"] == "authentication"
     assert log.details["retryable"] == "False"
     assert log.details["status_code"] == "401"
+    assert log.details["logical_models"] == "primary,backup"
+    assert log.details["deployments"] == "primary-key,backup-key"
     assert "模型 API Key" in log.details["suggested_action"]
     assert "diagnosis" not in log.details
 

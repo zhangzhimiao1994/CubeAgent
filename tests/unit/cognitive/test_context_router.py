@@ -115,18 +115,70 @@ def test_context_router_selects_world_state_for_strong_project_boundary_match() 
     assert "harness" in result.selected[0].summary
 
 
-def _memory(text: str, *, now: datetime) -> MemoryRecord:
+def test_context_router_prioritizes_hot_memory_and_skips_weak_cold_memory() -> None:
+    now = datetime.now(UTC)
+    archived = _memory("reviewer 超时历史归档。", now=now).model_copy(update={"archived_at": now})
+    hot = _memory("reviewer 超时时优先压缩上下文。", now=now, layer=MemoryLayer.EPISODIC, heat=0.9)
+    warm = _memory("reviewer 超时时可以分块审查。", now=now, layer=MemoryLayer.EPISODIC, heat=0.45)
+    cold_weak = _memory("reviewer 普通备注。", now=now, layer=MemoryLayer.EPISODIC, heat=0.1)
+
+    result = route_cognitive_context(
+        request="reviewer 超时 怎么处理",
+        mode="hybrid",
+        agent_ids=("quality_reviewer",),
+        memories=(warm, cold_weak, archived, hot),
+        limit=5,
+    )
+
+    assert [item.summary for item in result.selected[:2]] == [hot.text, warm.text]
+    assert any(item.id == f"memory:{cold_weak.id}" and item.reason == "冷记忆相关性不足" for item in result.skipped)
+    assert any(item.id == f"memory:{archived.id}" and item.reason == "记忆已删除或过期" for item in result.skipped)
+
+
+def test_context_router_applies_total_and_per_source_budgets() -> None:
+    now = datetime.now(UTC)
+
+    result = route_cognitive_context(
+        request="reviewer 超时 分块 审查",
+        mode="hybrid",
+        agent_ids=("quality_reviewer",),
+        memories=(
+            _memory("reviewer 超时要压缩上下文。", now=now, layer=MemoryLayer.EPISODIC, heat=0.9),
+            _memory("reviewer 超时要分块审查。", now=now, layer=MemoryLayer.EPISODIC, heat=0.8),
+            _memory("reviewer 超时要降低并发。", now=now, layer=MemoryLayer.EPISODIC, heat=0.7),
+        ),
+        experiences=(
+            _experience("reviewer 超时时先压缩再重试。", now=now),
+            _experience("reviewer 超时时记录失败原因。", now=now),
+        ),
+        limit=5,
+        total_context_budget=3,
+        per_source_budget=1,
+    )
+
+    assert len(result.selected) == 2
+    assert [item.source for item in result.selected].count("memory") == 1
+    assert [item.source for item in result.selected].count("experience") == 1
+
+
+def _memory(
+    text: str,
+    *,
+    now: datetime,
+    layer: MemoryLayer = MemoryLayer.CORE,
+    heat: float = 0.8,
+) -> MemoryRecord:
     return MemoryRecord(
         id=uuid4(),
         tenant_id=uuid4(),
         user_id=uuid4(),
-        layer=MemoryLayer.CORE,
+        layer=layer,
         category=MemoryCategory.PREFERENCE,
         text=text,
         confidence=0.85,
         created_at=now,
         updated_at=now,
-        heat=0.8,
+        heat=heat,
     )
 
 

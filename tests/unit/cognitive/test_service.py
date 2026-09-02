@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -13,6 +13,7 @@ from agent_hub.cognitive.service import (
     SkillPromotionService,
 )
 from agent_hub.cognitive.types import (
+    BeliefRecord,
     CognitiveEvidence,
     CognitiveMemoryScope,
     ExperienceKind,
@@ -20,6 +21,7 @@ from agent_hub.cognitive.types import (
     OutcomeAssessmentRecord,
     OutcomeVerdict,
     SkillCandidateRecord,
+    StrategyRecord,
     StrategyStatus,
 )
 
@@ -835,3 +837,132 @@ async def test_outcome_assessment_is_persisted_and_scoped() -> None:
     assert assessment.verdict is OutcomeVerdict.PARTIAL
     assert [item.id for item in owner_records] == [assessment.id]
     assert other_records == ()
+
+
+@pytest.mark.asyncio
+async def test_experience_calibration_deprecates_stale_failed_experience() -> None:
+    repository = InMemoryExperienceRepository()
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    service = ExperienceService(repository, now=lambda: now)
+    tenant_id = uuid4()
+    user_id = uuid4()
+    created = await service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.ERROR_HANDLING,
+        summary="旧 reviewer 处理经验。",
+        lesson="旧策略长期未验证且失败较多。",
+        strategy="继续完整审查。",
+        confidence=0.36,
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="created"),),
+    )
+    stale_failed = created.model_copy(
+        update={
+            "status": ExperienceStatus.CONFIRMED,
+            "use_count": 3,
+            "success_count": 0,
+            "failure_count": 3,
+            "contradictions": (
+                CognitiveEvidence(source_type="run", source_id="run-2", note="failed"),
+            ),
+            "last_verified_at": now - timedelta(days=120),
+        }
+    )
+    await repository.upsert(stale_failed)
+
+    changed = await service.calibrate_records(tenant_id=tenant_id, user_id=user_id)
+    records = await service.list_records(tenant_id=tenant_id, user_id=user_id)
+
+    assert changed == 1
+    assert records[0].status is ExperienceStatus.DEPRECATED
+    assert records[0].confidence < stale_failed.confidence
+    assert records[0].last_verified_at == stale_failed.last_verified_at
+
+
+@pytest.mark.asyncio
+async def test_cognitive_calibration_updates_stale_belief_strategy_and_skill() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    stale = now - timedelta(days=120)
+    tenant_id = uuid4()
+    user_id = uuid4()
+    evidence = CognitiveEvidence(source_type="run", source_id="run-1", note="created")
+    contradiction = CognitiveEvidence(source_type="run", source_id="run-2", note="failed")
+    belief = BeliefRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        subject="user.preference",
+        claim="用户总是需要完整长输出。",
+        confidence=0.5,
+        evidence=(evidence,),
+        contradictions=(contradiction,),
+        status="active",
+        use_count=2,
+        success_count=0,
+        failure_count=2,
+        last_verified_at=stale,
+        created_at=stale,
+        updated_at=stale,
+    )
+    strategy = StrategyRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="old-review-strategy",
+        context="reviewer timeout",
+        strategy="继续完整审查。",
+        rationale="旧判断。",
+        status=StrategyStatus.ACTIVE,
+        confidence=0.5,
+        evidence=(evidence,),
+        contradictions=(contradiction,),
+        use_count=2,
+        success_count=0,
+        failure_count=2,
+        last_verified_at=stale,
+        created_at=stale,
+        updated_at=stale,
+    )
+    skill = SkillCandidateRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="old-review-skill",
+        purpose="处理 reviewer timeout",
+        steps=("继续完整审查。",),
+        output_contract="输出审查结论。",
+        confidence=0.5,
+        evidence=(evidence,),
+        contradictions=(contradiction,),
+        use_count=2,
+        success_count=0,
+        failure_count=2,
+        last_verified_at=stale,
+        status="active",
+        created_at=stale,
+        updated_at=stale,
+    )
+    await repository.upsert(belief)
+    await repository.upsert(strategy)
+    await repository.upsert(skill)
+    service = CognitiveStateService(repository, now=lambda: now)
+
+    changed = await service.calibrate_records(tenant_id=tenant_id, user_id=user_id)
+
+    calibrated_belief = await repository.get(BeliefRecord, belief.id)
+    calibrated_strategy = await repository.get(StrategyRecord, strategy.id)
+    calibrated_skill = await repository.get(SkillCandidateRecord, skill.id)
+    assert changed == 3
+    assert calibrated_belief is not None
+    assert calibrated_belief.status in {"contested", "deprecated"}
+    assert calibrated_belief.confidence < belief.confidence
+    assert calibrated_belief.last_verified_at == stale
+    assert calibrated_strategy is not None
+    assert calibrated_strategy.status is StrategyStatus.CONTESTED
+    assert calibrated_strategy.confidence < strategy.confidence
+    assert calibrated_skill is not None
+    assert calibrated_skill.status == "contested"
+    assert calibrated_skill.confidence < skill.confidence

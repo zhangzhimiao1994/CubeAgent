@@ -114,6 +114,8 @@ type FailureDiagnostic = {
   retryable: boolean | null;
   statusCode: number | null;
   suggestedAction: string | null;
+  logicalModels: string | null;
+  deployments: string | null;
 };
 
 function collectFailureDiagnostics(events: RunEvent[]): FailureDiagnostic[] {
@@ -132,6 +134,8 @@ function collectFailureDiagnostics(events: RunEvent[]): FailureDiagnostic[] {
         retryable: payloadBoolean(event.payload, "retryable"),
         statusCode: payloadNumber(event.payload, "status_code"),
         suggestedAction: payloadString(event.payload, "suggested_action"),
+        logicalModels: payloadString(event.payload, "logical_models"),
+        deployments: payloadString(event.payload, "deployments"),
       },
     ];
   });
@@ -344,6 +348,8 @@ export function RunDetailPage() {
                   </span>
                 ) : null}
                 {diagnostic.statusCode !== null ? <span>状态码：{diagnostic.statusCode}</span> : null}
+                {diagnostic.logicalModels ? <span>不可用模型：{diagnostic.logicalModels}</span> : null}
+                {diagnostic.deployments ? <span>候选部署：{diagnostic.deployments}</span> : null}
                 {diagnostic.retryable !== null ? <span>可重试：{diagnostic.retryable ? "是" : "否"}</span> : null}
                 {diagnostic.suggestedAction ? <small>建议：{diagnostic.suggestedAction}</small> : null}
                 <small>
