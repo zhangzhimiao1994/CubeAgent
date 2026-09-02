@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from agent_hub.models.capacity import (
@@ -94,6 +96,43 @@ def test_safe_runtime_failure_diagnostic_classifies_provider_auth_failure() -> N
     assert diagnostic["retryable"] is False
     assert diagnostic["status_code"] == 401
     assert "sk-secret" not in str(diagnostic)
+
+
+def test_safe_runtime_failure_diagnostic_preserves_transport_model_context() -> None:
+    diagnostic = safe_runtime_failure_diagnostic(
+        ModelTransportError(
+            "Authorization: Bearer sk-secret",
+            status_code=503,
+            logical_models=("deepseek", "backup"),
+            deployments=("deepseek-main", "backup-main"),
+        )
+    )
+
+    assert diagnostic["error_summary"] == (
+        "model gateway failed: model transport failed "
+        "(status=503; logical_models=deepseek,backup; deployments=deepseek-main,backup-main)"
+    )
+    assert diagnostic["error_stage"] == "model_provider"
+    assert diagnostic["error_category"] == "upstream_unavailable"
+    assert diagnostic["error_code"] == "model.provider_unavailable"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["status_code"] == 503
+    assert diagnostic["logical_models"] == "deepseek,backup"
+    assert diagnostic["deployments"] == "deepseek-main,backup-main"
+    assert "供应商服务异常" in cast(str, diagnostic["possible_cause"])
+    assert "sk-secret" not in str(diagnostic)
+
+
+def test_runtime_failure_diagnostic_parses_prefixed_transport_model_context() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "hybrid direct failed: model gateway failed: model transport failed "
+        "(logical_models=deepseek; deployments=deepseek-main)"
+    )
+
+    assert diagnostic["error_code"] == "model.provider_transport_failed"
+    assert diagnostic["logical_models"] == "deepseek"
+    assert diagnostic["deployments"] == "deepseek-main"
+    assert "deepseek" in cast(str, diagnostic["suggested_action"])
 
 
 def test_safe_runtime_failure_diagnostic_classifies_capacity_timeout() -> None:

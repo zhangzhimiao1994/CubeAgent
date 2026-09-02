@@ -31,6 +31,21 @@ _LOGGER = logging.getLogger(__name__)
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        logical_models: Sequence[str] = (),
+        deployments: Sequence[str] = (),
+    ) -> None:
+        for logical_model in logical_models:
+            _require_safe_identifier("logical model", logical_model)
+        for deployment_id in deployments:
+            _require_safe_identifier("deployment id", deployment_id)
+        super().__init__(message)
+        self.logical_models = tuple(logical_models)
+        self.deployments = tuple(deployments)
+
 
 @dataclass(frozen=True, slots=True)
 class DeploymentPricing:
@@ -100,6 +115,30 @@ class _SafeTransportFailure:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _model_failure_context(
+    candidate_groups: Sequence[tuple[str, tuple[Deployment, ...]]],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    logical_models = tuple(logical_model for logical_model, _candidates in candidate_groups)
+    deployments = tuple(
+        deployment.id
+        for _logical_model, candidates in candidate_groups
+        for deployment in candidates
+    )
+    return logical_models, deployments
+
+
+def _attach_model_failure_context(
+    error: BaseException,
+    candidate_groups: Sequence[tuple[str, tuple[Deployment, ...]]],
+) -> BaseException:
+    logical_models, deployments = _model_failure_context(candidate_groups)
+    if logical_models:
+        error.__dict__["logical_models"] = logical_models
+    if deployments:
+        error.__dict__["deployments"] = deployments
+    return error
 
 
 def _retryable_model_failure(error: BaseException) -> bool:
@@ -317,17 +356,26 @@ class ModelGateway:
                 )
             except (CapacityWaitTimeout, CapacityQueueFull):
                 continue
+            except (CapacityConfigurationError, CapacityBackendError) as error:
+                raise _attach_model_failure_context(error, candidate_groups) from None
             selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
                 cleanup_error = await self._release_cleanup(capacity, lease)
                 if isinstance(cleanup_error, asyncio.CancelledError):
                     raise cleanup_error
                 if cleanup_error is not None:
-                    raise CapacityBackendError("model capacity release failed") from None
-                raise CapacityBackendError("model capacity returned an unknown deployment")
+                    raise _attach_model_failure_context(
+                        CapacityBackendError("model capacity release failed"),
+                        candidate_groups,
+                    ) from None
+                raise _attach_model_failure_context(
+                    CapacityBackendError("model capacity returned an unknown deployment"),
+                    candidate_groups,
+                ) from None
             try:
                 response = await self._complete_leased(capacity, selected, lease, request)
             except (ModelTransportError, ModelGatewayError) as error:
+                _attach_model_failure_context(error, candidate_groups)
                 if not _retryable_model_failure(error):
                     raise
                 last_retryable_error = error
@@ -342,8 +390,9 @@ class ModelGateway:
             )
         if last_retryable_error is not None:
             raise last_retryable_error from None
-        raise CapacityUnavailable(
-            self._capacity_unavailable_reason(candidate_groups)
+        raise _attach_model_failure_context(
+            CapacityUnavailable(self._capacity_unavailable_reason(candidate_groups)),
+            candidate_groups,
         ) from None
 
     @staticmethod
@@ -532,7 +581,12 @@ class ModelGateway:
                 type(error).__name__,
             )
             outcome = _SafeTransportFailure(
-                ModelTransportError("model transport failed", status_code=error.status_code)
+                ModelTransportError(
+                    "model transport failed",
+                    status_code=error.status_code,
+                    logical_models=(deployment.logical_model,),
+                    deployments=(deployment.id,),
+                )
             )
             error.__traceback__ = None
             del error

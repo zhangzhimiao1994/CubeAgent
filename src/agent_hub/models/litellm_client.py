@@ -20,6 +20,7 @@ from agent_hub.models.types import (
     ToolCall,
     ToolDefinition,
     _freeze_json,
+    _require_safe_identifier,
 )
 
 _SAFE_PROVIDER_VALUE = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
@@ -84,13 +85,26 @@ class HTTPClientFactory(Protocol):
 class ModelTransportError(RuntimeError):
     """Stable, redacted model transport failure."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        logical_models: Sequence[str] = (),
+        deployments: Sequence[str] = (),
+    ) -> None:
         if status_code is not None and (
             type(status_code) is not int or not 100 <= status_code <= 599
         ):
             raise ValueError("status_code must be None or between 100 and 599")
+        for logical_model in logical_models:
+            _require_safe_identifier("logical model", logical_model)
+        for deployment_id in deployments:
+            _require_safe_identifier("deployment id", deployment_id)
         super().__init__(message)
         self.status_code = status_code
+        self.logical_models = tuple(logical_models)
+        self.deployments = tuple(deployments)
 
 
 class ModelResponseError(ModelTransportError):

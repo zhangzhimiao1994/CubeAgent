@@ -511,6 +511,59 @@ async def test_transport_failure_never_records_success(status_code: int | None) 
     assert capacity.records[0][3] is False
 
 
+class AlwaysFailingTransport:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del model_request, api_key
+        self.events.append(("transport", deployment.id))
+        raise ModelTransportError("safe transport failure", status_code=503)
+
+
+async def test_retryable_transport_failure_preserves_safe_candidate_context() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        AlwaysFailingTransport(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(ModelTransportError) as captured:
+        await gateway.complete(request())
+
+    assert str(captured.value) == "model transport failed"
+    assert captured.value.logical_models == ("primary", "backup")
+    assert captured.value.deployments == ("primary-key", "backup-key")
+    assert [record[3] for record in capacity.records] == [False, False]
+    assert len(capacity.releases) == 2
+
+
+async def test_empty_response_failure_preserves_safe_candidate_context() -> None:
+    selected = deployment("primary-key")
+    capacity = CapacityStub([lease("primary-key")])
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        EmptyPrimaryTransport(capacity.events),
+    )
+
+    with pytest.raises(ModelGatewayError) as captured:
+        await gateway.complete(request(allow_fallback=False))
+
+    assert str(captured.value) == "model response text is empty"
+    assert captured.value.logical_models == ("primary",)
+    assert captured.value.deployments == ("primary-key",)
+    assert len(capacity.releases) == 1
+
+
 async def test_typed_transport_error_traceback_drops_transport_key_locals() -> None:
     selected = deployment("selected")
     capacity = CapacityStub([lease("selected")])

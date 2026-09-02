@@ -1242,6 +1242,7 @@ def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
                     "logical_models": "primary,backup",
                     "deployments": "primary-key,backup-key",
                     "suggested_action": "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
+                    "possible_cause": "API Key 失效、模型权限不足、供应商账号或 Base URL 配置不匹配。",
                 },
             )
         ],
@@ -1259,6 +1260,7 @@ def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
     assert log.details["logical_models"] == "primary,backup"
     assert log.details["deployments"] == "primary-key,backup-key"
     assert "模型 API Key" in log.details["suggested_action"]
+    assert "API Key 失效" in log.details["possible_cause"]
     assert "diagnosis" not in log.details
 
 
@@ -5560,6 +5562,109 @@ async def test_persistent_hermes_list_filters_cognitive_experience_rows(tmp_path
 
     assert [item.id for item in hermes] == ["hermes_regular"]
     assert [item.id for item in cognitive] == [str(cognitive_id)]
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_list_filters_all_cognitive_rows_and_uses_routeable_ids(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    stale_payload_id = "hermes_stale_payload_id"
+
+    class StoredPersistentHermesService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "hermes",
+                    "hermes_routeable_resource",
+                ): {
+                    "id": stale_payload_id,
+                    "category": "conversation",
+                    "outcome": "success",
+                    "lesson": "Use concise summaries for long discussions.",
+                    "summary": "Learned success pattern.",
+                    "user_summary": "本次对话记住了一个成功经验：长讨论需要先压缩摘要。",
+                    "tags": ["summary"],
+                    "weight": 5,
+                    "created_at": now,
+                    "confirmed_at": now,
+                },
+                (
+                    "hermes",
+                    f"cognitive_strategy:{uuid4()}",
+                ): {
+                    "id": str(uuid4()),
+                    "record_type": "strategy",
+                    "status": "candidate",
+                    "name": "Do not show in Hermes ledger",
+                    "description": "Cognitive strategy rows belong to cognitive pages.",
+                    "confidence": 0.5,
+                    "evidence": [],
+                    "contradictions": [],
+                    "source_experience_ids": [],
+                    "use_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "last_used_at": None,
+                    "last_verified_at": None,
+                    "version": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                    "storage_kind": "hermes",
+                },
+                (
+                    "hermes",
+                    f"cognitive_reflection:{uuid4()}",
+                ): {
+                    "id": str(uuid4()),
+                    "record_type": "reflection",
+                    "summary": "Do not show in Hermes ledger",
+                    "causal_factors": [],
+                    "counterfactual": "",
+                    "created_at": now,
+                    "storage_kind": "hermes",
+                },
+                (
+                    "hermes",
+                    f"cognitive_outcome:{uuid4()}",
+                ): {
+                    "id": str(uuid4()),
+                    "record_type": "outcome_assessment",
+                    "verdict": "success",
+                    "confidence": 0.5,
+                    "created_at": now,
+                    "storage_kind": "hermes",
+                },
+            }
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            payload = self.payloads.get((kind, resource_id))
+            return None if payload is None else dict(payload)
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (resource_id, dict(payload), None, None)
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+    service = StoredPersistentHermesService()
+
+    hermes = await service.list_hermes_insights()
+    details = [await service.get_hermes_insight(item.id) for item in hermes]
+
+    assert [item.id for item in hermes] == ["hermes_routeable_resource"]
+    assert details[0].id == "hermes_routeable_resource"
+    assert details[0].id != stale_payload_id
 
 
 @pytest.mark.asyncio

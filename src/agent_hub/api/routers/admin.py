@@ -1692,6 +1692,16 @@ _COGNITIVE_EXPERIENCE_PREFIX = "cognitive_experience:"
 _COGNITIVE_STRATEGY_PREFIX = "cognitive_strategy:"
 _COGNITIVE_REFLECTION_PREFIX = "cognitive_reflection:"
 _COGNITIVE_OUTCOME_PREFIX = "cognitive_outcome:"
+_COGNITIVE_RECORD_PREFIXES = (
+    _COGNITIVE_EXPERIENCE_PREFIX,
+    _COGNITIVE_STRATEGY_PREFIX,
+    _COGNITIVE_REFLECTION_PREFIX,
+    _COGNITIVE_OUTCOME_PREFIX,
+    "cognitive_belief:",
+    "cognitive_relationship:",
+    "cognitive_world:",
+    "cognitive_skill:",
+)
 
 
 def _clean_cognitive_text(value: str) -> str:
@@ -5695,15 +5705,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if rows is None:
             return await super().list_hermes_insights()
         return tuple(
-            _hermes_response_from_payload(payload)
+            _hermes_response_from_payload(payload, resource_id=resource_id)
             for resource_id, payload, _created_at, _updated_at in rows
-            if not resource_id.startswith(_COGNITIVE_EXPERIENCE_PREFIX)
+            if not _is_cognitive_resource_id(resource_id)
         )
 
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
         if payload:
-            return _hermes_response_from_payload(payload)
+            return _hermes_response_from_payload(payload, resource_id=insight_id)
         return await super().get_hermes_insight(insight_id)
 
     async def confirm_hermes_insight(
@@ -5719,7 +5729,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not await self._upsert_admin_payload("hermes", insight_id, payload):
             return await super().confirm_hermes_insight(insight_id, actor_id=actor_id)
         await self._record_audit("hermes.confirm", f"hermes:{insight_id}", {"id": insight_id})
-        return _hermes_response_from_payload(payload)
+        return _hermes_response_from_payload(payload, resource_id=insight_id)
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
         deleted = await self._delete_admin_payload("hermes", insight_id)
@@ -6913,6 +6923,7 @@ def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
         "logical_models",
         "deployments",
         "suggested_action",
+        "possible_cause",
     ):
         value = diagnostic.get(key)
         if value is not None:
@@ -6984,6 +6995,7 @@ def _failure_diagnostic_from_run_events(
             "logical_models",
             "deployments",
             "suggested_action",
+            "possible_cause",
         }
     }
 
@@ -7138,7 +7150,13 @@ def _audit_response_from_payload(payload: dict[str, object]) -> AuditEventRespon
     )
 
 
-def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightResponse:
+def _is_cognitive_resource_id(resource_id: str) -> bool:
+    return resource_id.startswith(_COGNITIVE_RECORD_PREFIXES)
+
+
+def _hermes_response_from_payload(
+    payload: dict[str, object], *, resource_id: str | None = None
+) -> HermesInsightResponse:
     tags = payload.get("tags")
     raw_weight = payload.get("weight", 1)
     normalized_tags = [str(tag) for tag in tags] if isinstance(tags, list) else []
@@ -7159,8 +7177,9 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     run_id = _uuid_from_json(payload.get("run_id"))
     raw_conversation_id = payload.get("conversation_id")
     raw_confirmed_at = payload.get("confirmed_at")
+    response_id = resource_id if resource_id is not None else str(payload.get("id", ""))
     return HermesInsightResponse(
-        id=str(payload.get("id", "")),
+        id=response_id,
         user_id=str(payload.get("user_id", "")),
         memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
         category=category,

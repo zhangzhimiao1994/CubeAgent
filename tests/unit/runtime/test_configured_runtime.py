@@ -2,7 +2,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
@@ -227,10 +227,11 @@ class ProbeDiscussionRuntime(ProbeDispatchRuntime):
 
 
 class ProbeHybridRuntime(ProbeDispatchRuntime):
-    instances: ClassVar[list["ProbeDispatchRuntime"]] = []
+    instances: ClassVar[list[ProbeDispatchRuntime]] = []
 
     def __init__(self, dispatch: object, discussion: object, direct: object) -> None:
-        del dispatch, discussion, direct
+        del dispatch, discussion
+        self.direct: Any = direct
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
 
@@ -605,6 +606,76 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_uses_direct_model_for_final_synthesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "synthesis": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://synthesis",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.HYBRID,
+                request="Summarize the prior discussion.",
+                routing_decision={
+                    "main_agent_model": "main",
+                    "direct_model": "synthesis",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[0])
+    assert hybrid.direct._logical_model == "synthesis"
 
 
 @pytest.mark.asyncio

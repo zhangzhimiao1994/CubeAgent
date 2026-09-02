@@ -1234,6 +1234,7 @@ describe("operational management pages", () => {
             retryable: false,
             status_code: 401,
             suggested_action: "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
+            possible_cause: "API Key 失效、模型权限不足、供应商账号或 Base URL 配置不匹配。",
           },
         },
       ],
@@ -1248,6 +1249,7 @@ describe("operational management pages", () => {
     expect(screen.getByText("位置：模型供应商 / 认证或权限")).not.toBeNull();
     expect(screen.getByText("状态码：401")).not.toBeNull();
     expect(screen.getByText("可重试：否")).not.toBeNull();
+    expect(screen.getByText(/可能原因：API Key 失效/)).not.toBeNull();
     expect(screen.getByText(/检查模型 API Key/)).not.toBeNull();
   });
 
@@ -1274,6 +1276,7 @@ describe("operational management pages", () => {
             retryable: true,
             logical_models: "deepseek,backup",
             deployments: "deepseek-main,backup-main",
+            possible_cause: "目标模型部署并发已满、容量租约后端不可用、容量配置错误或健康状态被标记不可用。",
             suggested_action:
               "当前模型容量不可用：deepseek,backup；候选部署：deepseek-main,backup-main。可稍后重试、降低并发，或切换到可用模型。",
           },
@@ -1286,8 +1289,9 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "失败诊断" })).not.toBeNull();
     expect(screen.getByText("错误码：model.capacity_unavailable")).not.toBeNull();
-    expect(screen.getByText("不可用模型：deepseek,backup")).not.toBeNull();
-    expect(screen.getByText("候选部署：deepseek-main,backup-main")).not.toBeNull();
+    expect(screen.getByText("相关模型：deepseek,backup")).not.toBeNull();
+    expect(screen.getByText("相关部署：deepseek-main,backup-main")).not.toBeNull();
+    expect(screen.getByText(/可能原因：目标模型部署并发已满/)).not.toBeNull();
     expect(screen.getByText("可重试：是")).not.toBeNull();
   });
 
@@ -2023,6 +2027,9 @@ describe("operational management pages", () => {
             error_category: "transport",
             error_code: "model.provider_transport_failed",
             retryable: true,
+            logical_models: "deepseek",
+            deployments: "deepseek-main",
+            possible_cause: "网络连接失败、供应商连接被重置、DNS/TLS/代理异常，或上游未返回可解析状态码。",
             suggested_action: "检查 API Base、网络连通性和供应商状态。",
           },
         },
@@ -2042,6 +2049,9 @@ describe("operational management pages", () => {
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
     expect(within(stream).getByText(/错误码：model\.provider_transport_failed/)).not.toBeNull();
     expect(within(stream).getByText(/位置：模型供应商 \/ 网络连接/)).not.toBeNull();
+    expect(within(stream).getByText(/相关模型：deepseek/)).not.toBeNull();
+    expect(within(stream).getByText(/相关部署：deepseek-main/)).not.toBeNull();
+    expect(within(stream).getByText(/可能原因：网络连接失败/)).not.toBeNull();
     expect(within(stream).getByText(/建议：检查 API Base/)).not.toBeNull();
   });
 

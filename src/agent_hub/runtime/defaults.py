@@ -537,6 +537,7 @@ class ConfigBackedHybridRuntime:
             capacity_factory=self._capacity_factory,
             transport=self._transport,
         )
+        synthesis_logical_model = _direct_logical_model(config, context.routing_decision)
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
         high_risk = _high_risk_task(context.request)
@@ -640,10 +641,10 @@ class ConfigBackedHybridRuntime:
                     discussion_plan,
                     capability_gateway=self._capability_gateway,
                 ),
-                DirectRuntime(gateway, logical_model=logical_model),
+                DirectRuntime(gateway, logical_model=synthesis_logical_model),
             ),
             mode=TaskMode.HYBRID,
-            main_agent_model=logical_model,
+            main_agent_model=synthesis_logical_model,
             roles=_hybrid_role_payload(dispatch_plan, discussion_plan),
             steps=(
                 *_dispatch_step_payload(dispatch_plan),

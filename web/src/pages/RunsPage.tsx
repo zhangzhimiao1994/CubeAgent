@@ -466,10 +466,12 @@ function eventPayloadLabel(key: string) {
     critic_opinion: "审查员意见",
     model: "调用模型",
     logical_model: "逻辑模型",
+    logical_models: "相关模型",
     model_used: "调用模型",
     model_provider: "模型服务商",
     model_deployment: "模型部署",
     deployment: "模型部署",
+    deployments: "相关部署",
     provider: "服务商",
     role: "角色",
     agent: "Agent",
@@ -486,6 +488,7 @@ function eventPayloadLabel(key: string) {
     retryable: "是否可重试",
     status_code: "上游状态码",
     suggested_action: "建议处理",
+    possible_cause: "可能原因",
     upstream_model: "上游模型",
   };
   if (labels[key]) return labels[key];
@@ -498,16 +501,19 @@ function eventPayloadLabel(key: string) {
 function orderedEventPayloadEntries(payload: Record<string, unknown>) {
   const priority = [
     "logical_model",
+    "logical_models",
     "model",
     "upstream_model",
     "provider",
     "deployment",
+    "deployments",
     "error_summary",
     "error_code",
     "error_stage",
     "error_category",
     "status_code",
     "retryable",
+    "possible_cause",
     "suggested_action",
     "role",
     "agent",
@@ -981,6 +987,9 @@ function failedEventSummary(event: RunDetail["events"][number]) {
   const category = payloadText(event.payload, "error_category");
   const statusCode = payloadNumberValue(event.payload, "status_code");
   const retryable = payloadBooleanValue(event.payload, "retryable");
+  const logicalModels = payloadText(event.payload, "logical_models");
+  const deployments = payloadText(event.payload, "deployments");
+  const possibleCause = payloadText(event.payload, "possible_cause");
   const suggestedAction = payloadText(event.payload, "suggested_action");
   const parts = [`原因：${summary || "未记录具体原因"}`];
   if (code) parts.push(`错误码：${code}`);
@@ -988,7 +997,10 @@ function failedEventSummary(event: RunDetail["events"][number]) {
   const categoryLabel = errorCategoryLabel(category);
   if (stageLabel || categoryLabel) parts.push(`位置：${[stageLabel, categoryLabel].filter(Boolean).join(" / ")}`);
   if (statusCode !== null) parts.push(`状态码：${statusCode}`);
+  if (logicalModels) parts.push(`相关模型：${logicalModels}`);
+  if (deployments) parts.push(`相关部署：${deployments}`);
   if (retryable !== null) parts.push(`可重试：${retryable ? "是" : "否"}`);
+  if (possibleCause) parts.push(`可能原因：${possibleCause}`);
   if (suggestedAction) parts.push(`建议：${suggestedAction}`);
   return parts.join("\n");
 }
