@@ -97,4 +97,4 @@
 - [x] Ensure `HANDOFF.md` is local-only and not staged.
 - [x] Push to `https://github.com/zhangzhimiao1994/CubeAgent`.
 - [x] Check GitHub Actions until success.
-- [x] Skip production deployment for this slice per user instruction.
+- [x] Deploy to `prod-web-01`, run feature-specific production probes, and keep only the active release on the server.
