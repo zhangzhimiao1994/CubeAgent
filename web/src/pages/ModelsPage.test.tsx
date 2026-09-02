@@ -594,6 +594,51 @@ describe("ModelsPage", () => {
     });
   });
 
+  it("lets admins configure multi-capability multimedia generators without normal chat capabilities", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    await user.selectOptions(view.container.querySelector("#model-category") as HTMLSelectElement, "multimedia");
+
+    const providerSelect = screen.getByLabelText("服务商") as HTMLSelectElement;
+    expect(Array.from(providerSelect.options).map((option) => option.value)).toContain("openai-audio");
+    expect(Array.from(providerSelect.options).map((option) => option.value)).toContain("alibaba-token-plan-media");
+    await user.selectOptions(providerSelect, "custom");
+    await user.type(screen.getByLabelText("自定义服务商"), "media-provider");
+    await user.type(screen.getByLabelText("自定义模型"), "omni-media-1");
+    await user.clear(screen.getByLabelText("API Base"));
+    await user.type(screen.getByLabelText("API Base"), "https://media.example.com");
+    await user.clear(screen.getByLabelText("逻辑模型名"));
+    await user.type(screen.getByLabelText("逻辑模型名"), "omni_media");
+    expect(screen.getByText("一个模型可以同时承担图片、视频或音频生成；按真实支持能力勾选，系统运行时按能力匹配。")).not.toBeNull();
+    expect(screen.getByText("当前保存能力：视频生成")).not.toBeNull();
+    expect(screen.queryByText(/\/v1\/chat\/completions/)).toBeNull();
+    expect(screen.getByText("OpenAI-compatible（生成 API 基础地址）")).not.toBeNull();
+    expect(view.container.querySelector('input[value="text"]')).toBeNull();
+    expect(view.container.querySelector('input[value="vision"]')).toBeNull();
+    expect(view.container.querySelector('input[value="audio"]')).toBeNull();
+    expect(view.container.querySelector('input[value="tool_calling"]')).toBeNull();
+
+    await user.click(screen.getByLabelText("图片生成"));
+    expect(screen.getByText("当前保存能力：图片生成、视频生成")).not.toBeNull();
+    await user.type(screen.getByLabelText("API Key"), "sk-omni-media");
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await screen.findByText(/secret_created/);
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: expect.objectContaining({
+        provider: "media-provider",
+        upstream_model: "omni-media-1",
+        logical_model: "omni_media",
+        capabilities: ["video_generation", "image_generation"],
+        quota_scope: "media-provider-account",
+      }),
+    });
+  });
+
   it("offers verified Seedance video model ids and keeps Seedance 2.5 as manual configuration", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/models" />);

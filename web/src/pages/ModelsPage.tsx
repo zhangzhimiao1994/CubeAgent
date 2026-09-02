@@ -447,6 +447,11 @@ const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
   anthropic_messages: "Anthropic Messages / Claude Code API（/v1/messages）",
 };
 
+const MULTIMEDIA_API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
+  openai_compatible: "OpenAI-compatible（生成 API 基础地址）",
+  anthropic_messages: "Anthropic Messages（仅限明确支持的中转）",
+};
+
 function toPositiveNumber(value: string, fallback: number) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -484,6 +489,12 @@ function normalizeApiBase(value: string, apiProtocol: ApiProtocol) {
 
 function displayCapability(capability: string) {
   return ALL_CAPABILITIES.find((item) => item.value === capability)?.label ?? capability;
+}
+
+function displayApiProtocol(apiProtocol: ApiProtocol, isMultimediaModel: boolean) {
+  return isMultimediaModel
+    ? MULTIMEDIA_API_PROTOCOL_LABELS[apiProtocol]
+    : API_PROTOCOL_LABELS[apiProtocol];
 }
 
 function displaySaturationPolicy(policy: string) {
@@ -562,6 +573,14 @@ function savedModelCategoryLabel(model: ModelDeployment) {
 
 function modelCapabilitiesText(model: ModelDeployment) {
   return model.capabilities.map(displayCapability).join("、");
+}
+
+function orderedCapabilityLabels(capabilities: string[], options: Array<{ label: string; value: string }>) {
+  const selected = new Set(capabilities);
+  const ordered = options
+    .filter((option) => selected.has(option.value))
+    .map((option) => option.label);
+  return ordered.length > 0 ? ordered.join("、") : "未选择";
 }
 
 function matchesModelSearch(model: ModelDeployment, searchTerm: string) {
@@ -646,6 +665,7 @@ export function ModelsPage() {
   const isFreeformProvider = selectedProviderPreset?.modelEntryMode === "freeform";
   const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
   const canChooseProtocol = isCustomProvider || isFreeformProvider;
+  const isMultimediaModel = modelCategory === "multimedia";
   const requestedMaxConcurrency = Math.max(1, Math.floor(toPositiveNumber(maxConcurrency, 1)));
   const previewEffectiveSlots = effectiveModelSlots(requestedMaxConcurrency);
   const maxConcurrencyForTwoSlots = concurrencyNeededForSlots(2);
@@ -710,7 +730,11 @@ export function ModelsPage() {
       return { model, credentialRef };
     },
     onSuccess: async ({ model, credentialRef }) => {
-      setSaveMessage(`模型已通过可用性测试并${editingModel ? "更新" : "保存"}，Key 引用：${credentialRef}`);
+      setSaveMessage(
+        isMultimediaModel
+          ? `多媒体模型配置已${editingModel ? "更新" : "保存"}，生成实测请使用对应图片、视频或音频任务。Key 引用：${credentialRef}`
+          : `模型已通过可用性测试并${editingModel ? "更新" : "保存"}，Key 引用：${credentialRef}`,
+      );
       queryClient.setQueryData<ModelDeployment[]>(["models"], (current) => {
         if (!current) return [model];
         const existingIndex = current.findIndex((item) => item.id === model.id);
@@ -853,7 +877,11 @@ export function ModelsPage() {
   const filteredSavedModels = savedModels.filter((model) => matchesModelSearch(model, modelSearchTerm) && matchesModelColumns(model, modelColumnFilters));
   const visibleSavedModels = sortedSavedModels(filteredSavedModels, modelSort);
   const protocolHint =
-    apiProtocol === "anthropic_messages"
+    isMultimediaModel && apiProtocol === "anthropic_messages"
+      ? "只有当中转站明确要求 Anthropic Messages 兼容协议时才选择此项；多数多媒体生成接口使用服务商自己的生成 API 地址。"
+      : isMultimediaModel
+        ? "OpenAI-compatible 在多媒体配置中只表示 Base URL/鉴权兼容习惯，不代表聊天补全接口；真实调用由图片、视频或音频生成执行器按能力处理。"
+        : apiProtocol === "anthropic_messages"
       ? "Claude Code API 管理工具（例如 CC-Switch）如果显示 Anthropic Messages 兼容接口，请填写根域名、/v1 或完整 /v1/messages；保存前会统一成 /v1/messages。"
       : "OpenAI-compatible 聚合 API 通常填写根域名或 /v1；如果粘贴 /v1/chat/completions，保存前会自动修正为 /v1。";
 
@@ -861,7 +889,11 @@ export function ModelsPage() {
     <section>
       <p className="eyebrow">Model control</p>
       <h2>模型与 API</h2>
-      <p>保存模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。</p>
+      <p>
+        {isMultimediaModel
+          ? "多媒体模型先保存生成能力配置；真实可用性通过对应图片、视频或音频任务实测。"
+          : "保存普通模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。"}
+      </p>
       <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
 
       <article {...navTargetProps("presets")}>
@@ -895,6 +927,11 @@ export function ModelsPage() {
           </p>
         ) : null}
         <p>先选择模型大类：普通模型用于对话、图片/语音理解、工具调用和结构化输出；多媒体 AI 用于图片、视频和音频生成。</p>
+        {isMultimediaModel ? (
+          <p className="field-hint">
+            多媒体模型保存时只登记服务商、模型 ID、Key 和生成能力，不用聊天补全探测；保存后可用对应图片、视频或音频任务做真实生成实测。
+          </p>
+        ) : null}
 
         <label htmlFor="model-category">模型大类</label>
         <select
@@ -978,13 +1015,13 @@ export function ModelsPage() {
             >
               {Object.entries(API_PROTOCOL_LABELS).map(([value, label]) => (
                 <option key={value} value={value}>
-                  {label}
+                  {displayApiProtocol(value as ApiProtocol, isMultimediaModel)}
                 </option>
               ))}
             </select>
           </label>
         ) : (
-          <p className="field-hint">官方预设已内置接口类型：{API_PROTOCOL_LABELS[apiProtocol]}。</p>
+          <p className="field-hint">官方预设已内置接口类型：{displayApiProtocol(apiProtocol, isMultimediaModel)}。</p>
         )}
 
         <label htmlFor="api-base">API Base</label>
@@ -996,7 +1033,9 @@ export function ModelsPage() {
           required
         />
         <p className="field-hint">
-          中转站可以填写根域名、/v1 或 /v1/messages；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。
+          {isMultimediaModel
+            ? "多媒体服务商通常有独立生成接口；这里填写服务商或中转站要求的根地址，系统保存时只做地址规范化，不按聊天接口探测。"
+            : "中转站可以填写根域名、/v1 或 /v1/messages；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。"}
         </p>
         <p className="field-hint">{protocolHint}</p>
 
@@ -1028,7 +1067,15 @@ export function ModelsPage() {
         />
 
         <fieldset {...navTargetProps("capabilities")}>
-          <legend>能力</legend>
+          <legend>{isMultimediaModel ? "生成能力" : "能力"}</legend>
+          {isMultimediaModel ? (
+            <>
+              <p className="field-hint">
+                一个模型可以同时承担图片、视频或音频生成；按真实支持能力勾选，系统运行时按能力匹配。
+              </p>
+              <p className="field-hint">当前保存能力：{orderedCapabilityLabels(capabilities, MULTIMEDIA_CAPABILITIES)}</p>
+            </>
+          ) : null}
           {capabilityOptions.map((capability) => (
             <label key={capability.value}>
               <input
@@ -1066,7 +1113,17 @@ export function ModelsPage() {
         <input id="tpm" type="number" min="1" value={tpm} onChange={(event) => setTpm(event.target.value)} />
 
         <button type="submit" disabled={saveModel.isPending}>
-          {saveModel.isPending ? "测试并保存中..." : editingModel ? "测试并更新模型" : "测试并保存模型"}
+          {saveModel.isPending
+            ? isMultimediaModel
+              ? "保存多媒体配置中..."
+              : "测试并保存中..."
+            : isMultimediaModel
+              ? editingModel
+                ? "更新多媒体模型配置"
+                : "保存多媒体模型配置"
+              : editingModel
+                ? "测试并更新模型"
+                : "测试并保存模型"}
         </button>
         {editingModel ? (
           <button type="button" onClick={cancelEdit} disabled={saveModel.isPending}>
