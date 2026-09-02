@@ -31,7 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
-from agent_hub.cognitive.types import CognitiveMemoryScope, ExperienceKind, ExperienceStatus
+from agent_hub.cognitive.types import (
+    CognitiveMemoryScope,
+    ExperienceKind,
+    ExperienceStatus,
+    OutcomeVerdict,
+    StrategyStatus,
+)
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -1683,6 +1689,9 @@ class HermesRecommendationResponse(BaseModel):
 
 _HERMES_BULK_ACTION_LIMIT = 1000
 _COGNITIVE_EXPERIENCE_PREFIX = "cognitive_experience:"
+_COGNITIVE_STRATEGY_PREFIX = "cognitive_strategy:"
+_COGNITIVE_REFLECTION_PREFIX = "cognitive_reflection:"
+_COGNITIVE_OUTCOME_PREFIX = "cognitive_outcome:"
 
 
 def _clean_cognitive_text(value: str) -> str:
@@ -1826,6 +1835,86 @@ class CognitiveExperienceResponse(BaseModel):
     updated_at: datetime
     storage_kind: str = "hermes"
     resource_id: str
+
+
+class CognitiveStrategyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    user_id: str
+    memory_scope: CognitiveMemoryScope
+    name: str
+    context: str
+    strategy: str
+    rationale: str
+    status: StrategyStatus
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[CognitiveEvidencePayload]
+    contradictions: list[CognitiveEvidencePayload]
+    tags: list[str]
+    applies_to_modes: list[str]
+    applies_to_agents: list[str]
+    use_count: int = Field(ge=0)
+    success_count: int = Field(ge=0)
+    failure_count: int = Field(ge=0)
+    active_for_runtime: bool
+    last_used_at: datetime | None
+    last_verified_at: datetime | None
+    version: int = Field(ge=1)
+    created_at: datetime
+    updated_at: datetime
+    storage_kind: str = "hermes"
+    resource_id: str
+
+
+class CognitiveReflectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    user_id: str
+    memory_scope: CognitiveMemoryScope
+    source_run_id: str
+    trigger: str
+    outcome: str
+    causal_analysis: str
+    counterfactual: str
+    positive_patterns: list[str]
+    negative_patterns: list[str]
+    proposed_experience_ids: list[str]
+    confidence: float = Field(ge=0, le=1)
+    created_at: datetime
+    storage_kind: str = "hermes"
+    resource_id: str
+
+
+class CognitiveOutcomeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    user_id: str
+    memory_scope: CognitiveMemoryScope
+    source_run_id: str
+    target_type: str
+    target_id: str
+    verdict: OutcomeVerdict
+    note: str
+    evidence: list[CognitiveEvidencePayload]
+    confidence_delta: float = Field(ge=-1, le=1)
+    created_at: datetime
+    storage_kind: str = "hermes"
+    resource_id: str
+
+
+class CognitiveGovernanceMetadataResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    experience_count: int = Field(ge=0)
+    strategy_count: int = Field(ge=0)
+    reflection_count: int = Field(ge=0)
+    outcome_count: int = Field(ge=0)
+    candidate_experience_count: int = Field(ge=0)
+    active_strategy_count: int = Field(ge=0)
+    failure_outcome_count: int = Field(ge=0)
 
 
 class AdminResourceService(Protocol):
@@ -2076,6 +2165,14 @@ class AdminResourceService(Protocol):
 
     async def list_cognitive_experiences(self) -> tuple[CognitiveExperienceResponse, ...]: ...
 
+    async def list_cognitive_strategies(self) -> tuple[CognitiveStrategyResponse, ...]: ...
+
+    async def list_cognitive_reflections(self) -> tuple[CognitiveReflectionResponse, ...]: ...
+
+    async def list_cognitive_outcomes(self) -> tuple[CognitiveOutcomeResponse, ...]: ...
+
+    async def cognitive_governance_metadata(self) -> CognitiveGovernanceMetadataResponse: ...
+
     async def create_cognitive_experience(
         self, request: CognitiveExperienceCreateRequest, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse: ...
@@ -2084,9 +2181,15 @@ class AdminResourceService(Protocol):
         self, experience_id: UUID, *, actor_id: UUID | None = None
     ) -> CognitiveExperienceResponse: ...
 
+    async def confirm_cognitive_strategy(
+        self, strategy_id: UUID, *, actor_id: UUID | None = None
+    ) -> CognitiveStrategyResponse: ...
+
     async def reject_cognitive_experience(
         self, experience_id: UUID
     ) -> CognitiveExperienceResponse: ...
+
+    async def reject_cognitive_strategy(self, strategy_id: UUID) -> CognitiveStrategyResponse: ...
 
     async def delete_cognitive_experience(self, experience_id: UUID) -> None: ...
 
@@ -2835,6 +2938,9 @@ class InMemoryAdminResourceService:
     logs: list[LogEntryResponse] = field(default_factory=list)
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
     cognitive_experiences: dict[str, CognitiveExperienceResponse] = field(default_factory=dict)
+    cognitive_strategies: dict[str, CognitiveStrategyResponse] = field(default_factory=dict)
+    cognitive_reflections: dict[str, CognitiveReflectionResponse] = field(default_factory=dict)
+    cognitive_outcomes: dict[str, CognitiveOutcomeResponse] = field(default_factory=dict)
     openclaw_operations: dict[str, OpenClawOperationResponse] = field(default_factory=dict)
     openclaw_sessions: dict[str, OpenClawSessionResponse] = field(default_factory=dict)
     evolution_runs: dict[str, EvolutionRunResponse] = field(default_factory=dict)
@@ -3938,6 +4044,34 @@ class InMemoryAdminResourceService:
             sorted(self.cognitive_experiences.values(), key=lambda item: item.created_at)
         )
 
+    async def list_cognitive_strategies(self) -> tuple[CognitiveStrategyResponse, ...]:
+        return tuple(sorted(self.cognitive_strategies.values(), key=lambda item: item.created_at))
+
+    async def list_cognitive_reflections(self) -> tuple[CognitiveReflectionResponse, ...]:
+        return tuple(sorted(self.cognitive_reflections.values(), key=lambda item: item.created_at))
+
+    async def list_cognitive_outcomes(self) -> tuple[CognitiveOutcomeResponse, ...]:
+        return tuple(sorted(self.cognitive_outcomes.values(), key=lambda item: item.created_at))
+
+    async def cognitive_governance_metadata(self) -> CognitiveGovernanceMetadataResponse:
+        experiences = await self.list_cognitive_experiences()
+        strategies = await self.list_cognitive_strategies()
+        reflections = await self.list_cognitive_reflections()
+        outcomes = await self.list_cognitive_outcomes()
+        return CognitiveGovernanceMetadataResponse(
+            experience_count=len(experiences),
+            strategy_count=len(strategies),
+            reflection_count=len(reflections),
+            outcome_count=len(outcomes),
+            candidate_experience_count=sum(
+                1 for item in experiences if item.status is ExperienceStatus.CANDIDATE
+            ),
+            active_strategy_count=sum(1 for item in strategies if item.status is StrategyStatus.ACTIVE),
+            failure_outcome_count=sum(
+                1 for item in outcomes if item.verdict is OutcomeVerdict.FAILURE
+            ),
+        )
+
     async def create_cognitive_experience(
         self,
         request: CognitiveExperienceCreateRequest,
@@ -3973,6 +4107,21 @@ class InMemoryAdminResourceService:
         self.cognitive_experiences[str(experience_id)] = updated
         return updated
 
+    async def confirm_cognitive_strategy(
+        self, strategy_id: UUID, *, actor_id: UUID | None = None
+    ) -> CognitiveStrategyResponse:
+        del actor_id
+        current = self.cognitive_strategies[str(strategy_id)]
+        updated = current.model_copy(
+            update={
+                "status": StrategyStatus.ACTIVE,
+                "active_for_runtime": True,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.cognitive_strategies[str(strategy_id)] = updated
+        return updated
+
     async def reject_cognitive_experience(
         self, experience_id: UUID
     ) -> CognitiveExperienceResponse:
@@ -3985,6 +4134,18 @@ class InMemoryAdminResourceService:
             }
         )
         self.cognitive_experiences[str(experience_id)] = updated
+        return updated
+
+    async def reject_cognitive_strategy(self, strategy_id: UUID) -> CognitiveStrategyResponse:
+        current = self.cognitive_strategies[str(strategy_id)]
+        updated = current.model_copy(
+            update={
+                "status": StrategyStatus.REJECTED,
+                "active_for_runtime": False,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.cognitive_strategies[str(strategy_id)] = updated
         return updated
 
     async def delete_cognitive_experience(self, experience_id: UUID) -> None:
@@ -5679,6 +5840,39 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             responses.append(_cognitive_experience_from_payload(payload, resource_id=resource_id))
         return tuple(sorted(responses, key=lambda item: item.created_at))
 
+    async def list_cognitive_strategies(self) -> tuple[CognitiveStrategyResponse, ...]:
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
+            return await super().list_cognitive_strategies()
+        responses: list[CognitiveStrategyResponse] = []
+        for resource_id, payload, _created_at, _updated_at in rows:
+            if resource_id.startswith(_COGNITIVE_STRATEGY_PREFIX):
+                responses.append(_cognitive_strategy_from_payload(payload, resource_id=resource_id))
+        return tuple(sorted(responses, key=lambda item: item.created_at))
+
+    async def list_cognitive_reflections(self) -> tuple[CognitiveReflectionResponse, ...]:
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
+            return await super().list_cognitive_reflections()
+        responses: list[CognitiveReflectionResponse] = []
+        for resource_id, payload, _created_at, _updated_at in rows:
+            if resource_id.startswith(_COGNITIVE_REFLECTION_PREFIX):
+                responses.append(_cognitive_reflection_from_payload(payload, resource_id=resource_id))
+        return tuple(sorted(responses, key=lambda item: item.created_at))
+
+    async def list_cognitive_outcomes(self) -> tuple[CognitiveOutcomeResponse, ...]:
+        rows = await self._list_admin_payloads_with_metadata("hermes")
+        if rows is None:
+            return await super().list_cognitive_outcomes()
+        responses: list[CognitiveOutcomeResponse] = []
+        for resource_id, payload, _created_at, _updated_at in rows:
+            if resource_id.startswith(_COGNITIVE_OUTCOME_PREFIX):
+                responses.append(_cognitive_outcome_from_payload(payload, resource_id=resource_id))
+        return tuple(sorted(responses, key=lambda item: item.created_at))
+
+    async def cognitive_governance_metadata(self) -> CognitiveGovernanceMetadataResponse:
+        return await super().cognitive_governance_metadata()
+
     async def create_cognitive_experience(
         self,
         request: CognitiveExperienceCreateRequest,
@@ -5724,6 +5918,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         return updated
 
+    async def confirm_cognitive_strategy(
+        self, strategy_id: UUID, *, actor_id: UUID | None = None
+    ) -> CognitiveStrategyResponse:
+        del actor_id
+        current = await self._get_cognitive_strategy(strategy_id)
+        updated = current.model_copy(
+            update={
+                "status": StrategyStatus.ACTIVE,
+                "active_for_runtime": True,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
+        await self._record_audit(
+            "cognitive.strategy.confirm",
+            updated.resource_id,
+            {"id": updated.id},
+        )
+        return updated
+
     async def reject_cognitive_experience(
         self, experience_id: UUID
     ) -> CognitiveExperienceResponse:
@@ -5738,6 +5952,23 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
         await self._record_audit(
             "cognitive.experience.reject",
+            updated.resource_id,
+            {"id": updated.id},
+        )
+        return updated
+
+    async def reject_cognitive_strategy(self, strategy_id: UUID) -> CognitiveStrategyResponse:
+        current = await self._get_cognitive_strategy(strategy_id)
+        updated = current.model_copy(
+            update={
+                "status": StrategyStatus.REJECTED,
+                "active_for_runtime": False,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await self._upsert_admin_payload("hermes", updated.resource_id, updated.model_dump(mode="json"))
+        await self._record_audit(
+            "cognitive.strategy.reject",
             updated.resource_id,
             {"id": updated.id},
         )
@@ -5762,6 +5993,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             payload,
             resource_id=_cognitive_experience_resource_id(experience_id),
         )
+
+    async def _get_cognitive_strategy(self, strategy_id: UUID) -> CognitiveStrategyResponse:
+        resource_id = _cognitive_strategy_resource_id(strategy_id)
+        payload = await self._get_admin_payload("hermes", resource_id)
+        if not payload:
+            raise KeyError(str(strategy_id))
+        return _cognitive_strategy_from_payload(payload, resource_id=resource_id)
 
     async def _mode_error_logs_from_repository(self) -> tuple[LogEntryResponse, ...]:
         if self._run_repository is None:
@@ -7187,6 +7425,128 @@ def _cognitive_experience_from_payload(
         storage_kind="hermes",
         resource_id=resource_id,
     )
+
+
+def _cognitive_strategy_from_payload(
+    payload: dict[str, object],
+    *,
+    resource_id: str,
+) -> CognitiveStrategyResponse:
+    raw_id = payload.get("id")
+    strategy_id = raw_id if isinstance(raw_id, str) and raw_id else resource_id.removeprefix(
+        _COGNITIVE_STRATEGY_PREFIX
+    )
+    status = _strategy_status_from_payload(payload.get("status"))
+    return CognitiveStrategyResponse(
+        id=strategy_id,
+        user_id=str(payload.get("user_id", "")),
+        memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
+        name=str(payload.get("name", ""))[:128] or "未命名策略",
+        context=str(payload.get("context", ""))[:512] or "暂无适用上下文。",
+        strategy=str(payload.get("strategy", ""))[:1200] or "暂无策略内容。",
+        rationale=str(payload.get("rationale", ""))[:512] or "暂无依据。",
+        status=status,
+        confidence=_float_from_payload(payload.get("confidence"), default=0.0),
+        evidence=_cognitive_evidence_payloads(payload.get("evidence")),
+        contradictions=_cognitive_evidence_payloads(payload.get("contradictions")),
+        tags=_string_list_from_payload(payload.get("tags"), limit=24),
+        applies_to_modes=_string_list_from_payload(payload.get("applies_to_modes"), limit=12),
+        applies_to_agents=_string_list_from_payload(payload.get("applies_to_agents"), limit=24),
+        use_count=_int_from_payload(payload.get("use_count")),
+        success_count=_int_from_payload(payload.get("success_count")),
+        failure_count=_int_from_payload(payload.get("failure_count")),
+        active_for_runtime=status is StrategyStatus.ACTIVE,
+        last_used_at=_datetime_from_json(payload.get("last_used_at"))
+        if payload.get("last_used_at")
+        else None,
+        last_verified_at=_datetime_from_json(payload.get("last_verified_at"))
+        if payload.get("last_verified_at")
+        else None,
+        version=_int_from_payload(payload.get("version"), default=1) or 1,
+        created_at=_datetime_from_json(payload.get("created_at")),
+        updated_at=_datetime_from_json(payload.get("updated_at")),
+        storage_kind="hermes",
+        resource_id=resource_id,
+    )
+
+
+def _cognitive_reflection_from_payload(
+    payload: dict[str, object],
+    *,
+    resource_id: str,
+) -> CognitiveReflectionResponse:
+    raw_id = payload.get("id")
+    reflection_id = raw_id if isinstance(raw_id, str) and raw_id else resource_id.removeprefix(
+        _COGNITIVE_REFLECTION_PREFIX
+    )
+    return CognitiveReflectionResponse(
+        id=reflection_id,
+        user_id=str(payload.get("user_id", "")),
+        memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
+        source_run_id=str(payload.get("source_run_id", ""))[:128] or "unknown-run",
+        trigger=str(payload.get("trigger", ""))[:64] or "unknown",
+        outcome=str(payload.get("outcome", ""))[:32] or "unknown",
+        causal_analysis=str(payload.get("causal_analysis", ""))[:1200] or "暂无因果反思。",
+        counterfactual=str(payload.get("counterfactual", ""))[:1200],
+        positive_patterns=_string_list_from_payload(payload.get("positive_patterns"), limit=24),
+        negative_patterns=_string_list_from_payload(payload.get("negative_patterns"), limit=24),
+        proposed_experience_ids=_string_list_from_payload(
+            payload.get("proposed_experience_ids"),
+            limit=24,
+        ),
+        confidence=_float_from_payload(payload.get("confidence"), default=0.0),
+        created_at=_datetime_from_json(payload.get("created_at")),
+        storage_kind="hermes",
+        resource_id=resource_id,
+    )
+
+
+def _cognitive_outcome_from_payload(
+    payload: dict[str, object],
+    *,
+    resource_id: str,
+) -> CognitiveOutcomeResponse:
+    raw_id = payload.get("id")
+    outcome_id = raw_id if isinstance(raw_id, str) and raw_id else resource_id.removeprefix(
+        _COGNITIVE_OUTCOME_PREFIX
+    )
+    return CognitiveOutcomeResponse(
+        id=outcome_id,
+        user_id=str(payload.get("user_id", "")),
+        memory_scope=_cognitive_memory_scope_from_payload(payload.get("memory_scope")),
+        source_run_id=str(payload.get("source_run_id", ""))[:128] or "unknown-run",
+        target_type=str(payload.get("target_type", ""))[:64] or "run",
+        target_id=str(payload.get("target_id", ""))[:160] or outcome_id,
+        verdict=_outcome_verdict_from_payload(payload.get("verdict")),
+        note=str(payload.get("note", ""))[:512] or "暂无结果说明。",
+        evidence=_cognitive_evidence_payloads(payload.get("evidence")),
+        confidence_delta=_float_from_payload(payload.get("confidence_delta"), default=0.0),
+        created_at=_datetime_from_json(payload.get("created_at")),
+        storage_kind="hermes",
+        resource_id=resource_id,
+    )
+
+
+def _strategy_status_from_payload(value: object) -> StrategyStatus:
+    if isinstance(value, str):
+        try:
+            return StrategyStatus(value)
+        except ValueError:
+            return StrategyStatus.CANDIDATE
+    return StrategyStatus.CANDIDATE
+
+
+def _outcome_verdict_from_payload(value: object) -> OutcomeVerdict:
+    if isinstance(value, str):
+        try:
+            return OutcomeVerdict(value)
+        except ValueError:
+            return OutcomeVerdict.INSUFFICIENT_EVIDENCE
+    return OutcomeVerdict.INSUFFICIENT_EVIDENCE
+
+
+def _cognitive_strategy_resource_id(strategy_id: UUID | str) -> str:
+    return f"{_COGNITIVE_STRATEGY_PREFIX}{strategy_id}"
 
 
 def _is_confirmed_conversation_hermes_insight(insight: HermesInsightResponse) -> bool:
@@ -9781,6 +10141,19 @@ async def recommend_with_hermes(
 
 
 @router.get(
+    "/cognitive/governance",
+    response_model=CognitiveGovernanceMetadataResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def cognitive_governance_metadata(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveGovernanceMetadataResponse:
+    _require(principal, "hermes:read")
+    return await service.cognitive_governance_metadata()
+
+
+@router.get(
     "/cognitive/experiences",
     response_model=list[CognitiveExperienceResponse],
     responses=error_responses(401, 403, 422),
@@ -9791,6 +10164,45 @@ async def list_cognitive_experiences(
 ) -> list[CognitiveExperienceResponse]:
     _require(principal, "hermes:read")
     return list(await service.list_cognitive_experiences())
+
+
+@router.get(
+    "/cognitive/strategies",
+    response_model=list[CognitiveStrategyResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_cognitive_strategies(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[CognitiveStrategyResponse]:
+    _require(principal, "hermes:read")
+    return list(await service.list_cognitive_strategies())
+
+
+@router.get(
+    "/cognitive/reflections",
+    response_model=list[CognitiveReflectionResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_cognitive_reflections(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[CognitiveReflectionResponse]:
+    _require(principal, "hermes:read")
+    return list(await service.list_cognitive_reflections())
+
+
+@router.get(
+    "/cognitive/outcomes",
+    response_model=list[CognitiveOutcomeResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_cognitive_outcomes(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[CognitiveOutcomeResponse]:
+    _require(principal, "hermes:read")
+    return list(await service.list_cognitive_outcomes())
 
 
 @router.post(
@@ -9829,6 +10241,27 @@ async def confirm_cognitive_experience(
 
 
 @router.post(
+    "/cognitive/strategies/{strategy_id}/confirm",
+    response_model=CognitiveStrategyResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def confirm_cognitive_strategy(
+    strategy_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveStrategyResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.confirm_cognitive_strategy(strategy_id, actor_id=principal.user_id)
+    except KeyError:
+        raise PublicAPIError(
+            404,
+            "cognitive_strategy_not_found",
+            "Cognitive strategy was not found",
+        ) from None
+
+
+@router.post(
     "/cognitive/experiences/{experience_id}/reject",
     response_model=CognitiveExperienceResponse,
     responses=error_responses(401, 403, 404, 422),
@@ -9846,6 +10279,27 @@ async def reject_cognitive_experience(
             404,
             "cognitive_experience_not_found",
             "Cognitive experience was not found",
+        ) from None
+
+
+@router.post(
+    "/cognitive/strategies/{strategy_id}/reject",
+    response_model=CognitiveStrategyResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def reject_cognitive_strategy(
+    strategy_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> CognitiveStrategyResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.reject_cognitive_strategy(strategy_id)
+    except KeyError:
+        raise PublicAPIError(
+            404,
+            "cognitive_strategy_not_found",
+            "Cognitive strategy was not found",
         ) from None
 
 

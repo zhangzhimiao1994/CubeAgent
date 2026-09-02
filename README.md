@@ -200,6 +200,14 @@ Long conversations are handled by the conversation framework. When the history a
 
 Hermes learning is not the same as raw chat history. A learning record first lands in the Hermes ledger with a Chinese one-line summary. Reusable Cognitive experiences are separate candidates and only affect future runs after confirmation. Runtime guidance is scoped: `用户记忆` applies only to the same user, while `根记忆` applies across users in the same tenant.
 
+## Cognitive Learning And Governance
+
+Cube Agent uses Hermes for conversation learning and a separate Cognitive layer for reusable experience. Runtime outcomes are assessed by the Outcome Critic, then reflected into candidate experiences or strategies only when there is enough evidence. Important records keep provenance, confidence, usage counts, success/failure counts, contradictions, scope, and version metadata.
+
+The default learning policy is candidate-first: new experiences and strategies can be collected automatically, but they should be reviewed before becoming active runtime guidance. Reflection can update ordinary experience quality, but it cannot modify core persona/SOUL, safety policy, model permissions, or tool permissions.
+
+The runtime does not inject all memory into the prompt. It builds a bounded working set from user-scoped confirmed memory plus confirmed root memory, then skips archived or low-quality records so long-term use should make guidance more compact rather than larger.
+
 Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
 
 Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then produce a reviewable Skill candidate instead of installing an unverified Skill directly.

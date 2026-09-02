@@ -45,7 +45,12 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, PermissionDenied, Role
-from agent_hub.cognitive.types import CognitiveMemoryScope, ExperienceStatus
+from agent_hub.cognitive.types import (
+    CognitiveMemoryScope,
+    ExperienceStatus,
+    OutcomeVerdict,
+    StrategyStatus,
+)
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
@@ -5094,6 +5099,228 @@ def test_cognitive_experience_api_can_create_root_scoped_experience() -> None:
     body = response.json()
     assert body["memory_scope"] == "root"
     assert body["user_id"]
+
+
+def test_cognitive_governance_api_lists_records_and_updates_strategy() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    now = datetime.now(UTC)
+    strategy_id = uuid4()
+    reflection_id = uuid4()
+    outcome_id = uuid4()
+    service.cognitive_strategies[str(strategy_id)] = admin_router.CognitiveStrategyResponse(
+        id=str(strategy_id),
+        user_id=str(ACTOR_ID),
+        memory_scope=CognitiveMemoryScope.USER,
+        name="失败任务拆分策略",
+        context="运行失败或 reviewer 超时时使用。",
+        strategy="先压缩输入，再拆分任务，最后重试关键步骤。",
+        rationale="多次失败说明大输入会拖慢 reviewer。",
+        status=StrategyStatus.CANDIDATE,
+        confidence=0.61,
+        evidence=[
+            admin_router.CognitiveEvidencePayload(
+                source_type="run",
+                source_id="run-1",
+                note="timeout",
+            )
+        ],
+        contradictions=[],
+        tags=["timeout"],
+        applies_to_modes=["hybrid"],
+        applies_to_agents=["quality_reviewer"],
+        use_count=0,
+        success_count=0,
+        failure_count=0,
+        active_for_runtime=False,
+        last_used_at=None,
+        last_verified_at=None,
+        version=1,
+        created_at=now,
+        updated_at=now,
+        resource_id=f"cognitive_strategy:{strategy_id}",
+    )
+    service.cognitive_reflections[str(reflection_id)] = admin_router.CognitiveReflectionResponse(
+        id=str(reflection_id),
+        user_id=str(ACTOR_ID),
+        memory_scope=CognitiveMemoryScope.USER,
+        source_run_id="run-1",
+        trigger="outcome_failure",
+        outcome="failure",
+        causal_analysis="输入过长导致审查步骤超时。",
+        counterfactual="下次应先压缩输入。",
+        positive_patterns=[],
+        negative_patterns=["未压缩输入"],
+        proposed_experience_ids=[],
+        confidence=0.66,
+        created_at=now,
+        resource_id=f"cognitive_reflection:{reflection_id}",
+    )
+    service.cognitive_outcomes[str(outcome_id)] = admin_router.CognitiveOutcomeResponse(
+        id=str(outcome_id),
+        user_id=str(ACTOR_ID),
+        memory_scope=CognitiveMemoryScope.USER,
+        source_run_id="run-1",
+        target_type="run",
+        target_id="run-1",
+        verdict=OutcomeVerdict.FAILURE,
+        note="reviewer timed out",
+        evidence=[
+            admin_router.CognitiveEvidencePayload(
+                source_type="run_event",
+                source_id="run-1:1",
+                note="runtime.failed",
+            )
+        ],
+        confidence_delta=-0.1,
+        created_at=now,
+        resource_id=f"cognitive_outcome:{outcome_id}",
+    )
+
+    strategies = api.get("/api/v1/admin/cognitive/strategies", headers=headers())
+    reflections = api.get("/api/v1/admin/cognitive/reflections", headers=headers())
+    outcomes = api.get("/api/v1/admin/cognitive/outcomes", headers=headers())
+    confirmed = api.post(
+        f"/api/v1/admin/cognitive/strategies/{strategy_id}/confirm",
+        headers=headers(),
+    )
+    metadata = api.get("/api/v1/admin/cognitive/governance", headers=headers())
+
+    assert strategies.status_code == 200
+    assert strategies.json()[0]["status"] == "candidate"
+    assert reflections.status_code == 200
+    assert reflections.json()[0]["trigger"] == "outcome_failure"
+    assert outcomes.status_code == 200
+    assert outcomes.json()[0]["verdict"] == "failure"
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "active"
+    assert confirmed.json()["active_for_runtime"] is True
+    assert metadata.status_code == 200
+    assert metadata.json()["strategy_count"] == 1
+    assert metadata.json()["active_strategy_count"] == 1
+    assert metadata.json()["failure_outcome_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_cognitive_governance_lists_records_and_updates_strategy(
+    tmp_path: Path,
+) -> None:
+    strategy_id = uuid4()
+    reflection_id = uuid4()
+    outcome_id = uuid4()
+    now = datetime.now(UTC)
+
+    class StoredPersistentCognitiveGovernanceService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "hermes",
+                    f"cognitive_strategy:{strategy_id}",
+                ): {
+                    "id": str(strategy_id),
+                    "user_id": str(ACTOR_ID),
+                    "memory_scope": "user",
+                    "name": "失败任务拆分策略",
+                    "context": "运行失败时使用。",
+                    "strategy": "先压缩输入，再拆分任务。",
+                    "rationale": "降低单步超时概率。",
+                    "status": "candidate",
+                    "confidence": 0.61,
+                    "evidence": [
+                        {"source_type": "run", "source_id": "run-1", "note": "timeout"}
+                    ],
+                    "contradictions": [],
+                    "tags": ["timeout"],
+                    "applies_to_modes": ["hybrid"],
+                    "applies_to_agents": ["quality_reviewer"],
+                    "use_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "last_used_at": None,
+                    "last_verified_at": None,
+                    "version": 1,
+                    "created_at": now.isoformat(),
+                    "updated_at": now.isoformat(),
+                },
+                (
+                    "hermes",
+                    f"cognitive_reflection:{reflection_id}",
+                ): {
+                    "id": str(reflection_id),
+                    "user_id": str(ACTOR_ID),
+                    "memory_scope": "user",
+                    "source_run_id": "run-1",
+                    "trigger": "outcome_failure",
+                    "outcome": "failure",
+                    "causal_analysis": "输入过长导致失败。",
+                    "counterfactual": "下次先压缩输入。",
+                    "positive_patterns": [],
+                    "negative_patterns": ["未压缩输入"],
+                    "proposed_experience_ids": [],
+                    "confidence": 0.66,
+                    "created_at": now.isoformat(),
+                },
+                (
+                    "hermes",
+                    f"cognitive_outcome:{outcome_id}",
+                ): {
+                    "id": str(outcome_id),
+                    "user_id": str(ACTOR_ID),
+                    "memory_scope": "user",
+                    "source_run_id": "run-1",
+                    "target_type": "run",
+                    "target_id": "run-1",
+                    "verdict": "failure",
+                    "note": "reviewer timed out",
+                    "evidence": [
+                        {"source_type": "run_event", "source_id": "run-1:1", "note": "runtime.failed"}
+                    ],
+                    "confidence_delta": -0.1,
+                    "created_at": now.isoformat(),
+                },
+            }
+
+        async def _list_admin_payloads_with_metadata(
+            self,
+            kind: str,
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (resource_id, dict(payload), now, now)
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            payload = self.payloads.get((kind, resource_id))
+            return None if payload is None else dict(payload)
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+    service = StoredPersistentCognitiveGovernanceService()
+
+    assert [item.id for item in await service.list_cognitive_strategies()] == [str(strategy_id)]
+    assert [item.id for item in await service.list_cognitive_reflections()] == [str(reflection_id)]
+    assert [item.id for item in await service.list_cognitive_outcomes()] == [str(outcome_id)]
+
+    confirmed = await service.confirm_cognitive_strategy(strategy_id)
+    metadata = await service.cognitive_governance_metadata()
+
+    assert confirmed.status is StrategyStatus.ACTIVE
+    assert service.payloads[("hermes", f"cognitive_strategy:{strategy_id}")]["status"] == "active"
+    assert metadata.strategy_count == 1
+    assert metadata.active_strategy_count == 1
+    assert metadata.failure_outcome_count == 1
 
 
 @pytest.mark.asyncio

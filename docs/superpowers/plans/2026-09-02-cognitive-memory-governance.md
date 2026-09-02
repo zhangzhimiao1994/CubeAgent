@@ -76,11 +76,11 @@
 - Test: `tests/unit/cognitive/test_pipeline.py`
 - Test: `tests/unit/runs/test_terminal_hooks.py`
 
-- [x] Write failing tests for success reflection, failure reflection, outcome critic verdict persistence, candidate experience creation, strategy outcome calibration, and terminal hook non-blocking behavior.
+- [x] Write failing tests for success reflection, failure reflection, outcome critic verdict persistence, candidate experience creation, nested artifact output detection, strategy outcome calibration, and terminal hook non-blocking behavior.
 - [x] Run the new tests and verify current reflection is too narrow or pipeline missing.
 - [x] Implement `ReflectionEngine`, `OutcomeCritic`, and `CognitiveLearningPipeline`.
 - [x] Register the pipeline as an additional terminal hook in app and worker wiring.
-- [x] Run targeted cognitive and run-hook tests.
+- [x] Run targeted cognitive, verifier, worker-wiring, and run-hook tests plus ruff, strict mypy, and diff check.
 - [x] Commit as `feat: connect cognitive reflection pipeline`.
 
 ### Task 5: API, verification, and handoff
@@ -91,10 +91,10 @@
 - Modify local-only: `HANDOFF.md`
 - Test: `tests/api/test_admin_resources.py`
 
-- [ ] Write failing API tests for listing strategies/reflections, confirming/rejecting strategies, and exposing governance metadata.
-- [ ] Implement minimal admin endpoints without adding UI dependency.
-- [ ] Run full backend verification: cognitive tests, Hermes advisor tests, admin API tests, ruff, mypy.
-- [ ] Ensure `HANDOFF.md` is local-only and not staged.
+- [x] Write failing API tests for listing strategies/reflections, confirming/rejecting strategies, and exposing governance metadata.
+- [x] Implement minimal admin endpoints without adding UI dependency.
+- [x] Run full backend verification: cognitive tests, Hermes advisor tests, admin API tests, ruff, mypy.
+- [x] Ensure `HANDOFF.md` is local-only and not staged.
 - [ ] Push to `https://github.com/zhangzhimiao1994/CubeAgent`.
 - [ ] Check GitHub Actions until success.
-- [ ] Do not deploy production in this task.
+- [ ] Deploy to `prod-web-01`, run feature-specific production probes, and keep only the active release on the server.
