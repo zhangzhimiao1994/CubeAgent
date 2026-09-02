@@ -13,6 +13,7 @@ from agent_hub.cognitive.types import (
     BeliefRecord,
     CognitiveMemoryScope,
     ExperienceRecord,
+    OutcomeAssessmentRecord,
     ReflectionRecord,
     RelationshipStateRecord,
     SkillCandidateRecord,
@@ -30,6 +31,7 @@ _RECORD_STORAGE: dict[type[object], tuple[str, str]] = {
     WorldStateRecord: ("cognitive_world:", "world_state"),
     SkillCandidateRecord: ("cognitive_skill:", "skill_candidate"),
     StrategyRecord: ("cognitive_strategy:", "strategy"),
+    OutcomeAssessmentRecord: ("cognitive_outcome:", "outcome_assessment"),
 }
 
 CognitiveRecord = (
@@ -39,6 +41,7 @@ CognitiveRecord = (
     | WorldStateRecord
     | SkillCandidateRecord
     | StrategyRecord
+    | OutcomeAssessmentRecord
 )
 CognitiveRecordT = TypeVar("CognitiveRecordT", bound=CognitiveRecord)
 

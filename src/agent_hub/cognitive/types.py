@@ -36,6 +36,13 @@ class StrategyStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class OutcomeVerdict(StrEnum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILURE = "failure"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
 class CognitiveMemoryScope(StrEnum):
     USER = "user"
     ROOT = "root"
@@ -295,6 +302,28 @@ class StrategyRecord(BaseModel):
         if self.updated_at < self.created_at:
             raise ValueError("updated_at cannot be before created_at")
         return self
+
+
+class OutcomeAssessmentRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER
+    source_run_id: str = Field(min_length=1, max_length=128)
+    target_type: str = Field(min_length=1, max_length=64)
+    target_id: str = Field(min_length=1, max_length=160)
+    verdict: OutcomeVerdict
+    note: str = Field(min_length=1, max_length=512)
+    evidence: tuple[CognitiveEvidence, ...] = ()
+    confidence_delta: float = Field(ge=-1, le=1)
+    created_at: datetime
+
+    @field_validator("source_run_id", "target_type", "target_id", "note")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return _bounded_printable(value)
 
 
 def _bounded_printable(value: str, *, allow_empty: bool = False) -> str:

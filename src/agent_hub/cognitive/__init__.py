@@ -1,6 +1,13 @@
 """Cognitive experience layer for durable learning and bounded future guidance."""
 
 from agent_hub.cognitive.context_router import route_cognitive_context
+from agent_hub.cognitive.governance import (
+    AntiLearningService,
+    ConfidenceCalibrationService,
+    ConflictResolutionDecision,
+    ConflictResolutionEngine,
+    ConflictResolutionStatus,
+)
 from agent_hub.cognitive.reflection import reflect_from_feedback
 from agent_hub.cognitive.repository import (
     InMemoryCognitiveRecordRepository,
@@ -22,6 +29,8 @@ from agent_hub.cognitive.types import (
     ExperienceKind,
     ExperienceRecord,
     ExperienceStatus,
+    OutcomeAssessmentRecord,
+    OutcomeVerdict,
     ReflectionRecord,
     RelationshipStateRecord,
     SkillCandidateRecord,
@@ -31,16 +40,23 @@ from agent_hub.cognitive.types import (
 )
 
 __all__ = [
+    "AntiLearningService",
     "BeliefRecord",
     "CognitiveEvidence",
     "CognitiveMemoryScope",
     "CognitiveStateService",
+    "ConfidenceCalibrationService",
+    "ConflictResolutionDecision",
+    "ConflictResolutionEngine",
+    "ConflictResolutionStatus",
     "ExperienceKind",
     "ExperienceRecord",
     "ExperienceService",
     "ExperienceStatus",
     "InMemoryCognitiveRecordRepository",
     "InMemoryExperienceRepository",
+    "OutcomeAssessmentRecord",
+    "OutcomeVerdict",
     "PersistentCognitiveRecordRepository",
     "PersistentExperienceRepository",
     "ReflectionRecord",

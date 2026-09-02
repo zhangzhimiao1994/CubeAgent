@@ -17,6 +17,8 @@ from agent_hub.cognitive.types import (
     CognitiveMemoryScope,
     ExperienceKind,
     ExperienceStatus,
+    OutcomeAssessmentRecord,
+    OutcomeVerdict,
     SkillCandidateRecord,
     StrategyStatus,
 )
@@ -98,6 +100,50 @@ async def test_record_use_outcome_updates_counts_and_confidence() -> None:
     assert updated.confidence > confirmed.confidence
     assert updated.last_used_at is not None
     assert updated.last_verified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_experience_use_deprecates_runtime_learning() -> None:
+    repository = InMemoryExperienceRepository()
+    service = ExperienceService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+    record = await service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.ERROR_HANDLING,
+        summary="弱证据策略不应长期污染运行时。",
+        lesson="连续失败说明经验不可靠。",
+        strategy="失败后继续使用同一策略。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="candidate"),),
+        confidence=0.42,
+    )
+    confirmed = await service.confirm(record.id, tenant_id=tenant_id, user_id=user_id)
+
+    first = await service.record_use_outcome(
+        confirmed.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=False,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-2", note="failed"),
+    )
+    second = await service.record_use_outcome(
+        first.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=False,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-3", note="failed again"),
+    )
+    third = await service.record_use_outcome(
+        second.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        succeeded=False,
+        evidence=CognitiveEvidence(source_type="run", source_id="run-4", note="failed repeatedly"),
+    )
+
+    assert third.status is ExperienceStatus.DEPRECATED
+    assert third.active_for_runtime is False
 
 
 @pytest.mark.asyncio
@@ -708,3 +754,84 @@ async def test_strategy_library_reject_and_use_outcome_update_learning_state() -
     assert len(failed.contradictions) == 1
     assert failed.last_used_at == datetime(2026, 9, 2, 10, 4, tzinfo=UTC)
     assert failed.last_verified_at == datetime(2026, 9, 2, 10, 4, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_strategy_use_marks_strategy_contested() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    user_id = uuid4()
+    strategy = await service.create_strategy_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        name="weak-reviewer-recovery",
+        context="reviewer 审查大输入时超时。",
+        strategy="继续完整审查。",
+        rationale="旧策略证据不足。",
+        evidence=(CognitiveEvidence(source_type="reflection", source_id="ref-1", note="weak"),),
+        tags=("reviewer", "timeout"),
+        applies_to_modes=("hybrid",),
+        confidence=0.52,
+    )
+    strategy = await service.confirm_strategy(strategy.id, tenant_id=tenant_id, user_id=user_id)
+
+    for index in range(3):
+        strategy = await service.record_strategy_use_outcome(
+            strategy.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            succeeded=False,
+            evidence=CognitiveEvidence(source_type="run", source_id=f"run-{index}", note="failed"),
+        )
+
+    selected = await service.select_strategies_for_task(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        request="reviewer timeout",
+        mode="hybrid",
+    )
+
+    assert strategy.status is StrategyStatus.CONTESTED
+    assert strategy.active_for_runtime is False
+    assert selected == ()
+
+
+@pytest.mark.asyncio
+async def test_outcome_assessment_is_persisted_and_scoped() -> None:
+    from agent_hub.cognitive import InMemoryCognitiveRecordRepository
+
+    repository = InMemoryCognitiveRecordRepository()
+    service = CognitiveStateService(repository, now=lambda: datetime.now(UTC))
+    tenant_id = uuid4()
+    owner_user_id = uuid4()
+    other_user_id = uuid4()
+
+    assessment = await service.record_outcome_assessment(
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+        source_run_id="run-1",
+        target_type="strategy",
+        target_id="strategy-1",
+        verdict=OutcomeVerdict.PARTIAL,
+        note="completed with reviewer fallback",
+        evidence=(CognitiveEvidence(source_type="run_event", source_id="event-1", note="step.failed recovered"),),
+        confidence_delta=-0.04,
+    )
+
+    owner_records = await repository.list_for_user(
+        OutcomeAssessmentRecord,
+        tenant_id=tenant_id,
+        user_id=owner_user_id,
+    )
+    other_records = await repository.list_for_user(
+        OutcomeAssessmentRecord,
+        tenant_id=tenant_id,
+        user_id=other_user_id,
+    )
+
+    assert assessment.verdict is OutcomeVerdict.PARTIAL
+    assert [item.id for item in owner_records] == [assessment.id]
+    assert other_records == ()

@@ -26,7 +26,7 @@
 - [x] Implement `StrategyRecord` and repository persistence mapping under `cognitive_strategy:`.
 - [x] Implement Strategy Library methods on `CognitiveStateService` for candidate creation, confirm/reject, task selection, and use outcome updates. Do not expose a separate `StrategyService` abstraction.
 - [x] Run targeted cognitive tests.
-- [ ] Commit as `feat: add cognitive strategy governance`.
+- [x] Commit as `feat: add cognitive strategy governance`.
 
 ### Task 2: Outcome verification, conflict resolution, confidence calibration, and anti-learning
 
@@ -39,11 +39,11 @@
 - Test: `tests/unit/cognitive/test_verifier.py`
 - Test: `tests/unit/cognitive/test_service.py`
 
-- [ ] Write failing tests for outcome verdicts (`success`, `partial`, `failure`, `insufficient_evidence`), unresolved conflicts, supported winners, confidence calibration, and automatic degradation of repeatedly failing Experience/Strategy records.
-- [ ] Run the new tests and verify missing module/service failures.
-- [ ] Implement `OutcomeVerifier`, `ConflictResolutionEngine`, `ConfidenceCalibrationService`, `AntiLearningService`, and memory-tier scoring types.
-- [ ] Wire anti-learning helpers into existing experience/strategy outcome update behavior.
-- [ ] Run targeted governance/service tests.
+- [x] Write failing tests for outcome verdicts (`success`, `partial`, `failure`, `insufficient_evidence`), unresolved conflicts, supported winners, confidence calibration, and automatic degradation of repeatedly failing Experience/Strategy records.
+- [x] Run the new tests and verify missing module/service failures.
+- [x] Implement `OutcomeVerifier`, `ConflictResolutionEngine`, `ConfidenceCalibrationService`, `AntiLearningService`, and memory-tier scoring types.
+- [x] Wire anti-learning helpers into existing experience/strategy outcome update behavior.
+- [x] Run targeted governance/service tests.
 - [ ] Commit as `feat: add cognitive governance controls`.
 
 ### Task 3: Metacognition, working set, and hierarchical memory

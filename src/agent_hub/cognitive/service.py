@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol, overload
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from agent_hub.cognitive.governance import AntiLearningService
 from agent_hub.cognitive.types import (
     BeliefRecord,
     CognitiveEvidence,
@@ -12,6 +13,8 @@ from agent_hub.cognitive.types import (
     ExperienceKind,
     ExperienceRecord,
     ExperienceStatus,
+    OutcomeAssessmentRecord,
+    OutcomeVerdict,
     RelationshipStateRecord,
     SkillCandidateRecord,
     StrategyRecord,
@@ -49,6 +52,9 @@ class CognitiveStateRepository(Protocol):
     async def upsert(self, record: StrategyRecord) -> StrategyRecord: ...
 
     @overload
+    async def upsert(self, record: OutcomeAssessmentRecord) -> OutcomeAssessmentRecord: ...
+
+    @overload
     async def upsert(self, record: RelationshipStateRecord) -> RelationshipStateRecord: ...
 
     @overload
@@ -68,6 +74,11 @@ class CognitiveStateRepository(Protocol):
     async def get(
         self, record_type: type[StrategyRecord], record_id: str | UUID
     ) -> StrategyRecord | None: ...
+
+    @overload
+    async def get(
+        self, record_type: type[OutcomeAssessmentRecord], record_id: str | UUID
+    ) -> OutcomeAssessmentRecord | None: ...
 
     @overload
     async def get(
@@ -105,6 +116,15 @@ class CognitiveStateRepository(Protocol):
         tenant_id: UUID,
         user_id: UUID,
     ) -> tuple[StrategyRecord, ...]: ...
+
+    @overload
+    async def list_for_user(
+        self,
+        record_type: type[OutcomeAssessmentRecord],
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+    ) -> tuple[OutcomeAssessmentRecord, ...]: ...
 
 
 def _bounded_confidence(value: float) -> float:
@@ -254,9 +274,16 @@ class ExperienceService:
         success_count = record.success_count + (1 if succeeded else 0)
         failure_count = record.failure_count + (0 if succeeded else 1)
         confidence_delta = 0.05 if succeeded else -0.08
+        confidence = _bounded_confidence(record.confidence + confidence_delta)
         updated = record.model_copy(
             update={
-                "confidence": max(0.0, min(1.0, record.confidence + confidence_delta)),
+                "confidence": confidence,
+                "status": AntiLearningService().experience_status(
+                    current_status=record.status,
+                    confidence=confidence,
+                    success_count=success_count,
+                    failure_count=failure_count,
+                ),
                 "evidence": (*record.evidence, evidence) if succeeded else record.evidence,
                 "contradictions": record.contradictions
                 if succeeded
@@ -530,6 +557,36 @@ class CognitiveStateService:
         )
         return await self._repository.upsert(updated)
 
+    async def record_outcome_assessment(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        source_run_id: str,
+        target_type: str,
+        target_id: str,
+        verdict: OutcomeVerdict,
+        note: str,
+        evidence: tuple[CognitiveEvidence, ...],
+        confidence_delta: float,
+        memory_scope: CognitiveMemoryScope = CognitiveMemoryScope.USER,
+    ) -> OutcomeAssessmentRecord:
+        record = OutcomeAssessmentRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            user_id=user_id,
+            memory_scope=memory_scope,
+            source_run_id=source_run_id,
+            target_type=target_type,
+            target_id=target_id,
+            verdict=verdict,
+            note=note,
+            evidence=evidence,
+            confidence_delta=confidence_delta,
+            created_at=self._now(),
+        )
+        return await self._repository.upsert(record)
+
     async def update_relationship_state(
         self,
         *,
@@ -737,11 +794,12 @@ class CognitiveStateService:
         failure_count: int,
         current_status: StrategyStatus,
     ) -> StrategyStatus:
-        if confidence <= 0.24:
-            return StrategyStatus.DEPRECATED
-        if failure_count > success_count and confidence < 0.45:
-            return StrategyStatus.CONTESTED
-        return current_status
+        return AntiLearningService().strategy_status(
+            current_status=current_status,
+            confidence=confidence,
+            success_count=success_count,
+            failure_count=failure_count,
+        )
 
 
 class SkillPromotionNotReady(RuntimeError):
