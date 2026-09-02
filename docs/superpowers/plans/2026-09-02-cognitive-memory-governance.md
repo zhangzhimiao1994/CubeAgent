@@ -63,7 +63,7 @@
 - [x] Implement `MetacognitionService`, `WorkingSetBuilder`, memory tiering, archive, and source-linked consolidation.
 - [x] Extend context construction to keep working memory bounded ahead of long-term memory and skip archived memory in active retrieval.
 - [x] Run targeted cognitive/memory/context tests plus ruff, strict mypy, and diff check.
-- [ ] Commit as `feat: add cognitive metacognition and memory hierarchy`.
+- [x] Commit as `feat: add cognitive metacognition and memory hierarchy`.
 
 ### Task 4: Reflection pipeline, Outcome Critic, and runtime terminal hook
 
