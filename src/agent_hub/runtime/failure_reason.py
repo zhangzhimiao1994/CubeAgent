@@ -35,6 +35,15 @@ _MODEL_CONTEXT = re.compile(
     r"logical_models=(?P<logical_models>[A-Za-z0-9_,:-]{1,512}); "
     r"deployments=(?P<deployments>[A-Za-z0-9_,:-]{1,1024})\)"
 )
+_MODEL_REQUEST_CHECKPOINT_MISMATCH = re.compile(
+    r"^model request changed after checkpoint "
+    r"\(step=(?P<step>[A-Za-z0-9_.-]{1,128}); "
+    r"actor=(?P<actor>[A-Za-z0-9_.-]{1,128}); "
+    r"purpose=(?P<purpose>[A-Za-z0-9_.-]{1,64}); "
+    r"call_index=(?P<call_index>[0-9]{1,6}); "
+    r"expected=(?P<expected>[A-Fa-f0-9]{6,64}); "
+    r"actual=(?P<actual>[A-Fa-f0-9]{6,64})\)$"
+)
 _SAFE_MODEL_CONTEXT_VALUE = re.compile(r"^[A-Za-z0-9_,:-]{1,1024}$")
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
@@ -169,6 +178,24 @@ def runtime_failure_diagnostic_from_reason(
         )
         diagnostic["step_id"] = crew_timeout.group("step")
         diagnostic["actor"] = crew_timeout.group("actor")
+    elif (checkpoint_mismatch := _MODEL_REQUEST_CHECKPOINT_MISMATCH.fullmatch(normalized)) is not None:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_checkpoint",
+            error_category="model_request_changed",
+            error_code="runtime.model_request_changed_after_checkpoint",
+            retryable=False,
+            suggested_action=(
+                "运行恢复时同一步骤的模型请求发生变化；检查运行期间是否修改了模式、"
+                "Agent、工具或模型配置，必要时重新提交任务。"
+            ),
+        )
+        diagnostic["step_id"] = checkpoint_mismatch.group("step")
+        diagnostic["actor"] = checkpoint_mismatch.group("actor")
+        diagnostic["purpose"] = checkpoint_mismatch.group("purpose")
+        diagnostic["call_index"] = int(checkpoint_mismatch.group("call_index"))
+        diagnostic["expected_request_sha256"] = checkpoint_mismatch.group("expected")
+        diagnostic["actual_request_sha256"] = checkpoint_mismatch.group("actual")
     elif (
         "model gateway failed" in lowered
         or "model response text is empty" in lowered
@@ -560,6 +587,8 @@ def _possible_cause(
         return "当前 Agent/工作流要求的能力没有匹配到已启用模型部署。"
     if error_stage == "model_configuration":
         return "模型 API Key、模型名、Base URL、供应商权限或容量配置不完整。"
+    if error_stage == "runtime_checkpoint":
+        return "任务恢复或重试期间，步骤输入、工具列表、模型选择或配置版本发生变化，导致账本无法安全复用。"
     return "查看同一运行中上一条失败事件、模型事件、工具事件和配置变更记录来定位具体层级。"
 
 

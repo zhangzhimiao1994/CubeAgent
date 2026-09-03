@@ -326,6 +326,33 @@ def test_presentation_tool_definition_exposes_strict_downloadable_contract() -> 
     }
 
 
+def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None:
+    tool = _tool_definitions(("generate_multimedia",))[0]
+
+    assert tool.name == "generate_multimedia"
+    assert "generate_multimedia" in tool.description
+    assert "image, video, or audio" in tool.description
+    assert tool.parameters["type"] == "object"
+    assert tool.parameters["additionalProperties"] is False
+    required = tool.parameters["required"]
+    assert isinstance(required, tuple)
+    assert required == ("kind", "logical_model", "prompt")
+    properties = tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    kind = properties["kind"]
+    assert isinstance(kind, Mapping)
+    assert kind["type"] == "string"
+    assert kind["enum"] == ("image", "video", "audio")
+    logical_model = properties["logical_model"]
+    assert isinstance(logical_model, Mapping)
+    assert logical_model["type"] == "string"
+    assert logical_model["minLength"] == 1
+    prompt = properties["prompt"]
+    assert isinstance(prompt, Mapping)
+    assert prompt["type"] == "string"
+    assert prompt["minLength"] == 1
+
+
 async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
     runtime = CrewDispatchRuntime(
         BadProjectZipGateway(),

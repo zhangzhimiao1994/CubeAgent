@@ -348,3 +348,22 @@ def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
     assert diagnostic["retryable"] is True
     assert diagnostic["step_id"] == "quality_reviewer_step"
     assert diagnostic["actor"] == "quality_reviewer"
+
+
+def test_runtime_failure_diagnostic_classifies_model_request_checkpoint_mismatch() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "model request changed after checkpoint "
+        "(step=project_manager_step; actor=project_manager; purpose=step; "
+        "call_index=2; expected=abc123; actual=def456)"
+    )
+
+    assert diagnostic["error_stage"] == "runtime_checkpoint"
+    assert diagnostic["error_category"] == "model_request_changed"
+    assert diagnostic["error_code"] == "runtime.model_request_changed_after_checkpoint"
+    assert diagnostic["retryable"] is False
+    assert diagnostic["step_id"] == "project_manager_step"
+    assert diagnostic["actor"] == "project_manager"
+    assert diagnostic["purpose"] == "step"
+    assert diagnostic["call_index"] == 2
+    assert diagnostic["expected_request_sha256"] == "abc123"
+    assert diagnostic["actual_request_sha256"] == "def456"

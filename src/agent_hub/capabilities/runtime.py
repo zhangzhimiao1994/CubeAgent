@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import cast
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.tools.calculator import Calculator
@@ -23,6 +23,11 @@ from agent_hub.files.generated import (
     GeneratedFileStore,
     safe_generated_filename,
 )
+from agent_hub.multimodal.generation import (
+    MultimediaArtifact,
+    MultimediaGenerationJob,
+    MultimediaGenerationKind,
+)
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
@@ -31,6 +36,7 @@ _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
+_MULTIMEDIA_TOOL = "generate_multimedia"
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
@@ -43,11 +49,29 @@ _REPLAY_SAFE = frozenset({
     _DOCX_TOOL,
     _PPTX_TOOL,
     _PROJECT_ZIP_TOOL,
+    _MULTIMEDIA_TOOL,
 })
 
 
 class RuntimeCapabilityError(RuntimeError):
     """Stable runtime capability failure."""
+
+
+class RuntimeMultimediaGenerationExecutor(Protocol):
+    def submit(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationJob: ...
+
+    async def run_job(
+        self,
+        job_id: str,
+        *,
+        executor_id: str,
+    ) -> MultimediaGenerationJob: ...
 
 
 class RuntimeCapabilityGateway:
@@ -61,6 +85,7 @@ class RuntimeCapabilityGateway:
         generated_artifact_dir: Path | None = None,
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
+        multimedia_generation_executor: RuntimeMultimediaGenerationExecutor | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -69,11 +94,14 @@ class RuntimeCapabilityGateway:
         )
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
+        self._multimedia_generation_executor = multimedia_generation_executor
 
     def is_replay_safe(self, name: str) -> bool:
         return name in _REPLAY_SAFE
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
+        if name == _MULTIMEDIA_TOOL:
+            return self._multimedia_generation_executor is not None
         if name in _REPLAY_SAFE:
             return True
         if _SAFE_CAPABILITY_NAME.fullmatch(name) is None:
@@ -105,6 +133,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_pptx(tenant_id, run_id, arguments)
         if name == _PROJECT_ZIP_TOOL:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
+        if name == _MULTIMEDIA_TOOL:
+            return await self._execute_generate_multimedia(actor, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -276,10 +306,41 @@ class RuntimeCapabilityGateway:
         )
         return result
 
+    async def _execute_generate_multimedia(
+        self,
+        actor: str,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        executor = self._require_multimedia_generation_executor()
+        kind = _multimedia_kind(arguments)
+        logical_model = _required_string(arguments, "logical_model").strip()
+        prompt = _required_string(arguments, "prompt").strip()
+        job = executor.submit(kind=kind, logical_model=logical_model, prompt=prompt)
+        completed = await executor.run_job(job.id, executor_id=actor)
+        artifacts = tuple(
+            _multimedia_artifact_result(artifact, job_id=completed.id, artifact_index=index)
+            for index, artifact in enumerate(completed.artifacts)
+        )
+        return {
+            "job_id": completed.id,
+            "kind": completed.kind.value,
+            "logical_model": completed.logical_model,
+            "status": completed.status.value,
+            "executor_id": completed.executor_id,
+            "summary": f"Generated {completed.kind.value} artifact with {completed.logical_model}.",
+            "artifacts": artifacts,
+            "presentation": "final_attachment",
+        }
+
     def _require_generated_file_store(self) -> GeneratedFileStore:
         if self._generated_file_store is None:
             raise RuntimeCapabilityError("generated artifact store is not configured")
         return self._generated_file_store
+
+    def _require_multimedia_generation_executor(self) -> RuntimeMultimediaGenerationExecutor:
+        if self._multimedia_generation_executor is None:
+            raise RuntimeCapabilityError("multimedia generation executor is not configured")
+        return self._multimedia_generation_executor
 
     async def _execute_skill(
         self,
@@ -385,6 +446,40 @@ def _optional_mapping_list(
             raise RuntimeCapabilityError(f"{field_name} items must be objects")
         items.append(dict(item))
     return items
+
+
+def _multimedia_kind(arguments: Mapping[str, JsonValue]) -> MultimediaGenerationKind:
+    value = _required_string(arguments, "kind").strip()
+    try:
+        return MultimediaGenerationKind(value)
+    except ValueError:
+        raise RuntimeCapabilityError("kind must be image, video, or audio") from None
+
+
+def _multimedia_artifact_result(
+    artifact: MultimediaArtifact,
+    *,
+    job_id: str,
+    artifact_index: int,
+) -> Mapping[str, JsonValue]:
+    download_url: str | None = None
+    if (
+        artifact.file_path is not None
+        and artifact.filename is not None
+        and artifact.mime_type is not None
+        and artifact.file_path.is_file()
+    ):
+        download_url = f"/api/v1/admin/multimedia/jobs/{job_id}/artifacts/{artifact_index}/download"
+    return {
+        "kind": artifact.kind.value,
+        "uri": artifact.uri,
+        "text": artifact.text,
+        "logical_model": artifact.logical_model,
+        "deployment_id": artifact.deployment_id,
+        "filename": artifact.filename,
+        "mime_type": artifact.mime_type,
+        "download_url": download_url,
+    }
 
 
 def _filename(arguments: Mapping[str, JsonValue], *, title: str, extension: str) -> str:

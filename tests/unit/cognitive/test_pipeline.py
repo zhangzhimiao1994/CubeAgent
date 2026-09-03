@@ -12,7 +12,13 @@ from agent_hub.cognitive.repository import (
     InMemoryExperienceRepository,
 )
 from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
-from agent_hub.cognitive.types import OutcomeAssessmentRecord, OutcomeVerdict, ReflectionRecord
+from agent_hub.cognitive.types import (
+    CognitiveEvidence,
+    ExperienceKind,
+    OutcomeAssessmentRecord,
+    OutcomeVerdict,
+    ReflectionRecord,
+)
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.memory.maintenance import MemoryMaintenanceService
 from agent_hub.memory.repository import InMemoryMemoryRepository
@@ -244,6 +250,60 @@ async def test_learning_injection_failure_feedback_and_memory_maintenance_closed
         source = await memory_repository.get(source_id)
         assert source is not None
         assert source.archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_learning_pipeline_records_hermes_injected_cognitive_experience_outcome() -> None:
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    cognitive_repository = InMemoryCognitiveRecordRepository()
+    experience_repository = InMemoryExperienceRepository()
+    cognitive_service = CognitiveStateService(cognitive_repository, now=lambda: now)
+    experience_service = ExperienceService(experience_repository, now=lambda: now)
+    tenant_id = uuid4()
+    user_id = uuid4()
+    run_id = uuid4()
+    candidate = await experience_service.create_candidate(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        kind=ExperienceKind.WORKFLOW_STRATEGY,
+        summary="多轮对话失败时先压缩上下文再重试。",
+        lesson="历史消息过长会让模型响应不稳定。",
+        strategy="连续多轮后先压缩上下文，再调用模型。",
+        evidence=(CognitiveEvidence(source_type="run", source_id="run-1", note="confirmed"),),
+        tags=("hybrid", "context"),
+        applies_to_modes=("hybrid",),
+    )
+    confirmed = await experience_service.confirm(candidate.id, tenant_id=tenant_id, user_id=user_id)
+
+    result = await CognitiveLearningPipeline(
+        cognitive_service=cognitive_service,
+        experience_service=experience_service,
+        run_repository=FakeRunEvidenceRepository(
+            events=({"kind": "runtime.completed", "message": "final answer generated"},),
+            artifacts=({"kind": "text", "title": "answer", "text": "完成"},),
+        ),
+    ).process_terminal_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=run_id,
+        status=RunStatus.COMPLETED,
+        mode=TaskMode.HYBRID,
+        routing_decision={
+            "hermes": {
+                "injected_memories": [
+                    {"id": f"cognitive_experience:{confirmed.id}", "summary": confirmed.summary}
+                ]
+            }
+        },
+    )
+
+    assert result is not None
+    updated = await experience_repository.get(confirmed.id)
+    assert updated is not None
+    assert updated.use_count == 1
+    assert updated.success_count == 1
+    assert updated.failure_count == 0
+    assert updated.confidence > confirmed.confidence
 
 
 @pytest.mark.asyncio

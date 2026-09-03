@@ -236,7 +236,7 @@ class CognitiveLearningPipeline:
         succeeded: bool,
         evidence: CognitiveEvidence,
     ) -> None:
-        for experience_id in _uuid_values(routing_decision, ("used_experience_ids", "injected_experience_ids")):
+        for experience_id in _experience_uuid_values(routing_decision):
             try:
                 await self._experience_service.record_use_outcome(
                     experience_id,
@@ -275,7 +275,7 @@ class CognitiveLearningPipeline:
     ) -> bool:
         if verdict in {OutcomeVerdict.FAILURE, OutcomeVerdict.PARTIAL}:
             return True
-        return any(
+        return bool(_experience_uuid_values(routing_decision)) or any(
             key in routing_decision
             for key in ("used_experience_ids", "injected_experience_ids", "used_strategy_ids")
         )
@@ -367,6 +367,28 @@ def _uuid_values(payload: dict[str, object], keys: tuple[str, ...]) -> tuple[UUI
                 values.append(UUID(item))
             except ValueError:
                 continue
+    return tuple(dict.fromkeys(values))
+
+
+def _experience_uuid_values(payload: dict[str, object]) -> tuple[UUID, ...]:
+    values = list(_uuid_values(payload, ("used_experience_ids", "injected_experience_ids")))
+    hermes = payload.get("hermes")
+    if isinstance(hermes, dict):
+        raw_items = hermes.get("injected_memories")
+        if isinstance(raw_items, list | tuple):
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                raw_id = raw.get("id")
+                if not isinstance(raw_id, str):
+                    continue
+                prefix = "cognitive_experience:"
+                if not raw_id.startswith(prefix):
+                    continue
+                try:
+                    values.append(UUID(raw_id.removeprefix(prefix)))
+                except ValueError:
+                    continue
     return tuple(dict.fromkeys(values))
 
 

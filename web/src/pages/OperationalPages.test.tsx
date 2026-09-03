@@ -430,6 +430,8 @@ describe("operational management pages", () => {
   let failCognitiveExperiences = false;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
+  let holdAttachmentUpload = false;
+  let releaseAttachmentUpload: (() => void) | null = null;
   let skillUploadConflict = false;
   let holdActiveConversationRequest = false;
 
@@ -450,6 +452,8 @@ describe("operational management pages", () => {
     failCognitiveExperiences = false;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
+    holdAttachmentUpload = false;
+    releaseAttachmentUpload = null;
     skillUploadConflict = false;
     holdActiveConversationRequest = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
@@ -979,6 +983,11 @@ describe("operational management pages", () => {
           if (failNextAttachmentUpload) {
             failNextAttachmentUpload = false;
             throw new TypeError("Failed to fetch");
+          }
+          if (holdAttachmentUpload) {
+            await new Promise<void>((resolve) => {
+              releaseAttachmentUpload = resolve;
+            });
           }
           const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
           const rawFilename = headers.get("X-Agent-Hub-Filename") ?? "screen.png";
@@ -3763,6 +3772,39 @@ describe("operational management pages", () => {
       },
     });
   });
+
+  it("blocks sending while an attachment upload is still waiting for its attachment id", async () => {
+    holdAttachmentUpload = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const file = new File(["image-bytes"], "screen.png", { type: "image/png" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+    await user.type(screen.getByPlaceholderText(/输入消息/), "请根据图片说明问题");
+
+    expect(await screen.findByText("正在上传附件...")).not.toBeNull();
+    const composer = screen.getByRole("form", { name: "发送消息" });
+    const sendButton = within(composer).getByRole("button", { name: "上传中..." }) as HTMLButtonElement;
+    expect(sendButton.disabled).toBe(true);
+    expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(false);
+
+    releaseAttachmentUpload?.();
+    expect(await screen.findByText("图片附件")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "请根据图片说明问题",
+        attachment_ids: ["att_0123456789abcdef0123456789abcdef"],
+      },
+    });
+  });
+
   it("encodes non-ascii attachment filenames before sending upload headers", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

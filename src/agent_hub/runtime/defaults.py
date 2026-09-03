@@ -955,6 +955,10 @@ def _role_allowed_tools(
     is_available = getattr(capability_gateway, "is_available", None)
     filtered: list[str] = []
     for name in requested:
+        if name == "generate_multimedia":
+            if callable(is_available) and is_available(context.tenant_id, name):
+                filtered.append(name)
+            continue
         if capability_gateway.is_replay_safe(name):
             filtered.append(name)
             continue
@@ -1052,7 +1056,12 @@ def _selected_config_agent_purpose(
 
 
 _DELIVERY_TOOL_NAMES = frozenset(
-    {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+    {
+        "document.generate_docx",
+        "generate_multimedia",
+        "presentation.generate_pptx",
+        "project.generate_zip",
+    }
 )
 
 

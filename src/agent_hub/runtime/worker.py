@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
+from agent_hub.app import _ConfigBackedMultimediaGenerationExecutor
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
 from agent_hub.cognitive.repository import (
@@ -22,6 +23,7 @@ from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.runs.attachments import FileSystemAttachmentArtifactLoader
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -118,6 +120,22 @@ def build_worker_service(
         database.session_factory,
         SecretCipher(settings.master_key_bytes()),
     )
+    admin_resource_service = admin.PersistentAdminResourceService(
+        config_service=config_service,
+        secret_service=secret_service,
+        run_repository=run_repository,
+        tenant_id=settings.bootstrap_tenant_id,
+        actor_id=settings.bootstrap_tenant_id,
+        session_factory=database.session_factory,
+        skill_store_dir=settings.skill_store_dir,
+        generated_artifact_dir=settings.generated_artifact_dir,
+    )
+    multimedia_generation_executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=admin_resource_service.list_models,
+        secret_service=secret_service,
+        tenant_id=settings.bootstrap_tenant_id,
+        redis_client=redis_client,
+    )
     service = RunService(
         run_repository,
         runtime_registry=configured_runtime_registry(
@@ -128,6 +146,7 @@ def build_worker_service(
                 skill_store_dir=settings.skill_store_dir,
                 workspace_root=settings.attachment_store_dir,
                 generated_artifact_dir=settings.generated_artifact_dir,
+                multimedia_generation_executor=multimedia_generation_executor,
             ),
         ),
         router=None,
@@ -135,6 +154,9 @@ def build_worker_service(
         hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
         runtime_timeout_seconds=settings.runtime_timeout_seconds,
         runtime_token_budget=settings.runtime_token_budget,
+        attachment_artifact_loader=FileSystemAttachmentArtifactLoader(
+            settings.attachment_store_dir
+        ),
         terminal_run_hooks=(
             *_evolution_terminal_hooks(
                 config_service=config_service,

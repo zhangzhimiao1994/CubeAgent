@@ -1111,6 +1111,29 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "文生语音",
 )
 
+_MULTIMEDIA_MEDIA_TERMS = (
+    "image",
+    "images",
+    "picture",
+    "pictures",
+    "poster",
+    "video",
+    "videos",
+    "audio",
+    "speech",
+    "media",
+    "multimedia",
+    "图片",
+    "图像",
+    "图",
+    "海报",
+    "视频",
+    "短视频",
+    "音频",
+    "语音",
+    "多媒体",
+)
+
 _MULTIMEDIA_GENERATION_NEGATIONS = (
     "不需要",
     "无需",
@@ -1506,8 +1529,11 @@ _PROJECT_PACKAGE_GENERATION_NEGATIONS = (
 
 def _is_multimedia_generation_request(task: str) -> bool:
     normalized = task.casefold()
-    return any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS) and not any(
-        negation in normalized for negation in _MULTIMEDIA_GENERATION_NEGATIONS
+    if _has_generation_negation(normalized):
+        return False
+    return any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS) or (
+        _has_delivery_action(normalized)
+        and any(term in normalized for term in _MULTIMEDIA_MEDIA_TERMS)
     )
 
 

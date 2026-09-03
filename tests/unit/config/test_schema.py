@@ -40,6 +40,28 @@ def test_agent_requires_existing_logical_model() -> None:
         PlatformConfig(models={}, agents=[agent(model="missing")])
 
 
+def test_agent_model_must_support_text() -> None:
+    media_only_model = LogicalModelDefinition(
+        deployments=[deployment(capabilities={"image_generation", "video_generation"})]
+    )
+
+    with pytest.raises(ValidationError, match="agent model must support text"):
+        PlatformConfig(models={"media_primary": media_only_model}, agents=[agent(model="media_primary")])
+
+
+def test_agent_model_can_bind_multi_capability_text_model() -> None:
+    multi_capability_model = LogicalModelDefinition(
+        deployments=[deployment(capabilities={"text", "image_generation", "video_generation"})]
+    )
+
+    config = PlatformConfig(
+        models={"creative_primary": multi_capability_model},
+        agents=[agent(model="creative_primary")],
+    )
+
+    assert config.agents[0].model == "creative_primary"
+
+
 def test_agent_ids_must_be_unique() -> None:
     with pytest.raises(ValidationError, match="duplicate agent id"):
         PlatformConfig(

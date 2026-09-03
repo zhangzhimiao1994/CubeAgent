@@ -177,6 +177,16 @@ class PlatformConfig(StrictConfigModel):
         if missing_agent_models:
             raise ValueError(f"unknown logical model: {missing_agent_models}")
 
+        non_text_agent_models = sorted(
+            {
+                agent.model
+                for agent in self.agents
+                if agent.model in self.models and not _logical_model_supports_text(self.models[agent.model])
+            }
+        )
+        if non_text_agent_models:
+            raise ValueError(f"agent model must support text: {non_text_agent_models}")
+
         for name, definition in self.models.items():
             fallback = definition.fallback_model
             if fallback is None:
@@ -186,3 +196,7 @@ class PlatformConfig(StrictConfigModel):
             if fallback not in self.models:
                 raise ValueError(f"unknown fallback model {fallback!r} for {name!r}")
         return self
+
+
+def _logical_model_supports_text(definition: LogicalModelDefinition) -> bool:
+    return any("text" in deployment.capabilities for deployment in definition.deployments)

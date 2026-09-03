@@ -290,6 +290,13 @@ def _tool_description(internal_name: str, external_name: str) -> str:
             "Required fields are title and files. files must be an object keyed by "
             "safe relative file path, and every value must be UTF-8 text content."
         )
+    if internal_name == "generate_multimedia":
+        return (
+            "Approved Agent Hub capability: generate_multimedia. Use the model "
+            f"function name {external_name} to generate an image, video, or audio "
+            "artifact through the configured multimedia executor. Required fields "
+            "are kind, logical_model, and prompt."
+        )
     return f"Approved Agent Hub capability: {internal_name}"
 
 
@@ -395,6 +402,31 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                     "additionalProperties": {"type": "string"},
                     "minProperties": 1,
                     "maxProperties": 64,
+                },
+            },
+        }
+    if internal_name == "generate_multimedia":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("kind", "logical_model", "prompt"),
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ("image", "video", "audio"),
+                    "description": "The media type to generate.",
+                },
+                "logical_model": {
+                    "type": "string",
+                    "description": (
+                        "Logical model configured with the matching generation capability."
+                    ),
+                    "minLength": 1,
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The final generation prompt for the media provider.",
+                    "minLength": 1,
                 },
             },
         }
@@ -559,7 +591,13 @@ def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
     delivery_tools = [
         tool
         for tool in tools
-        if tool in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+        if tool
+        in {
+            "document.generate_docx",
+            "generate_multimedia",
+            "presentation.generate_pptx",
+            "project.generate_zip",
+        }
     ]
     exposed_tools = ", ".join(tool.replace(".", "_") for tool in delivery_tools)
     return (
@@ -584,6 +622,22 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _model_request_checkpoint_mismatch_reason(
+    *,
+    step_id: str,
+    actor: str,
+    purpose: str,
+    call_index: int,
+    expected_sha256: str,
+    actual_sha256: str,
+) -> str:
+    return (
+        "model request changed after checkpoint "
+        f"(step={step_id}; actor={actor}; purpose={purpose}; "
+        f"call_index={call_index}; expected={expected_sha256}; actual={actual_sha256})"
+    )
 
 
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
@@ -2319,7 +2373,19 @@ class CrewDispatchRuntime:
             existing = model_ledger.states.get(key)
             if existing is not None:
                 if existing.get("request_sha256") != request_sha256:
-                    _fail("model request changed after checkpoint")
+                    expected_sha256 = existing.get("request_sha256")
+                    if not isinstance(expected_sha256, str):
+                        _fail("model ledger state is invalid")
+                    _fail(
+                        _model_request_checkpoint_mismatch_reason(
+                            step_id=step.id,
+                            actor=agent.id,
+                            purpose="step",
+                            call_index=call_index,
+                            expected_sha256=expected_sha256,
+                            actual_sha256=request_sha256,
+                        )
+                    )
                 if existing.get("status") == "succeeded":
                     model_artifact = model_ledger.artifacts.get(key)
                     if model_artifact is None:
@@ -2949,7 +3015,19 @@ class CrewDispatchRuntime:
                 existing = model_ledger.states.get(key)
                 if existing is not None:
                     if existing.get("request_sha256") != request_sha256:
-                        _fail("model request changed after checkpoint")
+                        expected_sha256 = existing.get("request_sha256")
+                        if not isinstance(expected_sha256, str):
+                            _fail("model ledger state is invalid")
+                        _fail(
+                            _model_request_checkpoint_mismatch_reason(
+                                step_id=step.id,
+                                actor=reviewer.id,
+                                purpose="review",
+                                call_index=call_index,
+                                expected_sha256=expected_sha256,
+                                actual_sha256=request_sha256,
+                            )
+                        )
                     if existing.get("status") == "succeeded":
                         model_artifact = model_ledger.artifacts.get(key)
                         if model_artifact is None:

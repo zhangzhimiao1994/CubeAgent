@@ -85,6 +85,15 @@ class TerminalRunHook(Protocol):
     ) -> None: ...
 
 
+class AttachmentArtifactLoader(Protocol):
+    async def __call__(
+        self,
+        *,
+        tenant_id: UUID,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ScheduleProposal:
     name: str
@@ -311,6 +320,7 @@ class RunService:
         runtime_timeout_seconds: float = 300.0,
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
+        attachment_artifact_loader: AttachmentArtifactLoader | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
         observer_policy: ObserverPolicy | None = None,
     ) -> None:
@@ -327,6 +337,7 @@ class RunService:
             TaskMode.DIRECT, configured_tokens=runtime_token_budget
         )
         self._main_agent_context_window_getter = main_agent_context_window_getter
+        self._attachment_artifact_loader = attachment_artifact_loader
         self._terminal_run_hooks = terminal_run_hooks
         self._observer_policy = observer_policy or ObserverPolicy()
 
@@ -1213,9 +1224,13 @@ class RunService:
         routing_decision: Mapping[str, object],
         runtime_token_budget: int,
     ) -> tuple[Artifact, ...]:
+        attachment_artifacts = await self._current_attachment_artifacts(
+            tenant_id=tenant_id,
+            routing_decision=routing_decision,
+        )
         conversation_id = _string_or_none(routing_decision.get("conversation_id"))
         if conversation_id is None:
-            return ()
+            return attachment_artifacts
         try:
             context_items = await self._repository.conversation_context(
                 tenant_id,
@@ -1229,7 +1244,7 @@ class RunService:
                 run_id,
                 conversation_id,
             )
-            return ()
+            return attachment_artifacts
         main_agent_context_window_tokens = await self._main_agent_context_window_tokens(
             routing_decision
         )
@@ -1244,8 +1259,34 @@ class RunService:
             history_token_budget=history_token_budget,
         )
         if artifact is None:
+            history_artifacts: tuple[Artifact, ...] = ()
+        else:
+            history_artifacts = (artifact,)
+        return (*attachment_artifacts, *history_artifacts)
+
+    async def _current_attachment_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
+    ) -> tuple[Artifact, ...]:
+        if self._attachment_artifact_loader is None:
             return ()
-        return (artifact,)
+        attachment_ids = _attachment_ids_from_routing(routing_decision)
+        if not attachment_ids:
+            return ()
+        try:
+            return await self._attachment_artifact_loader(
+                tenant_id=tenant_id,
+                attachment_ids=attachment_ids,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "attachment_context_load_failed tenant_id=%s attachment_count=%s",
+                tenant_id,
+                len(attachment_ids),
+            )
+            return ()
 
     async def _main_agent_context_window_tokens(
         self, routing_decision: Mapping[str, object]
@@ -2368,6 +2409,21 @@ def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
 
 def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _attachment_ids_from_routing(routing_decision: Mapping[str, object]) -> tuple[str, ...]:
+    raw = routing_decision.get("attachment_ids")
+    if not isinstance(raw, list | tuple):
+        return ()
+    result: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        if not re.fullmatch(r"att_[a-f0-9]{32}", item):
+            continue
+        if item not in result:
+            result.append(item)
+    return tuple(result)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

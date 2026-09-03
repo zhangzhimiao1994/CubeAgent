@@ -59,6 +59,26 @@ describe("AgentsPage", () => {
               effective_slots: 4,
               saturation_policy: "queue_first_then_fallback",
             },
+            {
+              id: "22222222-2222-4222-8222-222222222222",
+              provider: "minimax",
+              api_base: "https://api.minimax.io/v1",
+              upstream_model: "MiniMax-Hailuo-02",
+              logical_model: "video_primary",
+              capabilities: ["video_generation"],
+              credential_ref: "secret://media",
+              quota_scope: "minimax-video-account",
+              max_concurrency: 1,
+              target_utilization: 0.8,
+              reserved_capacity: 0,
+              rpm: 3,
+              tpm: null,
+              queue_timeout_seconds: 60,
+              fallback: null,
+              weight: 100,
+              effective_slots: 1,
+              saturation_policy: "queue_first_then_fallback",
+            },
           ]);
         }
         if (path === "/api/v1/admin/agents" && method === "GET") {
@@ -103,6 +123,15 @@ describe("AgentsPage", () => {
         skills: [],
       },
     });
+  });
+
+  it("hides generation-only multimedia models from ordinary agent binding", async () => {
+    render(<TestApp initialPath="/agents" />);
+
+    const modelSelect = (await screen.findByLabelText("绑定逻辑模型")) as HTMLSelectElement;
+
+    expect(Array.from(modelSelect.options).map((option) => option.value)).toEqual(["main"]);
+    expect(screen.getByText(/已隐藏 1 个不支持文本对话的多媒体生成模型/)).not.toBeNull();
   });
 
   it("loads an existing agent into the form for editing", async () => {

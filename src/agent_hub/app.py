@@ -105,6 +105,7 @@ from agent_hub.routing.types import (
     RouteDecision,
     RouteSource,
 )
+from agent_hub.runs.attachments import FileSystemAttachmentArtifactLoader
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
@@ -770,6 +771,25 @@ def create_app(
                 )
             if user_admin_service is None and active_sessions is not None:
                 application.state.user_admin_service = PersistentUserAdminService(active_sessions)
+            if (
+                active_secret_service is not None
+                and active_redis is not None
+                and getattr(application.state, "multimedia_generation_executor", None) is None
+            ):
+                admin_service_for_generation = cast(
+                    admin.AdminResourceService,
+                    admin_resource_service
+                    if admin_resource_service is not None
+                    else application.state.admin_resource_service,
+                )
+                application.state.multimedia_generation_executor = (
+                    _ConfigBackedMultimediaGenerationExecutor(
+                        list_models=admin_service_for_generation.list_models,
+                        secret_service=active_secret_service,
+                        tenant_id=configured.bootstrap_tenant_id,
+                        redis_client=active_redis,
+                    )
+                )
             if run_service is None:
                 assert active_sessions is not None
                 if active_runtime_registry is None:
@@ -779,6 +799,11 @@ def create_app(
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
+                        multimedia_generation_executor=getattr(
+                            application.state,
+                            "multimedia_generation_executor",
+                            None,
+                        ),
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
@@ -821,6 +846,9 @@ def create_app(
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                     runtime_timeout_seconds=configured.runtime_timeout_seconds,
                     runtime_token_budget=configured.runtime_token_budget,
+                    attachment_artifact_loader=FileSystemAttachmentArtifactLoader(
+                        configured.attachment_store_dir
+                    ),
                     main_agent_context_window_getter=_MainAgentContextWindowGetter(
                         cast(
                             admin.AdminResourceService,
@@ -871,7 +899,11 @@ def create_app(
                     run_repository=RunRepository(active_sessions),
                     sender=FeishuOpenAPIReplySender(),
                 )
-            if active_secret_service is not None and active_redis is not None:
+            if (
+                active_secret_service is not None
+                and active_redis is not None
+                and getattr(application.state, "multimedia_generation_executor", None) is None
+            ):
                 admin_service_for_generation = cast(
                     admin.AdminResourceService,
                     admin_resource_service

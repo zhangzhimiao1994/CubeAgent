@@ -4266,9 +4266,14 @@ export function RunsPage() {
                 ) : null}
                 <button
                   type="submit"
-                  disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
+                  disabled={
+                    createRun.isPending ||
+                    uploadAttachment.isPending ||
+                    message.trim().length === 0 ||
+                    Boolean(directSendBlockedReason)
+                  }
                 >
-                  {createRun.isPending ? "发送中..." : "发送"}
+                  {createRun.isPending ? "发送中..." : uploadAttachment.isPending ? "上传中..." : "发送"}
                 </button>
               </div>
             </div>

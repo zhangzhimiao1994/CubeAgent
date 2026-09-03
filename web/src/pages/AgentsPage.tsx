@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
 import { api, formatApiError } from "../api/client";
+import type { ModelDeployment } from "../api/client";
 
 type RoleTemplate = {
   id: string;
@@ -134,6 +135,31 @@ function parseSkills(value: string) {
     .filter(Boolean);
 }
 
+function textCapableLogicalModels(models: ModelDeployment[]) {
+  return Array.from(
+    new Set(
+      models
+        .filter((item) => item.capabilities.includes("text"))
+        .map((item) => item.logical_model),
+    ),
+  ).sort();
+}
+
+function generationOnlyLogicalModels(models: ModelDeployment[]) {
+  const grouped = new Map<string, Set<string>>();
+  for (const item of models) {
+    const capabilities = grouped.get(item.logical_model) ?? new Set<string>();
+    for (const capability of item.capabilities) {
+      capabilities.add(capability);
+    }
+    grouped.set(item.logical_model, capabilities);
+  }
+  return Array.from(grouped.entries())
+    .filter(([, capabilities]) => !capabilities.has("text"))
+    .map(([logicalModel]) => logicalModel)
+    .sort();
+}
+
 export function AgentsPage() {
   const queryClient = useQueryClient();
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
@@ -151,8 +177,9 @@ export function AgentsPage() {
   const [skills, setSkills] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
-  const modelOptions = useMemo(
-    () => Array.from(new Set((models.data ?? []).map((item) => item.logical_model))).sort(),
+  const modelOptions = useMemo(() => textCapableLogicalModels(models.data ?? []), [models.data]);
+  const hiddenGenerationOnlyModels = useMemo(
+    () => generationOnlyLogicalModels(models.data ?? []),
     [models.data],
   );
   const selectedModel = model || modelOptions[0] || "";
@@ -251,6 +278,12 @@ export function AgentsPage() {
 
       {modelOptions.length === 0 ? (
         <p role="alert">还没有可用模型。请先到“模型”页面添加模型，并通过 API 可用性测试。</p>
+      ) : null}
+      {hiddenGenerationOnlyModels.length > 0 ? (
+        <p className="field-help">
+          已隐藏 {hiddenGenerationOnlyModels.length} 个不支持文本对话的多媒体生成模型：
+          {hiddenGenerationOnlyModels.join("、")}。图片/视频模型应由对应的多媒体子 Agent 或生成任务使用。
+        </p>
       ) : null}
 
       <form onSubmit={submit} aria-label="保存 Agent">

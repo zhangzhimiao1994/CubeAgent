@@ -13,7 +13,7 @@ from agent_hub.cognitive.pipeline import CognitiveLearningTerminalHook
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import HermesRunOutcome, RunService
-from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -165,6 +165,15 @@ class RuntimeCompletes:
         raise AssertionError("not used")
 
 
+class RuntimeCapturesArtifacts(RuntimeCompletes):
+    def __init__(self) -> None:
+        self.artifacts: tuple[Artifact, ...] = ()
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.artifacts = context.artifacts
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+
 class RuntimeReportsCapacityPressure:
     mode = TaskMode.DISPATCH
 
@@ -281,6 +290,49 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "routing_decision": {"source": "evolution", "evolution_run_id": "evolution_1"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_loads_current_attachment_artifacts_into_runtime_context() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "conversation_id": "conv-with-file",
+            "attachment_ids": ["att_11111111111111111111111111111111"],
+        }
+    )
+    runtime = RuntimeCapturesArtifacts()
+    attachment_artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="uploaded_attachment",
+        content={
+            "text": "附件：screen.png\n类型：image\n说明：用户本轮上传的文件。",
+            "attachment_id": "att_11111111111111111111111111111111",
+        },
+    )
+
+    async def load_attachments(
+        *,
+        tenant_id: UUID,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]:
+        assert tenant_id == TENANT_ID
+        assert attachment_ids == ("att_11111111111111111111111111111111",)
+        return (attachment_artifact,)
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        attachment_artifact_loader=load_attachments,
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert attachment_artifact in runtime.artifacts
 
 
 @pytest.mark.asyncio
