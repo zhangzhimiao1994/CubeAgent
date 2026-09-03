@@ -116,7 +116,24 @@ const runDetail: RunDetail = {
   },
 };
 
-const settings = {
+type TestSettings = {
+  allow_main_agent_override: boolean;
+  allow_temporary_agents: boolean;
+  attachment_max_mb: number;
+  attachment_retention_days: number;
+  channel_entry: string;
+  default_agent_ids: string[];
+  default_mode: string;
+  default_workflow_id: string | null;
+  hermes_enabled: boolean;
+  log_level: string;
+  require_approval_for_tools: boolean;
+  safe_tools_enabled: boolean;
+  temporary_agent_policy: string;
+  vibe_coding_enabled: boolean;
+};
+
+const settings: TestSettings = {
   default_mode: "auto",
   default_workflow_id: null,
   default_agent_ids: [],
@@ -420,6 +437,7 @@ describe("operational management pages", () => {
   let visibleConversationRuns = [runDetail];
   let visibleRunListItems = [runListItem];
   let visibleModels = models;
+  let visibleSettings = settings;
   let visibleWorkflows = workflows;
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
@@ -442,6 +460,7 @@ describe("operational management pages", () => {
     visibleConversationRuns = [visibleRunDetail];
     visibleRunListItems = [visibleRunListItem];
     visibleModels = models;
+    visibleSettings = settings;
     visibleWorkflows = workflows;
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
@@ -712,7 +731,7 @@ describe("operational management pages", () => {
           });
         }
         if (path === "/api/v1/admin/settings") {
-          return jsonResponse(settings);
+          return jsonResponse(visibleSettings);
         }
         if (path === "/api/v1/admin/main-agent") {
           return jsonResponse(mainAgent);
@@ -1373,8 +1392,11 @@ describe("operational management pages", () => {
     vi.unstubAllGlobals();
   });
 
-  async function openRunConfig(user: ReturnType<typeof userEvent.setup>) {
-    await user.click(screen.getByRole("button", { name: /打开本次运行配置|open/i }));
+  function currentProcessArea() {
+    return (
+      (document.querySelector(".chat-active-process-dock") as HTMLElement | null) ??
+      screen.getByRole("region", { name: "主对话内容" })
+    );
   }
 
   it("shows run operations and supports pause control on the detail page", async () => {
@@ -1561,16 +1583,14 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
   });
-  it("keeps agent process access inside the center chat stream and sends selected workflow roles", async () => {
+  it("keeps agent process access visible while hiding per-run workflow configuration", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     expect(screen.getByText(/连续对话窗口/)).not.toBeNull();
-
-    await openRunConfig(user);
-    await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
-    expect(screen.getByText(/全局临场策略已开启/)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /打开本次运行配置/ })).toBeNull();
+    expect(screen.queryByLabelText("使用工作流")).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -1581,24 +1601,133 @@ describe("operational management pages", () => {
       method: "POST",
       body: {
         message: "给我做一个短视频脚本方案。",
-        mode: "dispatch",
-        workflow_id: "short-video-dispatch",
+        mode: "auto",
+        workflow_id: null,
         allow_workflow_adjustment: true,
-        agent_ids: ["director", "copywriter", "editor"],
+        agent_ids: [],
       },
     });
+  });
+
+  it("does not submit a hidden default workflow from the chat composer", async () => {
+    const user = userEvent.setup();
+    visibleSettings = {
+      ...settings,
+      default_workflow_id: "short-video-dispatch",
+      default_agent_ids: ["director", "copywriter"],
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(screen.queryByLabelText("使用工作流")).toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "继续完善这个方案。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      body: {
+        workflow_id: null,
+        agent_ids: ["director", "copywriter"],
+      },
+    });
+  });
+
+  it("docks the latest running agent process above the composer while older process cards stay in history", async () => {
+    const user = userEvent.setup();
+    const completedRun = {
+      ...runDetail,
+      status: "completed",
+      request: "上一轮：先生成提示词。",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: conversationCreatedAt,
+          actor: "copywriter",
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: "previous_prompt",
+          action: null,
+          decision: null,
+          payload: { result: "上一轮规划输出：提示词结构完成。" },
+        },
+      ],
+      artifacts: [],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "copywriter",
+      },
+    };
+    const runningRun = {
+      ...runDetail,
+      id: secondRunId,
+      status: "running",
+      request: "当前轮：继续生成图片提示词。",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:02:00Z",
+          actor: "director",
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: "current_prompt",
+          action: null,
+          decision: null,
+          payload: { result: "当前轮规划输出：正在整理图片风格。" },
+        },
+      ],
+      artifacts: [],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "director",
+      },
+    };
+    visibleRunListItem = { ...runListItem, status: "running", mode: "dispatch" };
+    visibleRunListItems = [visibleRunListItem];
+    visibleRunDetail = runningRun;
+    visibleConversationRuns = [completedRun, runningRun];
+
+    const view = render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const activeDock = view.container.querySelector(".chat-active-process-dock") as HTMLElement | null;
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement | null;
+
+    expect(activeDock).not.toBeNull();
+    expect(composer).not.toBeNull();
+    expect(within(activeDock as HTMLElement).getByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
+    expect(within(activeDock as HTMLElement).getByText(/当前轮规划输出/)).not.toBeNull();
+    expect(within(stream).getByText(/上一轮规划输出/)).not.toBeNull();
+    expect(within(stream).queryByText(/当前轮规划输出/)).toBeNull();
+    expect(
+      Boolean(
+        (activeDock as HTMLElement).compareDocumentPosition(composer as HTMLFormElement) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
   });
 
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
     render(<TestApp initialPath="/collaboration?section=workflows" />);
 
-    expect(await screen.findByRole("heading", { name: "流程模板" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "协作预设" })).not.toBeNull();
     expect(screen.queryByText(/临场调整/)).toBeNull();
     expect(screen.queryByText(/临时子 Agent/)).toBeNull();
     expect(screen.queryByLabelText("临时 Agent 补位规则")).toBeNull();
+    expect(screen.queryByLabelText("执行步骤（每行一个）")).toBeNull();
+    expect(screen.queryByLabelText("交付物（每行一个）")).toBeNull();
+    expect(screen.queryByLabelText("分歧裁决规则")).toBeNull();
   });
 
-  it("filters and sorts saved workflows like an operational table", async () => {
+  it("filters saved workflow presets as compact cards", async () => {
     const user = userEvent.setup();
     visibleWorkflows = [
       ...workflows,
@@ -1616,47 +1745,36 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/collaboration?section=workflows" />);
 
-    expect(await screen.findByRole("table", { name: "已保存工作流列表" })).not.toBeNull();
-    expect(screen.getByRole("searchbox", { name: "快速搜索工作流" })).not.toBeNull();
-    expect(screen.getByLabelText("按工作流状态筛选")).not.toBeNull();
-    expect(screen.getByLabelText("按工作流默认模式筛选")).not.toBeNull();
+    expect(await screen.findByRole("list", { name: "已保存协作预设列表" })).not.toBeNull();
+    expect(screen.getByRole("searchbox", { name: "快速搜索协作预设" })).not.toBeNull();
+    expect(screen.queryByLabelText("按工作流状态筛选")).toBeNull();
+    expect(screen.queryByLabelText("按工作流默认模式筛选")).toBeNull();
     expect(screen.getByText("显示 2 / 2")).not.toBeNull();
 
-    await user.type(screen.getByRole("searchbox", { name: "快速搜索工作流" }), "学术");
+    await user.type(screen.getByRole("searchbox", { name: "快速搜索协作预设" }), "学术");
     expect(screen.getByText("学术研究混合流程")).not.toBeNull();
     expect(screen.queryByText("短视频派单")).toBeNull();
 
-    await user.click(screen.getByRole("button", { name: "清空工作流筛选" }));
+    await user.click(screen.getByRole("button", { name: "清空搜索" }));
     expect(await screen.findByText("短视频派单")).not.toBeNull();
-
-    await user.selectOptions(screen.getByLabelText("按工作流默认模式筛选"), "hybrid");
-    expect(screen.getByText("学术研究混合流程")).not.toBeNull();
-    expect(screen.queryByText("短视频派单")).toBeNull();
-
-    await user.selectOptions(screen.getByLabelText("按工作流默认模式筛选"), "all");
-    await user.selectOptions(screen.getByLabelText("按工作流状态筛选"), "enabled");
-    expect(screen.getByText("短视频派单")).not.toBeNull();
-    expect(screen.queryByText("学术研究混合流程")).toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "工作流排序" }));
-    expect(screen.getByRole("button", { name: "工作流排序" }).textContent).toContain("↓");
+    expect(screen.getByText("已停用")).not.toBeNull();
+    expect(screen.getByText("hybrid")).not.toBeNull();
   });
+
   it("loads an existing workflow into the form for editing", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/collaboration?section=workflows" />);
 
-    expect(await screen.findByRole("heading", { name: "流程模板" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "编辑工作流" }));
+    expect(await screen.findByRole("heading", { name: "协作预设" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "编辑预设" }));
 
     expect(screen.getByRole("status").textContent).toContain("已载入 短视频派单");
-    expect((screen.getByLabelText("工作流 ID") as HTMLInputElement).value).toBe("short-video-dispatch");
-    expect((screen.getByLabelText("执行步骤（每行一个）") as HTMLTextAreaElement).value).toBe(
-      "拆解需求\n角色分工\n汇总产物",
-    );
+    expect((screen.getByLabelText("预设 ID") as HTMLInputElement).value).toBe("short-video-dispatch");
+    expect(screen.queryByLabelText("执行步骤（每行一个）")).toBeNull();
 
-    await user.clear(screen.getByLabelText("工作流目标"));
-    await user.type(screen.getByLabelText("工作流目标"), "更新后的短视频脚本方案");
-    await user.click(screen.getByRole("button", { name: "保存流程模板" }));
+    await user.clear(screen.getByLabelText("一句话策略"));
+    await user.type(screen.getByLabelText("一句话策略"), "更新后的短视频脚本方案");
+    await user.click(screen.getByRole("button", { name: "保存协作预设" }));
 
     expect(
       requests.find((request) => request.path === "/api/v1/admin/workflows" && request.method === "POST"),
@@ -1665,6 +1783,10 @@ describe("operational management pages", () => {
         id: "short-video-dispatch",
         name: "短视频派单",
         objective: "更新后的短视频脚本方案",
+        role_selection_policy: "更新后的短视频脚本方案",
+        steps: ["拆解需求", "角色分工", "汇总产物"],
+        deliverables: ["脚本", "分镜", "剪辑建议"],
+        decision_policy: "主 Agent 汇总裁决",
         agent_ids: ["director", "copywriter", "editor"],
       },
     });
@@ -2287,11 +2409,12 @@ describe("operational management pages", () => {
 
     expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
     expect(within(stream).queryByRole("button", { name: /已记录 3 个关键步骤/ })).toBeNull();
-    expect(within(stream).getByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
+    const processArea = currentProcessArea();
+    expect(within(processArea).getByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
     expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
-    expect(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ })).not.toBeNull();
-    expect(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ })).not.toBeNull();
-    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ }));
+    expect(within(processArea).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ })).not.toBeNull();
+    expect(within(processArea).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ })).not.toBeNull();
+    await user.click(within(processArea).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ }));
     expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByText("子 Agent 工作席")).not.toBeNull();
@@ -2851,8 +2974,9 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const copywriterOutput = within(stream).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ });
-    const processCards = Array.from(stream.querySelectorAll(".process-intermediate-card"));
+    const processArea = currentProcessArea();
+    const copywriterOutput = within(processArea).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ });
+    const processCards = Array.from(processArea.querySelectorAll(".process-intermediate-card"));
     expect(processCards.length).toBeLessThanOrEqual(3);
 
     expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
@@ -2980,14 +3104,14 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    const stream = screen.getByRole("region", { name: "主对话内容" });
-    const copywriterOutput = within(stream).getByRole("button", {
+    const processArea = currentProcessArea();
+    const copywriterOutput = within(processArea).getByRole("button", {
       name: /文案生成 输出：文案生成输出：中秋活动脚本包含开场、互动和收尾/,
     });
-    const directorOutput = within(stream).getByRole("button", {
+    const directorOutput = within(processArea).getByRole("button", {
       name: /导演 输出：导演输出：压缩主持人串场，保留抽奖互动/,
     });
-    expect(within(stream).queryByRole("button", { name: /完成阶段输出|生成了结果/ })).toBeNull();
+    expect(within(processArea).queryByRole("button", { name: /完成阶段输出|生成了结果/ })).toBeNull();
     expect(copywriterOutput.compareDocumentPosition(directorOutput) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     await user.click(directorOutput);
@@ -3085,7 +3209,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText(/第二版输出/)).toBeNull();
 
@@ -3172,7 +3296,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：终态第一版/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /文案生成 输出：终态第一版/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText(/终态补写产物/)).toBeNull();
 
@@ -3245,8 +3369,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     await user.click(within(drawer).getByRole("button", { name: /打开活动详情：文案生成 输出/ }));
     const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
@@ -3336,7 +3459,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getAllByRole("button", { name: /文案生成 输出：同一份摘要/ })[0]);
+    await user.click(within(currentProcessArea()).getAllByRole("button", { name: /文案生成 输出：同一份摘要/ })[0]);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 输出/ }).length).toBeGreaterThanOrEqual(2);
   });
@@ -3348,7 +3471,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(document.body.style.overflow).toBe("hidden");
 
@@ -3393,7 +3516,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     const hermesRow = within(drawer).getByRole("button", { name: /Hermes\+ 记忆：已注入 1 条，未注入 1 条/ });
     expect(within(drawer).queryByRole("button", { name: /查看详情/ })).toBeNull();
@@ -3444,7 +3567,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByRole("button", { name: /Hermes\+ 记忆/ })).toBeNull();
 
@@ -3479,7 +3602,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
     expect(within(drawer).queryByRole("button", { name: /Hermes\+ 记忆/ })).toBeNull();
@@ -3527,7 +3650,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const outputRow = within(stream).getByRole("button", { name: /文案生成 输出：中秋活动文案初稿/ });
+    const outputRow = within(currentProcessArea()).getByRole("button", { name: /文案生成 输出：中秋活动文案初稿/ });
     expect(within(stream).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
 
     await user.click(outputRow);
@@ -3551,7 +3674,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
     expect(within(drawer).queryByText("参与者")).toBeNull();
@@ -3887,8 +4010,6 @@ describe("operational management pages", () => {
     const view = render(<TestApp initialPath="/" />);
 
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
-    await openRunConfig(user);
-    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -3941,8 +4062,6 @@ describe("operational management pages", () => {
     const view = render(<TestApp initialPath="/" />);
 
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
-    await openRunConfig(user);
-    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -3966,8 +4085,6 @@ describe("operational management pages", () => {
     const view = render(<TestApp initialPath="/" />);
 
     await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
-    await openRunConfig(user);
-    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -4006,31 +4123,27 @@ describe("operational management pages", () => {
     );
   });
 
-  it("keeps a clear mobile hierarchy for chat sessions, content, and run settings", async () => {
-    const user = userEvent.setup();
+  it("keeps a clear mobile hierarchy for chat sessions, content, and the fixed composer", async () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
-    await openRunConfig(user);
-    expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
-    expect(screen.getByText("本次运行设置")).not.toBeNull();
+    expect(document.querySelector(".chat-sticky-footer")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /打开本次运行配置/ })).toBeNull();
+    expect(screen.queryByLabelText("使用工作流")).toBeNull();
   });
 
 
-  it("loads a referenced conversation by id from the chat page", async () => {
+  it("keeps branch reference controls lightweight in the fixed composer", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await openRunConfig(user);
-    await user.type(screen.getByLabelText("参考会话 ID"), "conv-previous");
-    await user.click(screen.getByRole("button", { name: "读取参考会话" }));
+    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
+    await user.click(screen.getByRole("button", { name: "读取引用" }));
 
     expect(await screen.findByText("conv-previous")).not.toBeNull();
-    expect(screen.getByText(/已读取 1 条运行/)).not.toBeNull();
     expect(screen.getAllByText(runDetail.request).length).toBeGreaterThan(0);
   });
 

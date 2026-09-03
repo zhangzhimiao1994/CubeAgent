@@ -9,7 +9,7 @@ import { ArtifactFileCard, artifactFileName, hasArtifactDownload } from "../comp
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
   { value: "direct", label: "直连", description: "由你指定一个模型/API回答，主 Agent 负责控场、提示词和记录。" },
-  { value: "dispatch", label: "派单", description: "适合拆成多个专业角色执行；派给谁由工作流或本次选择决定。" },
+  { value: "dispatch", label: "派单", description: "适合拆成多个专业角色执行；派给谁由主 Agent、协作预设和系统默认角色池决定。" },
   { value: "discuss", label: "讨论", description: "适合多角色观点冲突、方案评审或需要裁决的任务。" },
   { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，最后审查收口。" },
 ] as const;
@@ -131,7 +131,7 @@ function displayMode(mode: string | null | undefined) {
 function displayRoutingReason(reason: string) {
   const normalized = reason.trim();
   const labels: Record<string, string> = {
-    "workflow selected explicitly": "按你选择的工作流执行",
+    "workflow selected explicitly": "按协作预设执行",
     routing_requires_user_choice: "自动判断把握不足，需要确认模式",
     main_agent_auto_resolved: "主 Agent 已根据任务现场自动裁决",
     router_unavailable: "主 Agent 暂时无法可靠判断，需要你确认运行方式",
@@ -2711,19 +2711,16 @@ export function RunsPage() {
   const runListItems = runs.data ?? [];
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
-  const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
-  const [workflowId, setWorkflowId] = useState("");
   const [agentIds, setAgentIds] = useState<string[]>([]);
   const [conversationId, setConversationId] = useState(newConversationId);
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
-  const [configOpen, setConfigOpen] = useState(false);
   const [directModel, setDirectModel] = useState("");
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -2757,11 +2754,6 @@ export function RunsPage() {
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
-
-  const selectedWorkflow = useMemo(
-    () => (workflows.data ?? []).find((workflow) => workflow.id === workflowId),
-    [workflowId, workflows.data],
-  );
 
   const selectedRun = useQuery({
     queryKey: ["run", selectedRunId],
@@ -2824,18 +2816,8 @@ export function RunsPage() {
     if (!userSelectedMode.current) {
       setMode(settings.data.default_mode);
     }
-    setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
   }, [settings.data]);
-
-  useEffect(() => {
-    if (!selectedWorkflow) return;
-    if (selectedWorkflow.mode) {
-      userSelectedMode.current = true;
-      setMode(selectedWorkflow.mode);
-    }
-    setAgentIds(selectedWorkflow.agent_ids ?? []);
-  }, [selectedWorkflow]);
 
   useEffect(() => {
     const selection = modeSelectionFromRunDetail(selectedRun.data);
@@ -2935,7 +2917,7 @@ export function RunsPage() {
       return api.createRun({
         message: runMessage,
         mode: runMode,
-        workflow_id: workflowId || null,
+        workflow_id: null,
         allow_workflow_adjustment: runMode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
         agent_ids: runMode === "direct" ? [] : agentIds,
         direct_model: runMode === "direct" ? selectedDirectModel : null,
@@ -3450,7 +3432,6 @@ export function RunsPage() {
     setMessage("");
     userSelectedMode.current = false;
     setMode(settings.data?.default_mode ?? "auto");
-    setWorkflowId(settings.data?.default_workflow_id ?? "");
     setAgentIds(settings.data?.default_agent_ids ?? []);
     setDirectModel("");
     setTemporaryApproval(null);
@@ -3498,11 +3479,9 @@ export function RunsPage() {
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runListItems;
-  const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
-  const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
   const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
@@ -3515,6 +3494,8 @@ export function RunsPage() {
   const openClawApprovalVisibleInMessages =
     !!openClawApproval && messages.some((item) => item.id === `${openClawApproval.runId}-openclaw-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
+  const activeProcessDockRun =
+    latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status) ? latestVisibleRun : null;
   const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
   const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
@@ -3595,7 +3576,7 @@ export function RunsPage() {
   }
 
   return (
-    <section>
+    <section className="chat-page">
       <p className="eyebrow">Conversation</p>
       <h2>对话</h2>
       <p className="compact-page-intro">
@@ -3736,160 +3717,7 @@ export function RunsPage() {
           ) : null}
         </nav>
 
-        <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>
-          {configOpen ? (
-              <div className="composer-config-sheet" role="region" aria-label="本次运行更多设置">
-          <details className="run-settings-panel" aria-label="本次运行设置" open>
-            <summary aria-label="展开或收起本次运行设置">本次运行设置</summary>
-            <div className="chat-config-strip" aria-label="本次对话运行设置">
-            <label htmlFor="run-mode">
-              模式
-              <select id="run-mode" value={mode} onChange={(event) => chooseRunMode(event.target.value as RunMode)}>
-                {RUN_MODES.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label htmlFor="run-workflow">
-              使用工作流
-              <select id="run-workflow" value={workflowId} onChange={(event) => setWorkflowId(event.target.value)}>
-                <option value="">不使用固定工作流</option>
-                {savedWorkflows
-                  .filter((workflow) => workflow.enabled)
-                  .map((workflow) => (
-                    <option key={workflow.id} value={workflow.id}>
-                      {workflow.name}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            <label htmlFor="conversation-id">
-              本次会话 ID
-              <input
-                id="conversation-id"
-                value={conversationId}
-                onChange={(event) => setConversationId(event.target.value)}
-              />
-            </label>
-            <label htmlFor="reference-conversation-id">
-              参考会话 ID
-              <input
-                id="reference-conversation-id"
-                value={referenceConversationId}
-                onChange={(event) => setReferenceConversationId(event.target.value)}
-                placeholder="可选：粘贴其他会话 ID"
-              />
-            </label>
-            <button
-              className="secondary-action inline-action"
-              type="button"
-              disabled={!trimmedReferenceConversationId || referenceConversation.isFetching}
-              onClick={loadReferenceConversation}
-            >
-              {referenceConversation.isFetching ? "读取中..." : "读取参考会话"}
-            </button>
-            <div className="mode-help">
-              <span className="eyebrow">{selectedMode.label}</span>
-              <p>{selectedMode.description}</p>
-              {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
-              {settings.isError ? (
-                <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p>
-              ) : null}
-              {workflows.isError ? (
-                <p role="alert">{formatApiError(workflows.error, "工作流列表加载失败")}</p>
-              ) : null}
-              {selectedWorkflow ? (
-                <>
-                  <p>
-                    当前工作流：{selectedWorkflow.name}
-                    {selectedWorkflow.task_type ? `；适用场景：${selectedWorkflow.task_type}` : ""}
-                  </p>
-                  <p>
-                    全局临场策略：
-                    {settings.data?.allow_main_agent_override
-                      ? "全局临场策略已开启；主 Agent 可以提出改步骤、换角色或加交付物，但执行前必须向你核对。"
-                      : "关闭；主 Agent 会按预设执行，只提示明显不匹配风险。"}
-                  </p>
-                  <p>
-                    临时子 Agent：
-                    {settings.data?.allow_temporary_agents
-                      ? "允许在能力不足时提出申请，用户确认后才加入。"
-                      : "关闭；不会临时扩充角色池。"}
-                  </p>
-                </>
-              ) : (
-                <p>未选择工作流时，主 Agent 会按消息内容和你勾选的角色进行调度。</p>
-              )}
-            </div>
-            {referenceConversation.data ? (
-              <div className="reference-preview">
-                <span className="eyebrow">{referenceConversation.data.conversation_id}</span>
-                <strong>已读取 {referenceConversation.data.runs.length} 条运行</strong>
-                {referenceConversation.data.runs.slice(0, 3).map((run) => (
-                  <p key={run.id}>{run.request}</p>
-                ))}
-              </div>
-            ) : null}
-            {referenceConversation.isError ? (
-              <p className="form-error" role="alert">
-                {formatApiError(referenceConversation.error, "参考会话读取失败")}
-              </p>
-            ) : null}
-            </div>
-          </details>
-
-          <details className="inline-guide" open={mode !== "direct"}>
-            <summary>{mode === "direct" ? "直连说明" : "选择本次参与角色池"}</summary>
-            {mode === "direct" ? (
-              <>
-                <p className="field-help">
-                  直连模型不在这里下拉选择。请回到主对话，按编号或模型关键词选择本次对话使用的模型/API。
-                </p>
-                {models.isLoading ? <p className="field-help">正在加载已测试模型...</p> : null}
-                {models.isError ? (
-                  <p className="field-help" role="alert">
-                    {formatApiError(models.error, "模型列表加载失败")}
-                  </p>
-                ) : null}
-                {savedModels.length === 0 ? (
-                  <p className="field-help">还没有可用于直连的已测试模型，请先到“模型与 API”页面配置。</p>
-                ) : null}
-              </>
-            ) : (
-              <>
-                <p className="field-help">
-                  同一个模式可以派给不同对象。选择工作流会自动带出默认角色；你也可以为本次任务临时增删。
-                </p>
-                <fieldset>
-                  <legend>角色池</legend>
-                  {agents.isLoading ? (
-                    <p className="field-help">正在加载 Agent 角色...</p>
-                  ) : agents.isError ? (
-                    <p className="field-help" role="alert">
-                      {formatApiError(agents.error, "Agent 列表加载失败")}
-                    </p>
-                  ) : savedAgents.length === 0 ? (
-                    <p className="field-help">还没有 Agent。请先到 Agent 页面创建角色。</p>
-                  ) : (
-                    savedAgents.map((agent) => (
-                      <label key={agent.id} className="inline-check">
-                        <input
-                          type="checkbox"
-                          checked={agentIds.includes(agent.id)}
-                          onChange={() => setAgentIds((current) => toggle(current, agent.id))}
-                        />
-                        {agent.name}（{agent.id}）
-                      </label>
-                    ))
-                  )}
-                </fieldset>
-              </>
-            )}
-          </details>
-            </div>
-          ) : null}
+        <div className="chat-panel">
 
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
@@ -3980,37 +3808,40 @@ export function RunsPage() {
                 <p>{openClawProposalBody(openClawApproval.proposal)}</p>
               </article>
             ) : null}
-            {messages.map((item, index) => (
-              <Fragment key={item.id}>
-                {item.temporaryAgentProposal ? (
-                  <TemporaryAgentRecruitmentCard
-                    proposal={item.temporaryAgentProposal}
-                    approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
-                    onOpen={() => setTemporaryAgentDetail(item.temporaryAgentProposal ?? null)}
-                    onApprove={approveTemporaryAgentFromCard}
-                    onReject={rejectTemporaryAgentFromCard}
-                    onRevise={requestTemporaryAgentRevisionFromCard}
-                    onPersist={persistTemporaryAgentFromCard}
-                    disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
-                  />
-                ) : (
-                  <article className={`chat-message ${item.role}`}>
-                    <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
-                    <h3>{item.title}</h3>
-                    <MessageBody text={item.body} title={item.title} />
-                    {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
-                  </article>
-                )}
-                {item.id.endsWith("-request") && item.run ? (
-                  <RunProcessSummary
-                    detail={item.run}
-                    onOpen={setProcessDetailTarget}
-                    agentNames={agentNameMap}
-                    mainAgentModelName={mainAgentModelName}
-                  />
-                ) : null}
-              </Fragment>
-            ))}
+            {messages.map((item, index) => {
+              const shouldDockProcess = item.id.endsWith("-request") && item.run?.id === activeProcessDockRun?.id;
+              return (
+                <Fragment key={item.id}>
+                  {item.temporaryAgentProposal ? (
+                    <TemporaryAgentRecruitmentCard
+                      proposal={item.temporaryAgentProposal}
+                      approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
+                      onOpen={() => setTemporaryAgentDetail(item.temporaryAgentProposal ?? null)}
+                      onApprove={approveTemporaryAgentFromCard}
+                      onReject={rejectTemporaryAgentFromCard}
+                      onRevise={requestTemporaryAgentRevisionFromCard}
+                      onPersist={persistTemporaryAgentFromCard}
+                      disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
+                    />
+                  ) : (
+                    <article className={`chat-message ${item.role}`}>
+                      <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
+                      <h3>{item.title}</h3>
+                      <MessageBody text={item.body} title={item.title} />
+                      {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
+                    </article>
+                  )}
+                  {item.id.endsWith("-request") && item.run && !shouldDockProcess ? (
+                    <RunProcessSummary
+                      detail={item.run}
+                      onOpen={setProcessDetailTarget}
+                      agentNames={agentNameMap}
+                      mainAgentModelName={mainAgentModelName}
+                    />
+                  ) : null}
+                </Fragment>
+              );
+            })}
           </div>
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
@@ -4023,6 +3854,18 @@ export function RunsPage() {
               proposal={temporaryAgentDetail}
               onClose={() => setTemporaryAgentDetail(null)}
             />
+          ) : null}
+
+          <div className="chat-sticky-footer" aria-label="当前输入与运行状态">
+          {activeProcessDockRun ? (
+            <div className="chat-active-process-dock" aria-label="当前轮 Agent 工作席">
+              <RunProcessSummary
+                detail={activeProcessDockRun}
+                onOpen={setProcessDetailTarget}
+                agentNames={agentNameMap}
+                mainAgentModelName={mainAgentModelName}
+              />
+            </div>
           ) : null}
 
           <form onSubmit={submit} aria-label="发送消息" className="chat-composer">
@@ -4040,6 +3883,21 @@ export function RunsPage() {
             ) : null}
             {createScheduleFromProposal.isError ? (
               <p role="alert">{formatApiError(createScheduleFromProposal.error, "计划任务创建失败")}</p>
+            ) : null}
+            {referenceConversation.data ? (
+              <aside className="composer-attachment-card" role="status" aria-label="参考会话已读取">
+                <div>
+                  <span className="eyebrow">参考会话</span>
+                  <strong>{referenceConversation.data.conversation_id}</strong>
+                  <small>已读取 {referenceConversation.data.runs.length} 条运行</small>
+                </div>
+                {referenceConversation.data.runs[0] ? <p>{referenceConversation.data.runs[0].request}</p> : null}
+              </aside>
+            ) : null}
+            {referenceConversation.isError ? (
+              <p className="form-error" role="alert">
+                {formatApiError(referenceConversation.error, "参考会话读取失败")}
+              </p>
             ) : null}
             {openClawApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="OpenClaw 操作确认">
@@ -4231,15 +4089,16 @@ export function RunsPage() {
                     取消引用
                   </button>
                 ) : null}
-                <button
-                  type="button"
-                  className="composer-plus-button"
-                  aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
-                  aria-pressed={configOpen}
-                  onClick={() => setConfigOpen((current) => !current)}
-                >
-                  +
-                </button>
+                {handoffActive ? (
+                  <button
+                    type="button"
+                    className="composer-reference-button"
+                    disabled={referenceConversation.isFetching}
+                    onClick={loadReferenceConversation}
+                  >
+                    读取引用
+                  </button>
+                ) : null}
               </div>
               <div className="composer-status-line" role="status">
                 <span>
@@ -4296,6 +4155,7 @@ export function RunsPage() {
             {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "消息发送失败")}</p> : null}
             {stopCurrentRun.isError ? <p role="alert">{formatApiError(stopCurrentRun.error, "停止运行失败")}</p> : null}
           </form>
+          </div>
         </div>
       </div>
     </section>

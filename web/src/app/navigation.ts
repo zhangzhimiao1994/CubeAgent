@@ -62,13 +62,13 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         to: "/collaboration",
         label: "协作配置",
-        description: "合并管理子助手分工和流程模板，减少低频配置入口。",
+        description: "合并管理子助手分工和协作预设，减少低频配置入口。",
         permission: "agent:read",
         children: [
           { to: "/collaboration?section=roles", label: "角色", permission: "agent:read" },
-          { to: "/collaboration?section=workflows", label: "工作流", permission: "agent:read" },
-          { to: "/collaboration?section=execution", label: "执行策略", permission: "agent:read" },
-          { to: "/collaboration?section=review", label: "审查/裁决规则", permission: "agent:read" },
+          { to: "/collaboration?section=workflows", label: "协作预设", permission: "agent:read" },
+          { to: "/collaboration?section=execution", label: "默认策略", permission: "agent:read" },
+          { to: "/collaboration?section=review", label: "使用边界", permission: "agent:read" },
         ],
       },
       {

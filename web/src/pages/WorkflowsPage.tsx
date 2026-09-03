@@ -3,7 +3,7 @@ import { FormEvent, useMemo, useState } from "react";
 
 import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type WorkflowResource } from "../api/client";
-import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
+import { textContains } from "../components/TableTools";
 
 const WORKFLOW_PRESETS: Array<
   Omit<WorkflowResource, "allow_main_agent_override" | "allow_temporary_agents" | "temporary_agent_policy"> & {
@@ -13,7 +13,7 @@ const WORKFLOW_PRESETS: Array<
 > = [
   {
     id: "custom-workflow",
-    name: "自定义工作流",
+    name: "自定义协作预设",
     enabled: true,
     mode: "auto",
     task_type: "",
@@ -24,7 +24,7 @@ const WORKFLOW_PRESETS: Array<
     deliverables: [],
     role_selection_policy: "根据任务目标选择真正需要的角色，不按模板固定派单对象。",
     decision_policy: "如果角色意见冲突，主 Agent 根据用户目标、证据质量、风险和可交付性做最终裁决；无法判断时询问用户。",
-    description: "从空白配置开始，适合你自己定义新的任务类型、参与角色、步骤、交付物和裁决规则。",
+    description: "从空白配置开始，适合你自己定义新的任务场景、参与角色和协作策略。",
   },
   {
     id: "short-video-dispatch",
@@ -103,40 +103,28 @@ const WORKFLOW_PRESETS: Array<
   },
 ];
 
-function linesToList(value: string) {
-  return value
-    .split("\n")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function listToLines(value: string[] | undefined) {
-  return (value ?? []).join("\n");
-}
-
 function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
-type WorkflowSortKey = "name" | "status" | "mode" | "taskType" | "roles" | "objective";
+const DEFAULT_WORKFLOW_STEPS = [
+  "主 Agent 判断任务意图和协作强度",
+  "按预设角色池派发必要子 Agent",
+  "汇总子 Agent 输出并形成最终回复",
+];
 
-type WorkflowColumnFilters = {
-  mode: "all" | NonNullable<WorkflowResource["mode"]>;
-  name: string;
-  objective: string;
-  roles: string;
-  status: "all" | "enabled" | "disabled";
-  taskType: string;
-};
+const DEFAULT_WORKFLOW_DELIVERABLES = ["最终回复", "必要时附子 Agent 摘要"];
 
-const EMPTY_WORKFLOW_FILTERS: WorkflowColumnFilters = {
-  mode: "all",
-  name: "",
-  objective: "",
-  roles: "",
-  status: "all",
-  taskType: "",
-};
+function workflowStrategySummary(
+  workflow: Pick<WorkflowResource, "objective" | "role_selection_policy" | "decision_policy">,
+) {
+  return (
+    workflow.objective?.trim() ||
+    workflow.role_selection_policy?.trim() ||
+    workflow.decision_policy?.trim() ||
+    "由主 Agent 根据当前任务自动判断协作方式。"
+  );
+}
 
 function workflowStatus(workflow: WorkflowResource) {
   return workflow.enabled ? "已启用" : "已停用";
@@ -170,30 +158,6 @@ function matchesWorkflowSearch(workflow: WorkflowResource, query: string) {
   return textContains(workflowSearchText(workflow), query);
 }
 
-function matchesWorkflowColumns(workflow: WorkflowResource, filters: WorkflowColumnFilters) {
-  return (
-    (filters.status === "all" || (filters.status === "enabled") === workflow.enabled) &&
-    (filters.mode === "all" || workflowMode(workflow) === filters.mode) &&
-    textContains(`${workflow.name} ${workflow.id}`, filters.name) &&
-    textContains(workflow.task_type ?? "", filters.taskType) &&
-    textContains(workflowRoles(workflow), filters.roles) &&
-    textContains(`${workflow.objective ?? ""} ${workflow.role_selection_policy ?? ""} ${workflow.decision_policy ?? ""}`, filters.objective)
-  );
-}
-
-function workflowSortValue(workflow: WorkflowResource, key: WorkflowSortKey) {
-  if (key === "status") return workflowStatus(workflow);
-  if (key === "mode") return workflowMode(workflow);
-  if (key === "taskType") return workflow.task_type ?? "";
-  if (key === "roles") return workflowRoles(workflow);
-  if (key === "objective") return workflow.objective ?? "";
-  return `${workflow.name} ${workflow.id}`;
-}
-
-function sortedWorkflows(items: WorkflowResource[], sort: SortState<WorkflowSortKey>) {
-  return [...items].sort((left, right) => compareText(workflowSortValue(left, sort.key), workflowSortValue(right, sort.key), sort.direction));
-}
-
 export function WorkflowsPage() {
   const queryClient = useQueryClient();
   const { navTargetProps } = useNavSection();
@@ -207,36 +171,38 @@ export function WorkflowsPage() {
   const [mode, setMode] = useState<NonNullable<WorkflowResource["mode"]>>(preset.mode ?? "dispatch");
   const [taskType, setTaskType] = useState<string>(preset.task_type ?? "");
   const [agentIds, setAgentIds] = useState<string[]>([]);
-  const [objective, setObjective] = useState<string>(preset.objective ?? "");
-  const [roleSelectionPolicy, setRoleSelectionPolicy] = useState<string>(preset.role_selection_policy ?? "");
-  const [steps, setSteps] = useState<string>(listToLines(preset.steps));
-  const [deliverables, setDeliverables] = useState<string>(listToLines(preset.deliverables));
-  const [decisionPolicy, setDecisionPolicy] = useState<string>(preset.decision_policy ?? "");
+  const [strategySummary, setStrategySummary] = useState<string>(workflowStrategySummary(preset));
   const [message, setMessage] = useState<string | null>(null);
   const [workflowSearchTerm, setWorkflowSearchTerm] = useState("");
-  const [workflowColumnFilters, setWorkflowColumnFilters] = useState<WorkflowColumnFilters>(EMPTY_WORKFLOW_FILTERS);
-  const [workflowSort, setWorkflowSort] = useState<SortState<WorkflowSortKey>>({ key: "name", direction: "asc" });
+  const savedWorkflows = workflows.data ?? [];
+  const savedAgents = agents.data ?? [];
 
   const saveWorkflow = useMutation({
-    mutationFn: () =>
-      api.createWorkflow({
+    mutationFn: () => {
+      const existingWorkflow = savedWorkflows.find((workflow) => workflow.id === workflowId.trim());
+      const presetWorkflow = WORKFLOW_PRESETS.find((workflow) => workflow.id === presetId) ?? WORKFLOW_PRESETS[0];
+      return api.createWorkflow({
         id: workflowId.trim(),
         name: name.trim(),
         enabled,
         mode,
-        allow_main_agent_override: false,
-        allow_temporary_agents: false,
-        temporary_agent_policy: null,
+        allow_main_agent_override: existingWorkflow?.allow_main_agent_override ?? false,
+        allow_temporary_agents: existingWorkflow?.allow_temporary_agents ?? false,
+        temporary_agent_policy: existingWorkflow?.temporary_agent_policy ?? null,
         task_type: taskType.trim(),
-        role_selection_policy: roleSelectionPolicy.trim(),
+        role_selection_policy: strategySummary.trim(),
         agent_ids: agentIds,
-        objective: objective.trim(),
-        steps: linesToList(steps),
-        deliverables: linesToList(deliverables),
-        decision_policy: decisionPolicy.trim(),
-      }),
+        objective: strategySummary.trim(),
+        steps: existingWorkflow?.steps ?? presetWorkflow.steps ?? DEFAULT_WORKFLOW_STEPS,
+        deliverables: existingWorkflow?.deliverables ?? presetWorkflow.deliverables ?? DEFAULT_WORKFLOW_DELIVERABLES,
+        decision_policy:
+          existingWorkflow?.decision_policy ??
+          presetWorkflow.decision_policy ??
+          "主 Agent 按任务目标、用户反馈、证据质量和可交付性做最终裁决；无法可靠判断时再询问用户。",
+      });
+    },
     onSuccess: async () => {
-      setMessage("流程模板已保存。它不会立即执行，只会在聊天任务选择该流程时生效。");
+      setMessage("协作预设已保存。它不会立即执行，只作为自动调度的参考。");
       await queryClient.invalidateQueries({ queryKey: ["workflows"] });
     },
   });
@@ -244,7 +210,7 @@ export function WorkflowsPage() {
   const deleteWorkflow = useMutation({
     mutationFn: (id: string) => api.deleteWorkflow(id),
     onSuccess: async () => {
-      setMessage("工作流已删除。");
+      setMessage("协作预设已删除。");
       await queryClient.invalidateQueries({ queryKey: ["workflows"] });
     },
   });
@@ -258,11 +224,7 @@ export function WorkflowsPage() {
     setMode(next.mode ?? "dispatch");
     setTaskType(next.task_type ?? "");
     setAgentIds([]);
-    setObjective(next.objective ?? "");
-    setRoleSelectionPolicy(next.role_selection_policy ?? "");
-    setSteps(listToLines(next.steps));
-    setDeliverables(listToLines(next.deliverables));
-    setDecisionPolicy(next.decision_policy ?? "");
+    setStrategySummary(workflowStrategySummary(next));
     setMessage(null);
   }
 
@@ -279,11 +241,7 @@ export function WorkflowsPage() {
     setMode(workflow.mode ?? "auto");
     setTaskType(workflow.task_type ?? "");
     setAgentIds(workflow.agent_ids ?? []);
-    setObjective(workflow.objective ?? "");
-    setRoleSelectionPolicy(workflow.role_selection_policy ?? "");
-    setSteps(listToLines(workflow.steps));
-    setDeliverables(listToLines(workflow.deliverables));
-    setDecisionPolicy(workflow.decision_policy ?? "");
+    setStrategySummary(workflowStrategySummary(workflow));
     setMessage(`已载入 ${workflow.name}，修改后点击保存。`);
   }
 
@@ -294,45 +252,38 @@ export function WorkflowsPage() {
   }
 
   function confirmDelete(workflow: { id: string; name: string }) {
-    if (!window.confirm(`确定删除工作流「${workflow.name}」吗？历史对话不会删除，但后续不能再选择它。`)) {
+    if (!window.confirm(`确定删除协作预设「${workflow.name}」吗？历史对话不会删除，但后续不能再选择它。`)) {
       return;
     }
     setMessage(null);
     deleteWorkflow.mutate(workflow.id);
   }
 
-  const savedWorkflows = workflows.data ?? [];
-  const savedAgents = agents.data ?? [];
   const visibleWorkflows = useMemo(
     () =>
-      sortedWorkflows(
-        savedWorkflows.filter(
-          (workflow) =>
-            matchesWorkflowSearch(workflow, workflowSearchTerm) &&
-            matchesWorkflowColumns(workflow, workflowColumnFilters),
-        ),
-        workflowSort,
-      ),
-    [savedWorkflows, workflowColumnFilters, workflowSearchTerm, workflowSort],
+      savedWorkflows
+        .filter((workflow) => matchesWorkflowSearch(workflow, workflowSearchTerm))
+        .sort((left, right) => `${left.name} ${left.id}`.localeCompare(`${right.name} ${right.id}`)),
+    [savedWorkflows, workflowSearchTerm],
   );
 
-  if (workflows.isLoading || agents.isLoading) return <p>正在加载流程模板...</p>;
-  if (workflows.isError) return <p role="alert">{formatApiError(workflows.error, "工作流加载失败")}</p>;
+  if (workflows.isLoading || agents.isLoading) return <p>正在加载协作预设...</p>;
+  if (workflows.isError) return <p role="alert">{formatApiError(workflows.error, "协作预设加载失败")}</p>;
   if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 列表加载失败")}</p>;
 
   return (
     <section>
       <p className="eyebrow">Workflow configuration</p>
-      <h2>流程模板</h2>
+      <h2>协作预设</h2>
       <p>
-        这里只负责维护流程模板，不会直接执行任务。流程模板用于描述某类任务应该用什么模式、哪些角色、哪些步骤和什么裁决规则。
+        这里保留少量高级协作预设，不再作为每轮对话必选配置。聊天页默认由主 Agent 自动判断模式和角色。
       </p>
 
       <div className="two-column">
-        <form onSubmit={submit} aria-label="保存流程模板">
-          <h3>新增或更新工作流</h3>
+        <form onSubmit={submit} aria-label="保存协作预设">
+          <h3>新增或更新协作预设</h3>
           <label htmlFor="workflow-preset">
-            任务模板
+            预设模板
             <select id="workflow-preset" value={presetId} onChange={(event) => changePreset(event.target.value)}>
               {WORKFLOW_PRESETS.map((item) => (
                 <option key={item.id} value={item.id}>
@@ -342,12 +293,12 @@ export function WorkflowsPage() {
             </select>
           </label>
           <p className="field-help">
-            {preset.description} 模板只负责快速填充，下面所有字段都可以改；如果要完全自定义，选择“自定义工作流”。
+            {preset.description} 预设只负责快速填充；日常对话不需要手动选择它。
           </p>
 
           <div className="form-grid">
             <label htmlFor="workflow-id">
-              工作流 ID
+              预设 ID
               <input id="workflow-id" value={workflowId} onChange={(event) => setWorkflowId(event.target.value)} placeholder="例如 short-video-dispatch" required />
             </label>
             <label htmlFor="workflow-name">
@@ -370,24 +321,30 @@ export function WorkflowsPage() {
             </label>
           </div>
           <p className="field-help">
-            工作流只保存这类任务的默认协作模板；聊天页使用它时可以选择本次角色池，但不会改写模板本身。
+            预设只描述某类任务的默认协作倾向；复杂步骤、交付物和裁决规则由系统默认生成，避免配置页过重。
           </p>
 
-          <label htmlFor="workflow-objective">
-            工作流目标
-            <textarea id="workflow-objective" value={objective} onChange={(event) => setObjective(event.target.value)} required />
+          <label htmlFor="workflow-strategy-summary" {...navTargetProps("execution")}>
+            一句话策略
+            <textarea
+              id="workflow-strategy-summary"
+              value={strategySummary}
+              onChange={(event) => setStrategySummary(event.target.value)}
+              placeholder="例如：内容生产任务先确定方向，再派发文案和审查角色收口。"
+              required
+            />
           </label>
 
           <fieldset {...navTargetProps("roles")}>
             <legend>默认参与角色</legend>
             <p className="field-help">
-              同一个模式可以有不同派单对象。这里选择的是该任务类型默认会派给哪些角色。
+              这里只保存默认角色池。实际运行时主 Agent 仍会按任务目标决定是否使用、追加或跳过。
             </p>
             <button type="button" onClick={applySuggestedRoles}>
               使用模板建议角色
             </button>
             {savedAgents.length === 0 ? (
-              <p className="field-help">还没有 Agent。可以先保存工作流，稍后创建角色后回来选择。</p>
+              <p className="field-help">还没有 Agent。可以先保存协作预设，稍后创建角色后回来选择。</p>
             ) : (
               savedAgents.map((agent) => (
                 <label key={agent.id} className="inline-check">
@@ -402,202 +359,107 @@ export function WorkflowsPage() {
             )}
           </fieldset>
 
-          <label htmlFor="workflow-role-selection">
-            角色选择规则
-            <textarea id="workflow-role-selection" value={roleSelectionPolicy} onChange={(event) => setRoleSelectionPolicy(event.target.value)} required />
-          </label>
-
-          <div {...navTargetProps("execution", "nav-form-section")}>
-            <label htmlFor="workflow-steps">
-              执行步骤（每行一个）
-              <textarea id="workflow-steps" value={steps} onChange={(event) => setSteps(event.target.value)} required />
-            </label>
-
-            <label htmlFor="workflow-deliverables">
-              交付物（每行一个）
-              <textarea id="workflow-deliverables" value={deliverables} onChange={(event) => setDeliverables(event.target.value)} required />
-            </label>
-          </div>
-
-          <label htmlFor="workflow-decision-policy" {...navTargetProps("review")}>
-            分歧裁决规则
-            <textarea id="workflow-decision-policy" value={decisionPolicy} onChange={(event) => setDecisionPolicy(event.target.value)} required />
-          </label>
-
           <label className="inline-check">
             <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
-            启用该工作流
+            启用该预设
           </label>
 
           <button type="submit" disabled={saveWorkflow.isPending}>
-            {saveWorkflow.isPending ? "正在保存..." : "保存流程模板"}
+            {saveWorkflow.isPending ? "正在保存..." : "保存协作预设"}
           </button>
           {message ? <p role="status">{message}</p> : null}
-          {saveWorkflow.isError ? <p role="alert">{formatApiError(saveWorkflow.error, "工作流保存失败")}</p> : null}
+          {saveWorkflow.isError ? <p role="alert">{formatApiError(saveWorkflow.error, "协作预设保存失败")}</p> : null}
         </form>
 
-        <article>
-          <h3>配置指引</h3>
+        <article {...navTargetProps("review")}>
+          <h3>使用边界</h3>
           <ol>
-            <li>模式只定义协作方式；角色由任务类型和工作流决定。</li>
-            <li>同样是派单，短视频、代码、财经、艺术设计应配置不同工作流。</li>
-            <li>流程模板配置后不会自动执行，只有聊天任务选择它时才会使用。</li>
-            <li>如果自动检测不确定，主 Agent 应询问用户，而不是猜错模式。</li>
+            <li>聊天页不再暴露本轮协作预设选择，默认自动运行。</li>
+            <li>预设只影响默认倾向，不强制主 Agent 固定派单。</li>
+            <li>如果自动判断不可靠，主 Agent 应给出原因并再询问用户。</li>
           </ol>
         </article>
       </div>
 
-      <section aria-label="已保存工作流" {...navTargetProps("list")}>
-        <h3>已保存工作流</h3>
+      <section aria-label="已保存协作预设" {...navTargetProps("list")}>
+        <h3>已保存协作预设</h3>
         {savedWorkflows.length === 0 ? (
           <article>
-            <h4>还没有工作流</h4>
-            <p>从上方选择模板并补全细节，保存后即可在对话任务中选择。</p>
+            <h4>还没有协作预设</h4>
+            <p>从上方选择模板并补全少量字段，保存后即可作为自动调度的参考。</p>
           </article>
         ) : (
           <>
             <div className="list-toolbar">
               <label>
-                快速搜索工作流
+                快速搜索协作预设
                 <input
                   type="search"
-                  aria-label="快速搜索工作流"
+                  aria-label="快速搜索协作预设"
                   value={workflowSearchTerm}
                   onChange={(event) => setWorkflowSearchTerm(event.currentTarget.value)}
-                  placeholder="名称、ID、任务类型、角色或裁决规则"
+                  placeholder="名称、ID、适用场景、角色或策略"
                 />
               </label>
-              <button type="button" className="secondary-action" onClick={() => { setWorkflowSearchTerm(""); setWorkflowColumnFilters(EMPTY_WORKFLOW_FILTERS); }}>
-                清空工作流筛选
+              <button type="button" className="secondary-action" onClick={() => setWorkflowSearchTerm("")}>
+                清空搜索
               </button>
               <small>显示 {visibleWorkflows.length} / {savedWorkflows.length}</small>
             </div>
             {visibleWorkflows.length === 0 ? (
               <article>
-                <h4>当前筛选没有匹配工作流</h4>
-                <p>调整列筛选或清空筛选查看全部工作流。</p>
+                <h4>当前搜索没有匹配预设</h4>
+                <p>清空搜索后可查看全部协作预设。</p>
               </article>
             ) : (
-              <table aria-label="已保存工作流列表" className="dense-table">
-                <thead>
-                  <tr>
-                    <th><SortHeader column="status" label="状态" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
-                    <th><SortHeader column="name" label="工作流" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>工作流</SortHeader></th>
-                    <th><SortHeader column="taskType" label="任务类型" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>任务类型</SortHeader></th>
-                    <th><SortHeader column="mode" label="默认模式" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认模式</SortHeader></th>
-                    <th><SortHeader column="roles" label="默认角色" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认角色</SortHeader></th>
-                    <th><SortHeader column="objective" label="目标" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>目标</SortHeader></th>
-                    <th>操作</th>
-                  </tr>
-                  <tr className="table-filter-row">
-                    <th>
-                      <select
-                        aria-label="按工作流状态筛选"
-                        value={workflowColumnFilters.status}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value as WorkflowColumnFilters["status"];
-                          setWorkflowColumnFilters((current) => ({ ...current, status: value }));
-                        }}
+              <div className="workflow-preset-list" role="list" aria-label="已保存协作预设列表">
+                {visibleWorkflows.map((workflow) => (
+                  <article key={workflow.id} className="workflow-preset-card" role="listitem">
+                    <div>
+                      <span className={`status-pill ${workflow.enabled ? "status-pill-success" : "status-pill-muted"}`}>
+                        {workflowStatus(workflow)}
+                      </span>
+                      <h4>{workflow.name}</h4>
+                      <p>{workflowStrategySummary(workflow)}</p>
+                    </div>
+                    <dl>
+                      <div>
+                        <dt>ID</dt>
+                        <dd>{workflow.id}</dd>
+                      </div>
+                      <div>
+                        <dt>场景</dt>
+                        <dd>{workflow.task_type || "未设置"}</dd>
+                      </div>
+                      <div>
+                        <dt>模式</dt>
+                        <dd>{workflowMode(workflow)}</dd>
+                      </div>
+                      <div>
+                        <dt>角色</dt>
+                        <dd>{workflowRoles(workflow)}</dd>
+                      </div>
+                    </dl>
+                    <div className="card-actions">
+                      <button type="button" onClick={() => editWorkflow(workflow)}>
+                        编辑预设
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-action"
+                        onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
+                        disabled={deleteWorkflow.isPending}
                       >
-                        <option value="all">全部</option>
-                        <option value="enabled">已启用</option>
-                        <option value="disabled">已停用</option>
-                      </select>
-                    </th>
-                    <th>
-                      <input
-                        aria-label="按工作流名称筛选"
-                        value={workflowColumnFilters.name}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setWorkflowColumnFilters((current) => ({ ...current, name: value }));
-                        }}
-                        placeholder="名称或 ID"
-                      />
-                    </th>
-                    <th>
-                      <input
-                        aria-label="按工作流任务类型筛选"
-                        value={workflowColumnFilters.taskType}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setWorkflowColumnFilters((current) => ({ ...current, taskType: value }));
-                        }}
-                        placeholder="任务类型"
-                      />
-                    </th>
-                    <th>
-                      <select
-                        aria-label="按工作流默认模式筛选"
-                        value={workflowColumnFilters.mode}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value as WorkflowColumnFilters["mode"];
-                          setWorkflowColumnFilters((current) => ({ ...current, mode: value }));
-                        }}
-                      >
-                        <option value="all">全部</option>
-                        <option value="auto">自动识别</option>
-                        <option value="direct">直接执行</option>
-                        <option value="dispatch">派单式</option>
-                        <option value="discuss">讨论式</option>
-                        <option value="hybrid">混合式</option>
-                      </select>
-                    </th>
-                    <th>
-                      <input
-                        aria-label="按工作流默认角色筛选"
-                        value={workflowColumnFilters.roles}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setWorkflowColumnFilters((current) => ({ ...current, roles: value }));
-                        }}
-                        placeholder="Agent ID"
-                      />
-                    </th>
-                    <th>
-                      <input
-                        aria-label="按工作流目标筛选"
-                        value={workflowColumnFilters.objective}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setWorkflowColumnFilters((current) => ({ ...current, objective: value }));
-                        }}
-                        placeholder="目标或规则"
-                      />
-                    </th>
-                    <th aria-label="工作流操作筛选占位" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {visibleWorkflows.map((workflow) => (
-                    <tr key={workflow.id}>
-                      <td>{workflowStatus(workflow)}</td>
-                      <td><strong>{workflow.name}</strong><br /><small>{workflow.id}</small></td>
-                      <td>{workflow.task_type || "未设置"}</td>
-                      <td>{workflowMode(workflow)}</td>
-                      <td>{workflowRoles(workflow)}</td>
-                      <td>{workflow.objective || "未设置"}</td>
-                      <td className="table-actions">
-                        <button type="button" onClick={() => editWorkflow(workflow)}>
-                          编辑工作流
-                        </button>
-                        <button
-                          type="button"
-                          className="danger-action"
-                          onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
-                          disabled={deleteWorkflow.isPending}
-                        >
-                          删除工作流
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                        删除预设
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
             )}
           </>
         )}
-        {deleteWorkflow.isError ? <p role="alert">{formatApiError(deleteWorkflow.error, "工作流删除失败")}</p> : null}
+        {deleteWorkflow.isError ? <p role="alert">{formatApiError(deleteWorkflow.error, "协作预设删除失败")}</p> : null}
       </section>
     </section>
   );

@@ -151,7 +151,7 @@ describe("AppShell presentation", () => {
       scrollIntoView.mockClear();
 
       const drawer = screen.getByLabelText("编排二级导航");
-      await user.click(within(drawer).getByRole("link", { name: "工作流" }));
+      await user.click(within(drawer).getByRole("link", { name: "协作预设" }));
 
       await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
     } finally {
@@ -238,5 +238,16 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/\.conversation-list\s*{[\s\S]*border-radius:\s*8px;[\s\S]*width:\s*min\(360px, calc\(100vw - 1\.5rem\)\);/);
     expect(stylesCss).toMatch(/\.conversation-title-text\s*{[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/);
     expect(stylesCss).toMatch(/@media \(max-width: 640px\)[\s\S]*\.conversation-list\s*{[\s\S]*width:\s*min\(86vw, 360px\);/);
+  });
+
+  it("keeps the chat composer fixed below a scrollable message stream", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(/\.chat-page\s*{[\s\S]*display:\s*grid;[\s\S]*min-height:\s*calc\(100dvh - 8rem\);/);
+    expect(stylesCss).toMatch(/\.chat-console\s*{[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;/);
+    expect(stylesCss).toMatch(/\.chat-panel\s*{[\s\S]*grid-template-rows:\s*minmax\(0,\s*1fr\) auto;[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;/);
+    expect(stylesCss).toMatch(/\.chat-stream\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;/);
+    expect(stylesCss).toMatch(/\.chat-sticky-footer\s*{[\s\S]*bottom:\s*0;[\s\S]*position:\s*sticky;/);
+    expect(stylesCss).toMatch(/\.chat-active-process-dock\s*{[\s\S]*max-height:\s*min\(32dvh, 260px\);[\s\S]*overflow-y:\s*auto;/);
   });
 });

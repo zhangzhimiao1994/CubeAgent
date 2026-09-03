@@ -207,7 +207,7 @@ export function ConfigPage() {
         <Link className="settings-shortcut-card" to="/models">配置模型与 API Key</Link>
         <Link className="settings-shortcut-card" to="/openclaw">配置 OpenClaw</Link>
         <Link className="settings-shortcut-card" to="/collaboration?section=roles">配置角色池</Link>
-        <Link className="settings-shortcut-card" to="/collaboration?section=workflows">配置流程模板</Link>
+        <Link className="settings-shortcut-card" to="/collaboration?section=workflows">配置协作预设</Link>
         <Link className="settings-shortcut-card" to="/channels">配置聊天通道</Link>
         <Link className="settings-shortcut-card" to="/logs">查看错误日志</Link>
       </div>
