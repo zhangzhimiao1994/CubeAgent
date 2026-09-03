@@ -1,73 +1,59 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useState } from "react";
+import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { useNavSection } from "../app/navSections";
-import { api, formatApiError, type MemoryCenterItem, type MemoryRecord } from "../api/client";
-import { HermesInsightDetail, HermesLearningTable } from "./HermesPage";
+import { api, formatApiError, type MemoryCenterActionName, type MemoryCenterItem } from "../api/client";
+import { HermesInsightDetail } from "./HermesPage";
+
+type MemoryCenterActionRequest = {
+  id: string;
+  action: MemoryCenterActionName;
+};
 
 export function MemoryPage() {
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
-  const { navTargetProps } = useNavSection(["source", "category", "status", "section"]);
-  const memory = useQuery({ queryKey: ["memory"], queryFn: () => api.memory() });
+  const { navTargetProps } = useNavSection(["status", "source", "category", "section"]);
   const memoryCenter = useQuery({ queryKey: ["memory-center"], queryFn: () => api.memoryCenter() });
-  const [memoryId, setMemoryId] = useState("project-policy");
-  const [scope, setScope] = useState("tenant");
-  const [value, setValue] = useState("Only non-dangerous operations may run without approval.");
-  const [message, setMessage] = useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
 
-  const create = useMutation({
-    mutationFn: () => api.createMemory({ id: memoryId.trim(), scope: scope.trim(), value: value.trim() }),
+  const memoryCenterAction = useMutation({
+    mutationFn: ({ id, action }: MemoryCenterActionRequest) => api.memoryCenterAction(id, action),
     onSuccess: async () => {
-      setMessage("记忆已保存。");
-      await queryClient.invalidateQueries({ queryKey: ["memory"] });
       await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
-    },
-  });
-  const update = useMutation({
-    mutationFn: ({ id, value: nextValue }: MemoryRecord) => api.updateMemory(id, nextValue),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
-    },
-  });
-  const forget = useMutation({
-    mutationFn: (id: string) => api.forgetMemory(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
-    },
-  });
-  const lock = useMutation({
-    mutationFn: (id: string) => api.lockMemory(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
-    },
-  });
-  const unlock = useMutation({
-    mutationFn: (id: string) => api.unlockMemory(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory"] });
-      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory"] });
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
     },
   });
 
-  function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setMessage(null);
-    create.mutate();
-  }
-
-  if (memory.isLoading) return <p>正在加载记忆...</p>;
-  if (memory.isError) {
-    return <p role="alert">{formatApiError(memory.error, "记忆加载失败")}</p>;
-  }
-
-  const records = memory.data ?? [];
   const centerItems = memoryCenter.data ?? [];
+  const sourceFilter = searchParams.get("source");
+  const statusFilter = searchParams.get("status");
+  const activeMemorySection = statusFilter === "pending" || statusFilter === "confirmed" ? statusFilter : sourceFilter ?? "memory";
+  const visibleItems = useMemo(
+    () =>
+      centerItems.filter((item) => {
+        if (sourceFilter === "cognitive") {
+          if (!item.source.startsWith("cognitive_")) return false;
+        } else if (sourceFilter && item.source !== sourceFilter) {
+          return false;
+        }
+        const normalizedStatus = statusFilter === "pending" ? "candidate" : statusFilter;
+        if (normalizedStatus && item.status !== normalizedStatus) return false;
+        return true;
+      }),
+    [centerItems, sourceFilter, statusFilter],
+  );
+  const selectedItem = centerItems.find((item) => item.id === selectedItemId) ?? null;
   const insightId = searchParams.get("insight");
+
+  function runAction(item: MemoryCenterItem, action: MemoryCenterActionName) {
+    if (action === "delete" && !window.confirm("确认删除这条记忆资产？删除后不会再进入运行时注入或学习建议。")) return;
+    memoryCenterAction.mutate({ id: item.id, action });
+    if (action === "delete" || action === "reject") setSelectedItemId(null);
+  }
 
   if (insightId) {
     return (
@@ -84,146 +70,258 @@ export function MemoryPage() {
       <p className="eyebrow">Memory control</p>
       <h2>记忆 / 经验管理</h2>
       <p>
-        这里统一管理普通记忆、Hermes 学习和 Cognitive 经验。底层仍保留来源字段用于兼容和审计，
-        用户侧不再把学习台账与记忆资源拆成两个独立模块。
+        这里统一管理普通记忆、Hermes 学习和 Cognitive 经验。主界面只展示可判断的摘要，完整内容放到详情里确认，
+        避免台账内容过长影响操作。
       </p>
 
-      <div className="two-column">
-        <form onSubmit={submit} aria-label="新增记忆">
-          <h3>新增或覆盖记忆</h3>
-          <label htmlFor="memory-id">记忆 ID</label>
-          <input
-            id="memory-id"
-            value={memoryId}
-            onChange={(event) => setMemoryId(event.target.value)}
-            placeholder="例如 project-policy"
-            required
-          />
-
-          <label htmlFor="memory-scope">作用域</label>
-          <input id="memory-scope" value={scope} onChange={(event) => setScope(event.target.value)} required />
-
-          <label htmlFor="memory-value">内容</label>
-          <textarea id="memory-value" value={value} onChange={(event) => setValue(event.target.value)} required />
-
-          <button type="submit" disabled={create.isPending || value.trim().length === 0}>
-            {create.isPending ? "正在保存..." : "保存记忆"}
-          </button>
-          {message ? <p role="status">{message}</p> : null}
-          {create.isError ? <p role="alert">{formatApiError(create.error, "记忆保存失败")}</p> : null}
-        </form>
-
-        <article>
-          <h3>配置指引</h3>
-          <ol>
-            <li>适合保存“默认日志级别 warning”“不自动执行危险操作”等长期规则。</li>
-            <li>不要写入 API Key、密码、Token 等敏感信息。</li>
-            <li>修改现有记忆后会立即持久化；删除前请确认该规则不再需要。</li>
-          </ol>
-        </article>
-      </div>
-
-      {update.isError ? <p role="alert">{formatApiError(update.error, "记忆更新失败")}</p> : null}
-      {forget.isError ? <p role="alert">{formatApiError(forget.error, "记忆删除失败")}</p> : null}
-      {lock.isError ? <p role="alert">{formatApiError(lock.error, "记忆锁定失败")}</p> : null}
-      {unlock.isError ? <p role="alert">{formatApiError(unlock.error, "记忆解锁失败")}</p> : null}
+      {memoryCenterAction.isError ? (
+        <p role="alert">{formatApiError(memoryCenterAction.error, "记忆操作失败")}</p>
+      ) : null}
       {memoryCenter.isError ? (
         <p role="alert">{formatApiError(memoryCenter.error, "统一记忆资产加载失败")}</p>
       ) : (
-        <section aria-label="统一记忆资产" {...navTargetProps("memory")}>
+        <section aria-label="统一记忆资产" {...navTargetProps(activeMemorySection)}>
           <h3>统一记忆资产</h3>
-          <p>
-            这里汇总普通记忆、Hermes 学习和 Cognitive 经验/策略/反思，避免误把单个台账为空理解为系统没有学习。
-          </p>
+          <p>学习记录、普通记忆和经验候选都会在这里以摘要列表显示；点击条目查看证据、详情和操作。</p>
           {memoryCenter.isLoading ? (
             <p>正在加载统一记忆资产...</p>
-          ) : centerItems.length === 0 ? (
+          ) : visibleItems.length === 0 ? (
             <article>
               <h4>还没有可展示的记忆资产</h4>
-              <p>普通记忆、已确认 Hermes 学习和 Cognitive 候选都会显示在这里。</p>
+              <p>当前筛选下没有普通记忆、Hermes 学习或 Cognitive 候选。</p>
             </article>
           ) : (
-            <div className="card-grid">
-              {centerItems.slice(0, 12).map((item) => (
-                <MemoryCenterCard key={item.id} item={item} />
+            <div className="memory-center-list" role="list" aria-label="记忆与经验摘要列表">
+              {visibleItems.map((item) => (
+                <MemoryCenterRow
+                  key={item.id}
+                  item={item}
+                  isActing={memoryCenterAction.isPending}
+                  onOpen={() => setSelectedItemId(item.id)}
+                  onAction={(action) => runAction(item, action)}
+                />
               ))}
             </div>
           )}
         </section>
       )}
 
-      <section aria-label="已保存记忆">
-        <h3>已保存记忆</h3>
-        {records.length === 0 ? (
-          <article>
-            <h4>还没有记忆</h4>
-            <p>从上方新增第一条长期规则。</p>
-          </article>
-        ) : (
-          <div className="card-grid">
-            {records.map((record) => (
-              <article key={record.id}>
-                <span className="eyebrow">{record.scope}</span>
-                <h3>{record.id}</h3>
-                <div className="inline-status-list">
-                  <span>热度 {record.heat.toFixed(2)}</span>
-                  <span>{record.locked ? "已锁定" : "未锁定"}</span>
-                  {record.project_id ? <span>项目 {record.project_id}</span> : null}
-                  {record.conversation_id ? <span>对话 {record.conversation_id}</span> : null}
-                  {record.summary_period !== "none" ? <span>摘要 {record.summary_period}</span> : null}
-                  <span>召回 {record.recall_count} 次</span>
-                </div>
-                <label>
-                  内容
-                  <textarea
-                    aria-label={`Memory value ${record.id}`}
-                    defaultValue={record.value}
-                    onBlur={(event) =>
-                      update.mutate({ ...record, value: event.currentTarget.value })
-                    }
-                  />
-                </label>
-                <button
-                  type="button"
-                  onClick={() =>
-                    record.locked ? unlock.mutate(record.id) : lock.mutate(record.id)
-                  }
-                  disabled={lock.isPending || unlock.isPending}
-                >
-                  {record.locked ? "解除锁定" : "锁定记忆"}
-                </button>
-                <button type="button" onClick={() => forget.mutate(record.id)}>
-                  删除记忆
-                </button>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
+      {selectedItem ? (
+        <MemoryCenterDetailDialog
+          item={selectedItem}
+          isActing={memoryCenterAction.isPending}
+          onClose={() => setSelectedItemId(null)}
+          onAction={(action) => runAction(selectedItem, action)}
+        />
+      ) : null}
 
-      <section aria-label="统一学习管理">
-        <HermesLearningTable embedded detailBasePath="/memory" unifiedActions />
-      </section>
     </section>
   );
 }
 
-function MemoryCenterCard({ item }: { item: MemoryCenterItem }) {
+function MemoryCenterRow({
+  item,
+  isActing,
+  onOpen,
+  onAction,
+}: {
+  item: MemoryCenterItem;
+  isActing: boolean;
+  onOpen: () => void;
+  onAction: (action: MemoryCenterActionName) => void;
+}) {
   return (
-    <article>
-      <span className="eyebrow">{memoryCenterSourceLabel(item.source)}</span>
-      <h3>{item.summary}</h3>
-      <div className="inline-status-list">
-        <span>{memoryScopeLabel(item.memory_scope)}</span>
-        <span>{memoryCenterStatusLabel(item.status)}</span>
-        {item.active_for_runtime ? <span>可注入运行时</span> : <span>不直接注入</span>}
-        {item.confidence !== null ? <span>置信度 {item.confidence.toFixed(2)}</span> : null}
-        {item.evidence_count > 0 ? <span>证据 {item.evidence_count} 条</span> : null}
-        {item.contradiction_count > 0 ? <span>冲突 {item.contradiction_count} 条</span> : null}
+    <article
+      className="memory-center-row"
+      role="listitem"
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      tabIndex={0}
+    >
+      <div className="memory-center-row-main">
+        <span className="eyebrow">{memoryCenterSourceLabel(item.source)}</span>
+        <h3>{item.source === "memory" ? memoryCenterMemoryTitle(item) : item.summary}</h3>
+        {item.source === "memory" && item.detail !== item.summary ? <p>{item.summary}</p> : null}
+        <div className="inline-status-list">
+          <span>{memoryScopeLabel(item.memory_scope)}</span>
+          <span>{memoryCenterStatusLabel(item.status)}</span>
+          {item.active_for_runtime ? <span>可注入运行时</span> : <span>不直接注入</span>}
+          {item.confidence !== null ? <span>置信度 {item.confidence.toFixed(2)}</span> : null}
+          {item.evidence_count > 0 ? <span>证据 {item.evidence_count} 条</span> : null}
+          {item.contradiction_count > 0 ? <span>冲突 {item.contradiction_count} 条</span> : null}
+        </div>
       </div>
-      {item.detail && item.detail !== item.summary ? <p>{item.detail}</p> : null}
+      <div className="memory-center-actions" aria-label={`${item.summary} 操作`}>
+        {memoryCenterActions(item).map((action) => (
+          <button
+            key={action}
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onAction(action);
+            }}
+            disabled={isActing}
+            className={memoryCenterActionClassName(action)}
+          >
+            {memoryCenterActionLabel(action)}
+          </button>
+        ))}
+      </div>
+      <button
+        className="sr-only"
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpen();
+        }}
+      >
+        打开记忆详情：{item.summary}
+      </button>
     </article>
   );
+}
+
+function MemoryCenterDetailDialog({
+  item,
+  isActing,
+  onClose,
+  onAction,
+}: {
+  item: MemoryCenterItem;
+  isActing: boolean;
+  onClose: () => void;
+  onAction: (action: MemoryCenterActionName) => void;
+}) {
+  return (
+    <div className="modal-backdrop memory-detail-backdrop" role="presentation" onClick={onClose}>
+      <article
+        className="modal-card memory-detail-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="记忆详情"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="memory-detail-header">
+          <div>
+            <span className="eyebrow">{memoryCenterSourceLabel(item.source)}</span>
+            <h3>{item.source === "memory" ? memoryCenterMemoryTitle(item) : item.summary}</h3>
+          </div>
+          <button type="button" onClick={onClose} aria-label="关闭记忆详情">
+            关闭
+          </button>
+        </div>
+        <dl className="memory-detail-meta">
+          <div>
+            <dt>状态</dt>
+            <dd>{memoryCenterStatusLabel(item.status)}</dd>
+          </div>
+          <div>
+            <dt>作用域</dt>
+            <dd>{memoryScopeLabel(item.memory_scope)}</dd>
+          </div>
+          <div>
+            <dt>运行时</dt>
+            <dd>{item.active_for_runtime ? "可注入运行时" : "不直接注入"}</dd>
+          </div>
+          {item.confidence !== null ? (
+            <div>
+              <dt>置信度</dt>
+              <dd>{item.confidence.toFixed(2)}</dd>
+            </div>
+          ) : null}
+          <div>
+            <dt>使用</dt>
+            <dd>
+              {item.use_count} 次，成功 {item.success_count}，失败 {item.failure_count}
+            </dd>
+          </div>
+          <div>
+            <dt>证据/冲突</dt>
+            <dd>
+              证据 {item.evidence_count} 条，冲突 {item.contradiction_count} 条
+            </dd>
+          </div>
+          {item.user_id ? (
+            <div>
+              <dt>用户</dt>
+              <dd>{item.user_id}</dd>
+            </div>
+          ) : null}
+          {item.created_at || item.updated_at ? (
+            <div>
+              <dt>时间</dt>
+              <dd>
+                {item.created_at ? `创建 ${item.created_at}` : null}
+                {item.created_at && item.updated_at ? " / " : null}
+                {item.updated_at ? `更新 ${item.updated_at}` : null}
+              </dd>
+            </div>
+          ) : null}
+        </dl>
+        <section className="memory-detail-content" aria-label="完整内容">
+          <h4>完整内容</h4>
+          <p>{item.detail || item.summary}</p>
+        </section>
+        <div className="memory-center-actions">
+          {memoryCenterActions(item).map((action) => (
+            <button
+              key={action}
+              type="button"
+              onClick={() => onAction(action)}
+              disabled={isActing}
+              className={memoryCenterActionClassName(action)}
+            >
+              {memoryCenterActionLabel(action)}
+            </button>
+          ))}
+        </div>
+      </article>
+    </div>
+  );
+}
+
+function memoryCenterMemoryTitle(item: MemoryCenterItem) {
+  return item.id.startsWith("memory:") ? item.id.slice("memory:".length) : item.summary;
+}
+
+function memoryCenterActions(item: MemoryCenterItem): MemoryCenterActionName[] {
+  if (item.source === "memory") {
+    return item.status === "locked" ? ["unlock", "delete"] : ["lock", "delete"];
+  }
+  if (item.source === "hermes") {
+    return item.status === "candidate" ? ["confirm", "reject", "delete"] : ["delete"];
+  }
+  if (item.source === "cognitive_experience") {
+    if (item.status === "candidate") return ["confirm", "reject", "delete"];
+    return ["delete"];
+  }
+  if (item.source === "cognitive_strategy") {
+    if (item.status === "candidate") return ["confirm", "reject"];
+    return [];
+  }
+  return [];
+}
+
+function memoryCenterActionLabel(action: MemoryCenterActionName) {
+  const labels: Record<MemoryCenterActionName, string> = {
+    confirm: "确认",
+    reject: "拒绝",
+    delete: "删除",
+    lock: "锁定",
+    unlock: "解除锁定",
+  };
+  return labels[action];
+}
+
+function memoryCenterActionClassName(action: MemoryCenterActionName) {
+  if (action === "delete") return "danger-action";
+  if (action === "reject" || action === "lock" || action === "unlock") return "secondary-action";
+  return undefined;
 }
 
 function memoryCenterSourceLabel(source: MemoryCenterItem["source"]) {

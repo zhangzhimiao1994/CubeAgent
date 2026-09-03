@@ -3119,6 +3119,138 @@ article:hover {
   padding: clamp(1rem, 3vw, 1.4rem);
 }
 
+.sr-only {
+  border: 0;
+  clip: rect(0, 0, 0, 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
+.memory-center-list {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1rem;
+}
+
+.memory-center-row {
+  align-items: flex-start;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent),
+    rgba(3, 10, 20, 0.5);
+  border: 1px solid var(--line);
+  border-radius: 1.15rem;
+  cursor: pointer;
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 1rem;
+  transition:
+    border-color 0.18s ease,
+    transform 0.18s ease;
+}
+
+.memory-center-row:hover,
+.memory-center-row:focus-visible {
+  border-color: rgba(61, 220, 255, 0.55);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.memory-center-row h3 {
+  margin: 0.2rem 0 0.5rem;
+}
+
+.memory-center-row p {
+  color: var(--muted);
+  margin: 0.25rem 0 0.6rem;
+}
+
+.memory-center-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.memory-center-actions button {
+  padding: 0.5rem 0.72rem;
+}
+
+.memory-detail-backdrop {
+  align-items: flex-end;
+}
+
+.memory-detail-dialog {
+  max-height: min(82vh, 760px);
+  max-width: min(760px, 100%);
+  overflow: auto;
+  width: min(760px, 100%);
+}
+
+.memory-detail-header {
+  align-items: flex-start;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.memory-detail-header h3 {
+  margin: 0.2rem 0 0;
+}
+
+.memory-detail-meta {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin: 1rem 0;
+}
+
+.memory-detail-meta div,
+.memory-detail-content {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--line);
+  border-radius: 0.95rem;
+  padding: 0.75rem;
+}
+
+.memory-detail-meta dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  margin-bottom: 0.25rem;
+}
+
+.memory-detail-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.memory-detail-content h4 {
+  margin-top: 0;
+}
+
+.memory-detail-content p {
+  margin-bottom: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 720px) {
+  .memory-center-row {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-center-actions {
+    justify-content: flex-start;
+  }
+}
+
 .link-actions {
   display: flex;
   flex-wrap: wrap;

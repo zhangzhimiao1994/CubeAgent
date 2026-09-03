@@ -1011,6 +1011,37 @@ describe("operational management pages", () => {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { id: "", action: "" };
           const id = typeof body.id === "string" ? body.id : "";
           const action = typeof body.action === "string" ? body.action : "";
+          if (id.startsWith("memory:")) {
+            const memoryId = id.slice("memory:".length);
+            if (action === "delete") {
+              return jsonResponse({ status: "deleted", item: null });
+            }
+            if (action === "lock" || action === "unlock") {
+              const locked = action === "lock";
+              return jsonResponse({
+                status: "updated",
+                item: {
+                  id,
+                  source: "memory",
+                  status: locked ? "locked" : "active",
+                  summary: "Only non-dangerous operations may run without approval.",
+                  detail: "Only non-dangerous operations may run without approval.",
+                  memory_scope: "tenant",
+                  user_id: null,
+                  confidence: null,
+                  active_for_runtime: true,
+                  evidence_count: 0,
+                  contradiction_count: 0,
+                  use_count: 3,
+                  success_count: 0,
+                  failure_count: 0,
+                  created_at: null,
+                  updated_at: "2026-08-30T09:05:00Z",
+                },
+              });
+            }
+            return jsonResponse({ error: { code: "unsupported", message: `unsupported ${memoryId}` } }, { status: 422 });
+          }
           if (id.startsWith("hermes:")) {
             const hermesId = id.slice("hermes:".length);
             if (action === "confirm") {
@@ -1164,24 +1195,64 @@ describe("operational management pages", () => {
               created_at: null,
               updated_at: null,
             },
-            {
-              id: "cognitive_experience:exp-runtime-errors",
+            ...visibleCognitiveExperiences.map((experience) => ({
+              id: `cognitive_experience:${experience.id}`,
               source: "cognitive_experience",
-              status: "candidate",
-              summary: "模型网络错误需要显示模型/部署信息。",
-              detail: "provider transport failed 需要暴露供应商和部署名。",
+              status: experience.status,
+              summary: experience.summary,
+              detail: experience.lesson,
+              memory_scope: experience.memory_scope,
+              user_id: experience.user_id,
+              confidence: experience.confidence,
+              active_for_runtime: experience.active_for_runtime,
+              evidence_count: experience.evidence.length,
+              contradiction_count: experience.contradictions.length,
+              use_count: experience.use_count,
+              success_count: experience.success_count,
+              failure_count: experience.failure_count,
+              created_at: experience.created_at,
+              updated_at: experience.updated_at,
+            })),
+            ...(!deletedHermesIds.has(hermesInsight.id)
+              ? [{
+              id: "hermes:hermes_run_11111111111111111111111111111111",
+              source: "hermes",
+              status: confirmedHermesIds.has(hermesInsight.id) ? "confirmed" : "candidate",
+              summary: hermesInsight.user_summary,
+              detail: hermesInsight.lesson,
               memory_scope: "user",
               user_id: "11111111-1111-4111-8111-111111111111",
-              confidence: 0.76,
-              active_for_runtime: false,
+              confidence: null,
+              active_for_runtime: confirmedHermesIds.has(hermesInsight.id),
               evidence_count: 1,
               contradiction_count: 0,
               use_count: 0,
-              success_count: 0,
+              success_count: 1,
               failure_count: 0,
-              created_at: "2026-08-30T09:00:00Z",
-              updated_at: "2026-08-30T09:00:00Z",
-            },
+              created_at: "2026-08-07T00:04:00Z",
+              updated_at: confirmedHermesIds.has(hermesInsight.id) ? "2026-08-07T00:05:00Z" : null,
+            }]
+              : []),
+            ...(!deletedHermesIds.has(secondHermesInsight.id)
+              ? [{
+              id: "hermes:hermes_run_22222222222222222222222222222222",
+              source: "hermes",
+              status: confirmedHermesIds.has(secondHermesInsight.id) ? "confirmed" : "candidate",
+              summary: secondHermesInsight.user_summary,
+              detail: secondHermesInsight.lesson,
+              memory_scope: "user",
+              user_id: "11111111-1111-4111-8111-111111111111",
+              confidence: null,
+              active_for_runtime: confirmedHermesIds.has(secondHermesInsight.id),
+              evidence_count: 1,
+              contradiction_count: 0,
+              use_count: 0,
+              success_count: 1,
+              failure_count: 0,
+              created_at: "2026-08-07T00:04:00Z",
+              updated_at: confirmedHermesIds.has(secondHermesInsight.id) ? "2026-08-07T00:07:00Z" : null,
+            }]
+              : []),
             {
               id: "hermes:hermes-style",
               source: "hermes",
@@ -3969,16 +4040,22 @@ describe("operational management pages", () => {
 
     cleanup();
     render(<TestApp initialPath="/memory" />);
-    expect(await screen.findByText("project-policy")).not.toBeNull();
-    expect(screen.getByText("tenant")).not.toBeNull();
-    expect(await screen.findByText("热度 0.82")).not.toBeNull();
-    expect(screen.getAllByText("已锁定").length).toBeGreaterThan(0);
-    expect(screen.getByText("项目 cube-agent")).not.toBeNull();
-    expect(screen.getByText("摘要 week")).not.toBeNull();
-    expect(screen.getByText("召回 3 次")).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "记忆 / 经验管理" })).not.toBeNull();
+    expect(screen.queryByRole("form", { name: "新增记忆" })).toBeNull();
+    expect(screen.queryByText("新增或覆盖记忆")).toBeNull();
+    expect(screen.queryByLabelText("记忆 ID")).toBeNull();
+    const memoryList = await screen.findByRole("list", { name: "记忆与经验摘要列表" });
+    expect(within(memoryList).getByText("project-policy")).not.toBeNull();
+    expect(within(memoryList).getAllByText("已锁定").length).toBeGreaterThan(0);
     expect(await screen.findByText("统一记忆资产")).not.toBeNull();
-    expect(screen.getByText("模型网络错误需要显示模型/部署信息。")).not.toBeNull();
-    expect(screen.getByText("用户希望技术结论先给明确判断，再给证据。")).not.toBeNull();
+    expect(within(memoryList).getAllByText(cognitiveExperience.summary).length).toBeGreaterThan(0);
+    expect(within(memoryList).queryByText(cognitiveExperience.lesson)).toBeNull();
+    await user.click(within(memoryList).getByRole("button", { name: `打开记忆详情：${cognitiveExperience.summary}` }));
+    const memoryDialog = await screen.findByRole("dialog", { name: "记忆详情" });
+    expect(within(memoryDialog).getByText(cognitiveExperience.lesson)).not.toBeNull();
+    expect(within(memoryDialog).getByRole("button", { name: "确认" })).not.toBeNull();
+    await user.click(memoryDialog.parentElement as HTMLElement);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "记忆详情" })).toBeNull());
 
     cleanup();
     const logsView = render(<TestApp initialPath="/logs" />);
@@ -4034,58 +4111,43 @@ describe("operational management pages", () => {
     expect(within(conversationAuditTable).queryByText("auth.login")).toBeNull();
   });
 
-  it("shows Hermes learning by time and conversation id with detail confirmation", async () => {
+  it("shows Hermes learning as summary rows and confirms from the detail dialog", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/memory?source=hermes" />);
 
-    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
-    expect(screen.queryByText("请求 Hermes 推荐")).toBeNull();
-    expect(screen.queryByText("推荐结果")).toBeNull();
-    expect(screen.getByRole("columnheader", { name: /中文学习摘要/ })).not.toBeNull();
-    expect(screen.getByText(hermesInsight.user_summary)).not.toBeNull();
-    expect(screen.getByText("conv-architecture-1")).not.toBeNull();
-    expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();
-    await user.click(screen.getByRole("link", { name: /conv-architecture-1/ }));
+    const list = await screen.findByRole("list", { name: "记忆与经验摘要列表" });
+    expect(within(list).getByText(hermesInsight.user_summary)).not.toBeNull();
+    expect(within(list).getByText(secondHermesInsight.user_summary)).not.toBeNull();
+    expect(within(list).queryByText(hermesInsight.lesson)).toBeNull();
+    expect(screen.queryByRole("table", { name: /Hermes/ })).toBeNull();
 
-    expect(await screen.findByText(hermesInsight.user_summary)).not.toBeNull();
-    expect(await screen.findByText(hermesInsight.summary)).not.toBeNull();
-    expect(screen.getByText(hermesInsight.lesson)).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: /确认/ }));
-
-    await waitFor(() => expect(screen.getByText("2026-08-07T00:05:00Z")).not.toBeNull());
-  });
-
-  it("separates Hermes conversation memory from scheduler observations", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes&category=scheduler" />);
-
-    const table = await screen.findByRole("table", { name: /Hermes/ });
-    expect(within(table).getByRole("cell", { name: "调度观察" })).not.toBeNull();
-    expect(within(table).getByText("conv-workflow-2")).not.toBeNull();
-    expect(within(table).queryByText("conv-architecture-1")).toBeNull();
-
-    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
-    await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
+    await user.click(screen.getByRole("button", { name: `打开记忆详情：${hermesInsight.user_summary}` }));
+    const detail = await screen.findByRole("dialog", { name: "记忆详情" });
+    expect(within(detail).getByText(hermesInsight.lesson)).not.toBeNull();
+    await user.click(within(detail).getByRole("button", { name: "确认" }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_22222222222222222222222222222222")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `hermes:${hermesInsight.id}` && "action" in request.body && request.body.action === "confirm")).toMatchObject({
         method: "POST",
-        body: { id: "hermes:hermes_run_22222222222222222222222222222222", action: "confirm" },
+        body: { id: `hermes:${hermesInsight.id}`, action: "confirm" },
       }),
     );
   });
 
-  it("shows reusable experience candidates and lets operators confirm or reject them", async () => {
+  it("shows reusable experience candidates in the same memory list and lets operators confirm or reject them", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes" />);
+    render(<TestApp initialPath="/memory" />);
 
-    const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
-    expect(within(experienceSection).getByText(/用户记忆/)).not.toBeNull();
-    expect(within(experienceSection).getByText("用户明确要求先给结论，再给必要证据。")).not.toBeNull();
-    expect(within(experienceSection).getByText("项目状态类问题先输出当前结论、阻塞项和下一步，不要堆叠完整运行轨迹。")).not.toBeNull();
-    expect(within(experienceSection).getByText("72%")).not.toBeNull();
+    const list = await screen.findByRole("list", { name: "记忆与经验摘要列表" });
+    expect(within(list).getAllByText(cognitiveExperience.summary).length).toBeGreaterThan(0);
+    expect(within(list).getByText("置信度 0.72")).not.toBeNull();
+    expect(within(list).queryByText(cognitiveExperience.lesson)).toBeNull();
 
-    await user.click(within(experienceSection).getByRole("button", { name: "确认" }));
+    await user.click(screen.getByRole("button", { name: `打开记忆详情：${cognitiveExperience.summary}` }));
+    const detail = await screen.findByRole("dialog", { name: "记忆详情" });
+    expect(within(detail).getByText(cognitiveExperience.lesson)).not.toBeNull();
+    await user.click(within(detail).getByRole("button", { name: "确认" }));
+
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `cognitive_experience:${cognitiveExperience.id}` && "action" in request.body && request.body.action === "confirm")).toMatchObject({
         method: "POST",
@@ -4093,7 +4155,7 @@ describe("operational management pages", () => {
       }),
     );
 
-    await user.click(within(experienceSection).getByRole("button", { name: "拒绝" }));
+    await user.click(within(detail).getByRole("button", { name: "拒绝" }));
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `cognitive_experience:${cognitiveExperience.id}` && "action" in request.body && request.body.action === "reject")).toMatchObject({
         method: "POST",
@@ -4102,119 +4164,32 @@ describe("operational management pages", () => {
     );
   });
 
-  it("shows an empty reusable-experience state when only inactive experiences are returned", async () => {
-    visibleCognitiveExperiences = [
-      { ...cognitiveExperience, id: "rejected-exp", status: "rejected", active_for_runtime: false },
-      { ...cognitiveExperience, id: "deprecated-exp", status: "deprecated", active_for_runtime: false },
-      { ...cognitiveExperience, id: "superseded-exp", status: "superseded", active_for_runtime: false },
-    ];
+  it("uses memory-center filtering for Hermes and shows an empty state for missing filtered assets", async () => {
     render(<TestApp initialPath="/memory?source=hermes" />);
 
-    const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
+    const hermesList = await screen.findByRole("list", { name: "记忆与经验摘要列表" });
+    expect(within(hermesList).getByText(hermesInsight.user_summary)).not.toBeNull();
+    expect(within(hermesList).queryByText(cognitiveExperience.summary)).toBeNull();
+    expect(within(hermesList).queryByText("project-policy")).toBeNull();
 
-    expect(within(experienceSection).getByText("暂无经验候选")).not.toBeNull();
-    expect(within(experienceSection).queryByText("已拒绝")).toBeNull();
-    expect(within(experienceSection).queryByText("已淘汰")).toBeNull();
-    expect(within(experienceSection).queryByText("已被替代")).toBeNull();
+    cleanup();
+    render(<TestApp initialPath="/memory?source=cognitive_skill" />);
+    expect(await screen.findByText("还没有可展示的记忆资产")).not.toBeNull();
   });
 
-  it("keeps the Hermes ledger visible when reusable experiences fail to load", async () => {
-    failCognitiveExperiences = true;
-    render(<TestApp initialPath="/memory?source=hermes" />);
-
-    const ledgerSection = await screen.findByRole("region", { name: "Hermes 学习台账" });
-    expect(within(ledgerSection).getByText(hermesInsight.user_summary)).not.toBeNull();
-    expect(screen.getByText("经验候选暂不可用")).not.toBeNull();
-    expect(screen.getByRole("alert").textContent).toContain("cognitive unavailable");
-  });
-
-  it("bulk selects Hermes learning records and confirms them through the unified memory center", async () => {
+  it("deletes a Hermes learning record from the unified memory list", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/memory?source=hermes" />);
 
-    expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
-    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
-    await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
-
-    await waitFor(() => {
-      const actionBodies = requests
-        .filter((request) => request.path === "/api/v1/admin/memory-center/actions")
-        .map((request) => request.body);
-      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_22222222222222222222222222222222", action: "confirm" });
-      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_11111111111111111111111111111111", action: "confirm" });
-    });
-  });
-
-  it("confirms a Hermes learning record directly from the table", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes" />);
-
-    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "确认 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
+    expect(await screen.findByText(hermesInsight.user_summary)).not.toBeNull();
+    await user.click(screen.getAllByRole("button", { name: "删除" })[0]);
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_11111111111111111111111111111111" && "action" in request.body && request.body.action === "confirm")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `hermes:${hermesInsight.id}` && "action" in request.body && request.body.action === "delete")).toMatchObject({
         method: "POST",
-        body: { id: "hermes:hermes_run_11111111111111111111111111111111", action: "confirm" },
+        body: { id: `hermes:${hermesInsight.id}`, action: "delete" },
       }),
     );
-  });
-
-  it("clears Hermes bulk selection when select all is clicked again", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes" />);
-
-    const selectAll = await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" });
-    const confirmButton = screen.getByRole("button", { name: /批量确认待确认学习/ }) as HTMLButtonElement;
-    const deleteButton = screen.getByRole("button", { name: /批量删除已选学习/ }) as HTMLButtonElement;
-
-    expect(confirmButton.disabled).toBe(true);
-    expect(deleteButton.disabled).toBe(true);
-    await user.click(selectAll);
-    expect(screen.getByText("当前结果已选 2")).not.toBeNull();
-    expect(confirmButton.disabled).toBe(false);
-    expect(deleteButton.disabled).toBe(false);
-    await user.click(selectAll);
-
-    expect(screen.getByText("当前结果已选 0")).not.toBeNull();
-    expect(confirmButton.disabled).toBe(true);
-    expect(deleteButton.disabled).toBe(true);
-  });
-
-  it("bulk deletes selected Hermes learning records through the unified memory center", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes" />);
-
-    expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
-    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
-    await user.click(screen.getByRole("button", { name: /批量删除已选学习/ }));
-
-    await waitFor(() => {
-      const actionBodies = requests
-        .filter((request) => request.path === "/api/v1/admin/memory-center/actions")
-        .map((request) => request.body);
-      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_22222222222222222222222222222222", action: "delete" });
-      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_11111111111111111111111111111111", action: "delete" });
-    });
-    await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
-    expect(screen.queryByText("conv-workflow-2")).toBeNull();
-  });
-
-  it("deletes a Hermes learning record from the table", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/memory?source=hermes" />);
-
-    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "删除 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
-
-    await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_11111111111111111111111111111111" && "action" in request.body && request.body.action === "delete")).toMatchObject({
-        method: "POST",
-        body: { id: "hermes:hermes_run_11111111111111111111111111111111", action: "delete" },
-      }),
-    );
-    await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
-    expect(screen.getByText("conv-workflow-2")).not.toBeNull();
   });
 
   it("shows detailed API errors on run list loading failures", async () => {
