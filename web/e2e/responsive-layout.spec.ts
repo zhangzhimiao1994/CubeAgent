@@ -579,29 +579,61 @@ test.describe("mobile chat composer layout", () => {
       const panel = document.querySelector(".chat-panel");
       const stream = document.querySelector(".chat-stream");
       const footer = document.querySelector(".chat-sticky-footer");
-      if (!surface || !panel || !stream || !footer) return null;
+      const modeTabs = document.querySelector(".chat-composer .mode-entry-tabs");
+      const statusLine = document.querySelector(".chat-composer .composer-status-line");
+      const sendButton = document.querySelector(".chat-composer button[type='submit']");
+      const streamModeEntry = document.querySelector(".chat-stream .mode-entry-panel");
+      const mobileNavBar = document.querySelector(".app-shell-chat .mobile-nav-bar");
+      const newConversationButton = document.querySelector(".chat-session-toolbar button[aria-label='新建对话']");
+      if (!surface || !panel || !stream || !footer || !modeTabs || !statusLine || !sendButton || !newConversationButton) {
+        return null;
+      }
 
       const surfaceRect = surface.getBoundingClientRect();
       const panelRect = panel.getBoundingClientRect();
       const streamRect = stream.getBoundingClientRect();
       const footerRect = footer.getBoundingClientRect();
+      const modeTabsRect = modeTabs.getBoundingClientRect();
+      const newConversationRect = newConversationButton.getBoundingClientRect();
+      const statusLineRect = statusLine.getBoundingClientRect();
+      const sendButtonRect = sendButton.getBoundingClientRect();
       const documentScroller = document.scrollingElement ?? document.documentElement;
 
       return {
         documentOverflows: documentScroller.scrollHeight > documentScroller.clientHeight + 2,
         footerBottomGap: Math.abs(panelRect.bottom - footerRect.bottom),
+        modeTabsBottom: modeTabsRect.bottom,
+        modeTabsTop: modeTabsRect.top,
+        mobileNavBarVisible:
+          !!mobileNavBar &&
+          getComputedStyle(mobileNavBar).display !== "none" &&
+          mobileNavBar.getBoundingClientRect().height > 1,
+        newConversationButtonVisible:
+          getComputedStyle(newConversationButton).display !== "none" &&
+          newConversationRect.width > 1 &&
+          newConversationRect.height > 1,
         panelHeightRatio: panelRect.height / surfaceRect.height,
+        sendButtonTop: sendButtonRect.top,
         streamHeight: streamRect.height,
+        streamModeEntryExists: !!streamModeEntry,
         surfaceOverflows: surface.scrollHeight > surface.clientHeight + 2,
+        statusLineBottom: statusLineRect.bottom,
       };
     });
 
     expect(metrics).not.toBeNull();
     expect(metrics!.documentOverflows).toBe(false);
     expect(metrics!.surfaceOverflows).toBe(false);
+    expect(metrics!.mobileNavBarVisible).toBe(false);
+    expect(metrics!.newConversationButtonVisible).toBe(true);
+    expect(metrics!.streamModeEntryExists).toBe(false);
     expect(metrics!.panelHeightRatio).toBeGreaterThan(0.82);
     expect(metrics!.streamHeight).toBeGreaterThan(360);
     expect(metrics!.footerBottomGap).toBeLessThanOrEqual(2);
+    expect(metrics!.statusLineBottom).toBeLessThanOrEqual(metrics!.modeTabsTop + 1);
+    expect(metrics!.modeTabsBottom).toBeLessThanOrEqual(metrics!.sendButtonTop + 1);
+    await expect(page.getByText("先选一个运行方式")).toHaveCount(0);
+    await expect(page.getByText("新对话")).toHaveCount(0);
   });
 });
 

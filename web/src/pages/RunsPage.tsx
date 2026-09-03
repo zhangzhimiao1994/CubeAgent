@@ -2587,12 +2587,7 @@ function ModeEntryPanel({
   ] as const;
   const selected = entryModes.find((item) => item.value === selectedMode) ?? entryModes[0];
   return (
-    <article className="mode-entry-panel">
-      <span className="mode-entry-logo" aria-hidden="true">
-        ✦
-      </span>
-      <h3>新对话</h3>
-      <p>先选一个运行方式，也可以保持自动直接发送。</p>
+    <div className="mode-entry-panel" aria-label={`当前模式：${selected.label}，${selected.description}`}>
       <div className="mode-entry-tabs" role="list" aria-label="对话模式入口">
         {entryModes.map((item) => (
           <button
@@ -2607,8 +2602,7 @@ function ModeEntryPanel({
           </button>
         ))}
       </div>
-      <p>{selected.description}</p>
-    </article>
+    </div>
   );
 }
 
@@ -3734,9 +3728,6 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
-            {showModeEntry ? (
-              <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
-            ) : null}
             {mode === "direct" && messages.length === 0 ? (
               <article className="chat-message assistant" aria-label="直连模型选择">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
@@ -4112,6 +4103,9 @@ export function RunsPage() {
                   {referenceConversationId.trim() ? " · 已引用会话" : ""}
                 </span>
               </div>
+              {showModeEntry && !selectedRunId ? (
+                <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
+              ) : null}
               <div className="composer-send-row">
                 {canStopLatestRun && latestVisibleRun ? (
                   <button

@@ -4131,6 +4131,10 @@ describe("operational management pages", () => {
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(document.querySelector(".chat-sticky-footer")).not.toBeNull();
+    expect(view.container.querySelector(".chat-stream .mode-entry-panel")).toBeNull();
+    expect(view.container.querySelector(".chat-composer .mode-entry-panel")).not.toBeNull();
+    expect(screen.queryByText("新对话")).toBeNull();
+    expect(screen.queryByText(/先选一个运行方式/)).toBeNull();
     expect(screen.queryByRole("button", { name: /打开本次运行配置/ })).toBeNull();
     expect(screen.queryByLabelText("使用工作流")).toBeNull();
   });
