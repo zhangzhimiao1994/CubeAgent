@@ -4124,9 +4124,10 @@ describe("operational management pages", () => {
   });
 
   it("keeps a clear mobile hierarchy for chat sessions, content, and the fixed composer", async () => {
-    render(<TestApp initialPath="/" />);
+    const view = render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(view.container.querySelector(".page-surface")?.className).toContain("page-surface-chat");
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(document.querySelector(".chat-sticky-footer")).not.toBeNull();

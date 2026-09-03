@@ -566,6 +566,45 @@ for (const viewport of viewports) {
   });
 }
 
+test.describe("mobile chat composer layout", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("keeps the chat display area expanded above the fixed composer", async ({ page }) => {
+    await mockLayoutApi(page);
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+
+    const metrics = await page.evaluate(() => {
+      const surface = document.querySelector(".page-surface-chat");
+      const panel = document.querySelector(".chat-panel");
+      const stream = document.querySelector(".chat-stream");
+      const footer = document.querySelector(".chat-sticky-footer");
+      if (!surface || !panel || !stream || !footer) return null;
+
+      const surfaceRect = surface.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const streamRect = stream.getBoundingClientRect();
+      const footerRect = footer.getBoundingClientRect();
+      const documentScroller = document.scrollingElement ?? document.documentElement;
+
+      return {
+        documentOverflows: documentScroller.scrollHeight > documentScroller.clientHeight + 2,
+        footerBottomGap: Math.abs(panelRect.bottom - footerRect.bottom),
+        panelHeightRatio: panelRect.height / surfaceRect.height,
+        streamHeight: streamRect.height,
+        surfaceOverflows: surface.scrollHeight > surface.clientHeight + 2,
+      };
+    });
+
+    expect(metrics).not.toBeNull();
+    expect(metrics!.documentOverflows).toBe(false);
+    expect(metrics!.surfaceOverflows).toBe(false);
+    expect(metrics!.panelHeightRatio).toBeGreaterThan(0.82);
+    expect(metrics!.streamHeight).toBeGreaterThan(360);
+    expect(metrics!.footerBottomGap).toBeLessThanOrEqual(2);
+  });
+});
+
 test.describe("desktop floating navigation hover stability", () => {
   test.use({ viewport: { width: 1280, height: 900 } });
 

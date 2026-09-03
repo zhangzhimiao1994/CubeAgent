@@ -49,6 +49,7 @@ export function AppShell() {
     [location.pathname, visibleGroups],
   );
   const drawerGroup = visibleGroups.find((group) => group.id === hoveredGroupId) ?? activeGroup;
+  const isChatRoute = location.pathname === "/" || location.pathname.startsWith("/runs/");
 
   useEffect(() => {
     const closeMobileNav = () => setMobileNavOpen(false);
@@ -61,7 +62,7 @@ export function AppShell() {
   }, [activeGroup?.id, location.pathname]);
 
   return (
-    <div className={`app-shell nav-floating${mobileNavOpen ? " mobile-nav-open" : ""}`}>
+    <div className={`app-shell nav-floating${mobileNavOpen ? " mobile-nav-open" : ""}${isChatRoute ? " app-shell-chat" : ""}`}>
       <aside className="sidebar floating-sidebar">
         <div className="mobile-nav-bar">
           <button
@@ -213,7 +214,7 @@ export function AppShell() {
           ) : null}
         </div>
       </aside>
-      <div className="workspace">
+      <div className={`workspace${isChatRoute ? " workspace-chat" : ""}`}>
         <header className="topbar">
           <div>
             <p className="eyebrow">工作台</p>
@@ -223,7 +224,7 @@ export function AppShell() {
             <span>{auth.user?.username}</span>
           </div>
         </header>
-        <main className="page-surface">
+        <main className={`page-surface${isChatRoute ? " page-surface-chat" : ""}`}>
           <Outlet />
         </main>
       </div>

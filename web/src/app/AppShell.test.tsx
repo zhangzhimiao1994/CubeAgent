@@ -243,7 +243,9 @@ describe("AppShell presentation", () => {
   it("keeps the chat composer fixed below a scrollable message stream", () => {
     const stylesCss = readFileSync("src/styles.css", "utf8");
 
-    expect(stylesCss).toMatch(/\.chat-page\s*{[\s\S]*display:\s*grid;[\s\S]*min-height:\s*calc\(100dvh - 8rem\);/);
+    expect(stylesCss).toMatch(/\.workspace-chat\s*{[\s\S]*grid-template-rows:\s*auto minmax\(0,\s*1fr\);[\s\S]*min-height:\s*100dvh;/);
+    expect(stylesCss).toMatch(/\.page-surface-chat\s*{[\s\S]*display:\s*grid;[\s\S]*overflow:\s*hidden;/);
+    expect(stylesCss).toMatch(/\.chat-page\s*{[\s\S]*display:\s*grid;[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;/);
     expect(stylesCss).toMatch(/\.chat-console\s*{[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;/);
     expect(stylesCss).toMatch(/\.chat-panel\s*{[\s\S]*grid-template-rows:\s*minmax\(0,\s*1fr\) auto;[\s\S]*height:\s*100%;[\s\S]*min-height:\s*0;/);
     expect(stylesCss).toMatch(/\.chat-stream\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;/);

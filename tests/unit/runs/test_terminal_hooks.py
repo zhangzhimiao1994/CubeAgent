@@ -13,7 +13,13 @@ from agent_hub.cognitive.pipeline import CognitiveLearningTerminalHook
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import HermesRunOutcome, RunService
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
