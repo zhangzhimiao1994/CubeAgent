@@ -1,10 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
+import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type MemoryCenterItem, type MemoryRecord } from "../api/client";
+import { HermesInsightDetail, HermesLearningTable } from "./HermesPage";
 
 export function MemoryPage() {
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
+  const { navTargetProps } = useNavSection(["source", "category", "status", "section"]);
   const memory = useQuery({ queryKey: ["memory"], queryFn: () => api.memory() });
   const memoryCenter = useQuery({ queryKey: ["memory-center"], queryFn: () => api.memoryCenter() });
   const [memoryId, setMemoryId] = useState("project-policy");
@@ -62,14 +67,25 @@ export function MemoryPage() {
 
   const records = memory.data ?? [];
   const centerItems = memoryCenter.data ?? [];
+  const insightId = searchParams.get("insight");
+
+  if (insightId) {
+    return (
+      <section>
+        <p className="eyebrow">Memory control</p>
+        <h2>记忆 / 经验管理</h2>
+        <HermesInsightDetail insightId={insightId} returnTo="/memory?source=hermes" unifiedActions />
+      </section>
+    );
+  }
 
   return (
     <section>
       <p className="eyebrow">Memory control</p>
-      <h2>记忆管理</h2>
+      <h2>记忆 / 经验管理</h2>
       <p>
-        记忆用于保存长期策略、偏好和安全边界。Hermes 负责经验学习，记忆负责明确规则；
-        子 Agent 使用前仍受主 Agent 调度和权限控制。
+        这里统一管理普通记忆、Hermes 学习和 Cognitive 经验。底层仍保留来源字段用于兼容和审计，
+        用户侧不再把学习台账与记忆资源拆成两个独立模块。
       </p>
 
       <div className="two-column">
@@ -114,7 +130,7 @@ export function MemoryPage() {
       {memoryCenter.isError ? (
         <p role="alert">{formatApiError(memoryCenter.error, "统一记忆资产加载失败")}</p>
       ) : (
-        <section aria-label="统一记忆资产">
+        <section aria-label="统一记忆资产" {...navTargetProps("memory")}>
           <h3>统一记忆资产</h3>
           <p>
             这里汇总普通记忆、Hermes 学习和 Cognitive 经验/策略/反思，避免误把单个台账为空理解为系统没有学习。
@@ -183,6 +199,10 @@ export function MemoryPage() {
             ))}
           </div>
         )}
+      </section>
+
+      <section aria-label="统一学习管理">
+        <HermesLearningTable embedded detailBasePath="/memory" unifiedActions />
       </section>
     </section>
   );

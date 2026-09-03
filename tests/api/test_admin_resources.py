@@ -5167,6 +5167,104 @@ def test_memory_center_lists_memory_and_deduplicated_cognitive_records() -> None
     assert "模型网络错误" in by_id[f"cognitive_experience:{experience.json()['id']}"]["summary"]
 
 
+def test_memory_center_actions_manage_unified_memory_and_experience_records() -> None:
+    api = client()
+
+    memory = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "temporary-rule",
+            "scope": "tenant",
+            "value": "This temporary rule can be removed from the unified memory center.",
+        },
+    )
+    hermes = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "用户希望把 Hermes 与 Memory 放在一个统一入口管理。",
+            "conversation_id": "conv-unified-actions",
+            "tags": ["memory"],
+            "weight": 5,
+        },
+    )
+    experience = api.post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "workflow_strategy",
+            "summary": "统一记忆入口优先。",
+            "lesson": "Hermes 学习、Memory 和 Cognitive 经验应在同一个中心确认和管理。",
+            "strategy": "用户侧只展示一个记忆 / 经验中心，保留底层 source 用于兼容。",
+            "confidence": 0.73,
+            "evidence": [
+                {"source_type": "feedback", "source_id": "conv-unified-actions", "note": "user requested merge"}
+            ],
+            "tags": ["memory", "hermes"],
+        },
+    )
+    rejected = api.post(
+        "/api/v1/admin/cognitive/experiences",
+        headers=headers(),
+        json={
+            "kind": "error_handling",
+            "summary": "待拒绝经验。",
+            "lesson": "这条经验用于验证统一拒绝动作。",
+            "strategy": "拒绝后不参与运行时注入。",
+            "confidence": 0.51,
+            "evidence": [
+                {"source_type": "test", "source_id": "memory-center-actions", "note": "reject path"}
+            ],
+            "tags": ["memory"],
+        },
+    )
+    assert memory.status_code == 200
+    assert hermes.status_code == 200
+    assert experience.status_code == 200
+    assert rejected.status_code == 200
+
+    confirmed_hermes = api.post(
+        "/api/v1/admin/memory-center/actions",
+        headers=headers(),
+        json={"id": f"hermes:{hermes.json()['id']}", "action": "confirm"},
+    )
+    assert confirmed_hermes.status_code == 200
+    assert confirmed_hermes.json()["status"] == "updated"
+    assert confirmed_hermes.json()["item"]["source"] == "hermes"
+    assert confirmed_hermes.json()["item"]["status"] == "confirmed"
+
+    confirmed_experience = api.post(
+        "/api/v1/admin/memory-center/actions",
+        headers=headers(),
+        json={"id": f"cognitive_experience:{experience.json()['id']}", "action": "confirm"},
+    )
+    assert confirmed_experience.status_code == 200
+    assert confirmed_experience.json()["item"]["source"] == "cognitive_experience"
+    assert confirmed_experience.json()["item"]["status"] == "confirmed"
+    assert confirmed_experience.json()["item"]["active_for_runtime"] is True
+
+    rejected_experience = api.post(
+        "/api/v1/admin/memory-center/actions",
+        headers=headers(),
+        json={"id": f"cognitive_experience:{rejected.json()['id']}", "action": "reject"},
+    )
+    assert rejected_experience.status_code == 200
+    assert rejected_experience.json()["item"]["status"] == "rejected"
+    assert rejected_experience.json()["item"]["active_for_runtime"] is False
+
+    deleted_memory = api.post(
+        "/api/v1/admin/memory-center/actions",
+        headers=headers(),
+        json={"id": "memory:temporary-rule", "action": "delete"},
+    )
+    assert deleted_memory.status_code == 200
+    assert deleted_memory.json() == {"status": "deleted", "item": None}
+    remaining = api.get("/api/v1/admin/memory-center", headers=headers())
+    assert "memory:temporary-rule" not in {item["id"] for item in remaining.json()}
+
+
 def test_cognitive_governance_api_lists_records_and_updates_strategy() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)

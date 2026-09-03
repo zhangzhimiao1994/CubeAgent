@@ -414,6 +414,31 @@ async function mockLayoutApi(page: Page) {
       });
       return;
     }
+    if (path === "/api/v1/admin/memory-center") {
+      await route.fulfill({
+        json: [
+          {
+            id: "memory:memory-1",
+            source: "memory",
+            status: "active",
+            summary: "Prefer production-safe deployment steps and explicit verification.",
+            detail: "Prefer production-safe deployment steps and explicit verification.",
+            memory_scope: "global",
+            user_id: null,
+            confidence: null,
+            active_for_runtime: true,
+            evidence_count: 0,
+            contradiction_count: 0,
+            use_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            created_at: null,
+            updated_at: null,
+          },
+        ],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/logs") {
       await route.fulfill({
         json: [
@@ -433,6 +458,10 @@ async function mockLayoutApi(page: Page) {
     }
     if (path === "/api/v1/admin/hermes") {
       await route.fulfill({ json: [hermesInsight] });
+      return;
+    }
+    if (path === "/api/v1/admin/cognitive/experiences") {
+      await route.fulfill({ json: [] });
       return;
     }
 
@@ -511,8 +540,8 @@ const pages = [
   "/schedules",
   "/attachments",
   "/memory",
+  "/memory?source=hermes",
   "/logs/audit",
-  "/hermes",
   "/users",
 ];
 

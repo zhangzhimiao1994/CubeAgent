@@ -1,6 +1,6 @@
-# Hermes Learning
+# Hermes Learning Inside The Unified Memory / Experience Center
 
-Hermes is an experience layer, not online model training.
+Hermes is an experience layer, not online model training. Operators manage Hermes learning records from the unified Memory / Experience center (`/memory`) together with ordinary memory and Cognitive experience candidates. Legacy `/hermes` links are kept only as compatibility redirects.
 
 It stores safe lessons from previous runs and uses them to recommend:
 

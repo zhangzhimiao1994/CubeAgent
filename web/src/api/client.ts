@@ -902,6 +902,14 @@ const MemoryCenterItemSchema = z.object({
 
 export type MemoryCenterItem = z.infer<typeof MemoryCenterItemSchema>;
 
+const MemoryCenterActionSchema = z.object({
+  status: z.enum(["updated", "deleted"]),
+  item: MemoryCenterItemSchema.nullable(),
+});
+
+export type MemoryCenterAction = z.infer<typeof MemoryCenterActionSchema>;
+export type MemoryCenterActionName = "confirm" | "reject" | "delete" | "lock" | "unlock";
+
 const AuditEventSchema = z.object({
   id: z.string(),
   actor: z.string(),
@@ -1752,6 +1760,13 @@ export const api = {
   },
   memoryCenter(): Promise<MemoryCenterItem[]> {
     return request("/api/v1/admin/memory-center", { method: "GET" }, z.array(MemoryCenterItemSchema));
+  },
+  memoryCenterAction(id: string, action: MemoryCenterActionName): Promise<MemoryCenterAction> {
+    return request(
+      "/api/v1/admin/memory-center/actions",
+      { method: "POST", body: JSON.stringify({ id, action }) },
+      MemoryCenterActionSchema,
+    );
   },
   createMemory(payload: { id: string; scope: string; value: string }): Promise<MemoryRecord> {
     return request(

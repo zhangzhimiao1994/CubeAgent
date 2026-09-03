@@ -146,6 +146,39 @@ async function mockAdminApi(page: Page) {
       });
       return;
     }
+    if (path === "/api/v1/admin/cognitive/experiences" && request.method() === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+    if (path === "/api/v1/admin/memory" && request.method() === "GET") {
+      await route.fulfill({ json: [] });
+      return;
+    }
+    if (path === "/api/v1/admin/memory-center" && request.method() === "GET") {
+      await route.fulfill({
+        json: [
+          {
+            id: "hermes:hermes-1",
+            source: "hermes",
+            status: "candidate",
+            summary: "Matched dispatch mode for concrete deliverables.",
+            detail: "Use dispatch mode when the request has clear deliverables.",
+            memory_scope: "user",
+            user_id: "11111111-1111-4111-8111-111111111111",
+            confidence: null,
+            active_for_runtime: false,
+            evidence_count: 1,
+            contradiction_count: 0,
+            use_count: 0,
+            success_count: 1,
+            failure_count: 0,
+            created_at: "2026-08-07T00:00:00Z",
+            updated_at: null,
+          },
+        ],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/hermes/recommend") {
       await route.fulfill({
         json: {
@@ -185,8 +218,9 @@ test("administrator can inspect MCP and export safe audit view", async ({ page }
 
 test("administrator reviews Hermes learning records", async ({ page }) => {
   await mockAdminApi(page);
-  await page.goto("/hermes");
-  await expect(page.getByRole("heading", { name: "Hermes 学习" })).toBeVisible();
+  await page.goto("/memory?source=hermes");
+  await expect(page.getByRole("heading", { name: "记忆 / 经验管理" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "学习台账与经验候选" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "Matched dispatch mode for concrete deliverables." })).toBeVisible();
   await expect(page.getByRole("button", { name: "确认 Hermes 学习 hermes-1" })).toBeVisible();
 });

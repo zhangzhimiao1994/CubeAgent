@@ -2,7 +2,7 @@
 
 Cube Agent is a self-hosted multi-agent operations console. The internal Python package is still named `agent_hub`, but the product-facing UI is Cube Agent / 魔方 agent.
 
-It combines a Web console, Feishu/channel entry points, model pools, workflow and role routing, governed Skills/MCP, scheduled tasks, multimedia generation routing, OpenClaw computer/server operations, Hermes learning, and audit logs.
+It combines a Web console, Feishu/channel entry points, model pools, workflow and role routing, governed Skills/MCP, scheduled tasks, multimedia generation routing, OpenClaw computer/server operations, a unified Memory / Experience center, and audit logs.
 
 [中文使用说明](README.zh-CN.md)
 
@@ -17,7 +17,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 - Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion. A Skill name keeps one active latest version by default; upload conflicts ask whether to overwrite or keep a separate version for controlled selection.
 - Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
 - Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
-- Review Hermes learning, logs, and audit records. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
+- Review memory, Hermes learning, reusable Cognitive experience, logs, and audit records from unified management pages. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
 - Keep Hermes/Cognitive memory separated by scope. User memory is bound to the current user and must not affect other users. Root memory is shared within the tenant and should only be used for stable project-wide lessons, policies, or environment facts. Runtime injection retrieves only the current user's confirmed memories plus confirmed root memories.
 
 ## Quick Install
@@ -198,7 +198,7 @@ Dispatch and discussion runs render a compact process card in the conversation s
 
 Long conversations are handled by the conversation framework. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 
-Hermes learning is not the same as raw chat history. A learning record first lands in the Hermes ledger with a Chinese one-line summary. Reusable Cognitive experiences are separate candidates and only affect future runs after confirmation. Runtime guidance is scoped: `用户记忆` applies only to the same user, while `根记忆` applies across users in the same tenant.
+Hermes learning is not the same as raw chat history, and it is managed from the same Memory / Experience center as ordinary memory and Cognitive records. A learning record first lands in the learning ledger with a Chinese one-line summary. Reusable Cognitive experiences are separate candidates and only affect future runs after confirmation. Runtime guidance is scoped: `用户记忆` applies only to the same user, while `根记忆` applies across users in the same tenant.
 
 ## Cognitive Learning And Governance
 
@@ -278,7 +278,7 @@ The legacy Feishu field `FEISHU_COMMAND_ALIASES` is kept only for backward-compa
 
 See [docs/feishu-setup.md](docs/feishu-setup.md).
 
-## Logs, Audit, And Hermes+
+## Logs, Audit, And Memory / Experience
 
 The Logs center separates audit logs, model errors, mode errors, feature errors, agent errors, and channel errors. Each log table supports search, column filters, sorting, selection, and JSON export.
 
@@ -291,7 +291,7 @@ Audit records cover administrative changes and user-triggered conversation submi
 - workflow, selected agents, direct model, the backend-compatible Vibe Coding metadata flag, and attachment count
 - message preview and `message_sha256`
 
-Hermes+ stores learning records separately from chat. Conversation memory, scheduler observations, and reusable experience candidates are separated so runtime telemetry does not pollute user-facing conversation memory. Experience candidates must be confirmed before they can be injected into future runs. Confirmed experiences are retrieved through the existing Hermes runtime advice path as short, bounded guidance instead of dumping the whole memory ledger into context.
+The Memory / Experience center is the operator-facing place for ordinary memory, Hermes learning records, and reusable Cognitive experience candidates. Conversation memory, scheduler observations, and reusable experience candidates still keep source/category metadata so runtime telemetry does not pollute user-facing conversation memory. Experience candidates must be confirmed before they can be injected into future runs. Confirmed experiences are retrieved as short, bounded guidance instead of dumping the whole memory ledger into context.
 
 ## Operations
 

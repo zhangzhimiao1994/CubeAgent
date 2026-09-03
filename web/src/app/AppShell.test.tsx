@@ -35,6 +35,8 @@ describe("AppShell presentation", () => {
         if (path === "/api/v1/admin/workflows") return jsonResponse([]);
         if (path === "/api/v1/admin/hermes") return jsonResponse([]);
         if (path === "/api/v1/admin/cognitive/experiences") return jsonResponse([]);
+        if (path === "/api/v1/admin/memory") return jsonResponse([]);
+        if (path === "/api/v1/admin/memory-center") return jsonResponse([]);
         if (path === "/api/v1/admin/settings") {
           return jsonResponse({
             default_mode: "auto",
@@ -104,7 +106,7 @@ describe("AppShell presentation", () => {
     expect(within(moduleGrid).getByRole("link", { name: /协作配置/ })).not.toBeNull();
     expect(within(moduleGrid).queryByRole("link", { name: /Agent 角色/ })).toBeNull();
     expect(within(moduleGrid).queryByRole("link", { name: /工作流配置/ })).toBeNull();
-    expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
+    expect(within(moduleGrid).queryByRole("link", { name: /Hermes 学习/ })).toBeNull();
 
     const drawer = screen.getByLabelText("编排二级导航");
     expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
@@ -166,10 +168,10 @@ describe("AppShell presentation", () => {
     });
   });
 
-  it("activates Hermes third-level filters from category and status query", async () => {
+  it("redirects legacy Hermes routes into the unified memory and experience center", async () => {
     render(<TestApp initialPath="/hermes?status=pending" />);
 
-    expect(await screen.findByRole("heading", { name: "Hermes 学习" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "记忆 / 经验管理" })).not.toBeNull();
     await waitFor(() => {
       expect(document.querySelector('[data-nav-section="pending"]')?.getAttribute("data-nav-active")).toBe("true");
     });

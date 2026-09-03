@@ -423,6 +423,7 @@ describe("operational management pages", () => {
   let visibleWorkflows = workflows;
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
+  let confirmedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
   let visibleCognitiveExperiences = [cognitiveExperience];
@@ -442,6 +443,7 @@ describe("operational management pages", () => {
     visibleWorkflows = workflows;
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
+    confirmedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
     visibleCognitiveExperiences = [cognitiveExperience];
@@ -1005,6 +1007,76 @@ describe("operational management pages", () => {
           }
           return jsonResponse(visibleCognitiveExperiences);
         }
+        if (path === "/api/v1/admin/memory-center/actions" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { id: "", action: "" };
+          const id = typeof body.id === "string" ? body.id : "";
+          const action = typeof body.action === "string" ? body.action : "";
+          if (id.startsWith("hermes:")) {
+            const hermesId = id.slice("hermes:".length);
+            if (action === "confirm") {
+              confirmedHermesIds.add(hermesId);
+              return jsonResponse({
+                status: "updated",
+                item: {
+                  id,
+                  source: "hermes",
+                  status: "confirmed",
+                  summary: hermesId === secondHermesInsight.id ? secondHermesInsight.user_summary : hermesInsight.user_summary,
+                  detail: hermesId === secondHermesInsight.id ? secondHermesInsight.lesson : hermesInsight.lesson,
+                  memory_scope: "user",
+                  user_id: "11111111-1111-4111-8111-111111111111",
+                  confidence: null,
+                  active_for_runtime: true,
+                  evidence_count: 1,
+                  contradiction_count: 0,
+                  use_count: 0,
+                  success_count: 1,
+                  failure_count: 0,
+                  created_at: "2026-08-07T00:04:00Z",
+                  updated_at: "2026-08-07T00:05:00Z",
+                },
+              });
+            }
+            if (action === "delete") {
+              deletedHermesIds.add(hermesId);
+              return jsonResponse({ status: "deleted", item: null });
+            }
+          }
+          if (id.startsWith("cognitive_experience:")) {
+            const cognitiveId = id.slice("cognitive_experience:".length);
+            const updated = {
+              ...cognitiveExperience,
+              id: cognitiveId,
+              status: action === "reject" ? "rejected" : "confirmed",
+              active_for_runtime: action === "confirm",
+            };
+            return jsonResponse({
+              status: action === "delete" ? "deleted" : "updated",
+              item:
+                action === "delete"
+                  ? null
+                  : {
+                      id,
+                      source: "cognitive_experience",
+                      status: updated.status,
+                      summary: updated.summary,
+                      detail: updated.lesson,
+                      memory_scope: updated.memory_scope,
+                      user_id: updated.user_id,
+                      confidence: updated.confidence,
+                      active_for_runtime: updated.active_for_runtime,
+                      evidence_count: updated.evidence.length,
+                      contradiction_count: updated.contradictions.length,
+                      use_count: updated.use_count,
+                      success_count: updated.success_count,
+                      failure_count: updated.failure_count,
+                      created_at: updated.created_at,
+                      updated_at: updated.updated_at,
+                    },
+            });
+          }
+          return jsonResponse({ error: { code: "unsupported", message: "unsupported" } }, { status: 422 });
+        }
         if (path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/confirm` && method === "POST") {
           return jsonResponse({ ...cognitiveExperience, status: "confirmed", active_for_runtime: true });
         }
@@ -1016,13 +1088,19 @@ describe("operational management pages", () => {
           return jsonResponse({ status: "deleted" });
         }
         if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111") {
-          return jsonResponse(hermesInsight);
+          return jsonResponse({
+            ...hermesInsight,
+            confirmed_at: confirmedHermesIds.has(hermesInsight.id) ? "2026-08-07T00:05:00Z" : hermesInsight.confirmed_at,
+          });
         }
         if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111/confirm" && method === "POST") {
           return jsonResponse({ ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" });
         }
         if (path === "/api/v1/admin/hermes/hermes_run_22222222222222222222222222222222") {
-          return jsonResponse(secondHermesInsight);
+          return jsonResponse({
+            ...secondHermesInsight,
+            confirmed_at: confirmedHermesIds.has(secondHermesInsight.id) ? "2026-08-07T00:07:00Z" : secondHermesInsight.confirmed_at,
+          });
         }
         if (path === "/api/v1/admin/hermes/hermes_run_22222222222222222222222222222222/confirm" && method === "POST") {
           return jsonResponse({ ...secondHermesInsight, confirmed_at: "2026-08-07T00:07:00Z" });
@@ -3958,7 +4036,7 @@ describe("operational management pages", () => {
 
   it("shows Hermes learning by time and conversation id with detail confirmation", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
     expect(screen.queryByText("请求 Hermes 推荐")).toBeNull();
@@ -3979,7 +4057,7 @@ describe("operational management pages", () => {
 
   it("separates Hermes conversation memory from scheduler observations", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes?category=scheduler" />);
+    render(<TestApp initialPath="/memory?source=hermes&category=scheduler" />);
 
     const table = await screen.findByRole("table", { name: /Hermes/ });
     expect(within(table).getByRole("cell", { name: "调度观察" })).not.toBeNull();
@@ -3990,16 +4068,16 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_22222222222222222222222222222222")).toMatchObject({
         method: "POST",
-        body: { ids: ["hermes_run_22222222222222222222222222222222"] },
+        body: { id: "hermes:hermes_run_22222222222222222222222222222222", action: "confirm" },
       }),
     );
   });
 
   it("shows reusable experience candidates and lets operators confirm or reject them", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
     expect(within(experienceSection).getByText(/用户记忆/)).not.toBeNull();
@@ -4009,15 +4087,17 @@ describe("operational management pages", () => {
 
     await user.click(within(experienceSection).getByRole("button", { name: "确认" }));
     await waitFor(() =>
-      expect(requests.find((request) => request.path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/confirm`)).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `cognitive_experience:${cognitiveExperience.id}` && "action" in request.body && request.body.action === "confirm")).toMatchObject({
         method: "POST",
+        body: { id: `cognitive_experience:${cognitiveExperience.id}`, action: "confirm" },
       }),
     );
 
     await user.click(within(experienceSection).getByRole("button", { name: "拒绝" }));
     await waitFor(() =>
-      expect(requests.find((request) => request.path === `/api/v1/admin/cognitive/experiences/${cognitiveExperience.id}/reject`)).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === `cognitive_experience:${cognitiveExperience.id}` && "action" in request.body && request.body.action === "reject")).toMatchObject({
         method: "POST",
+        body: { id: `cognitive_experience:${cognitiveExperience.id}`, action: "reject" },
       }),
     );
   });
@@ -4028,7 +4108,7 @@ describe("operational management pages", () => {
       { ...cognitiveExperience, id: "deprecated-exp", status: "deprecated", active_for_runtime: false },
       { ...cognitiveExperience, id: "superseded-exp", status: "superseded", active_for_runtime: false },
     ];
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     const experienceSection = await screen.findByRole("region", { name: "Cognitive 经验候选" });
 
@@ -4040,7 +4120,7 @@ describe("operational management pages", () => {
 
   it("keeps the Hermes ledger visible when reusable experiences fail to load", async () => {
     failCognitiveExperiences = true;
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     const ledgerSection = await screen.findByRole("region", { name: "Hermes 学习台账" });
     expect(within(ledgerSection).getByText(hermesInsight.user_summary)).not.toBeNull();
@@ -4048,39 +4128,41 @@ describe("operational management pages", () => {
     expect(screen.getByRole("alert").textContent).toContain("cognitive unavailable");
   });
 
-  it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {
+  it("bulk selects Hermes learning records and confirms them through the unified memory center", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
     await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
     await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
 
-    await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
-        method: "POST",
-        body: { ids: ["hermes_run_22222222222222222222222222222222", "hermes_run_11111111111111111111111111111111"] },
-      }),
-    );
+    await waitFor(() => {
+      const actionBodies = requests
+        .filter((request) => request.path === "/api/v1/admin/memory-center/actions")
+        .map((request) => request.body);
+      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_22222222222222222222222222222222", action: "confirm" });
+      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_11111111111111111111111111111111", action: "confirm" });
+    });
   });
 
   it("confirms a Hermes learning record directly from the table", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "确认 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111/confirm")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_11111111111111111111111111111111" && "action" in request.body && request.body.action === "confirm")).toMatchObject({
         method: "POST",
+        body: { id: "hermes:hermes_run_11111111111111111111111111111111", action: "confirm" },
       }),
     );
   });
 
   it("clears Hermes bulk selection when select all is clicked again", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     const selectAll = await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" });
     const confirmButton = screen.getByRole("button", { name: /批量确认待确认学习/ }) as HTMLButtonElement;
@@ -4099,34 +4181,36 @@ describe("operational management pages", () => {
     expect(deleteButton.disabled).toBe(true);
   });
 
-  it("bulk deletes selected Hermes learning records through one batch API call", async () => {
+  it("bulk deletes selected Hermes learning records through the unified memory center", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
     await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
     await user.click(screen.getByRole("button", { name: /批量删除已选学习/ }));
 
-    await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-delete")).toMatchObject({
-        method: "POST",
-        body: { ids: ["hermes_run_22222222222222222222222222222222", "hermes_run_11111111111111111111111111111111"] },
-      }),
-    );
+    await waitFor(() => {
+      const actionBodies = requests
+        .filter((request) => request.path === "/api/v1/admin/memory-center/actions")
+        .map((request) => request.body);
+      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_22222222222222222222222222222222", action: "delete" });
+      expect(actionBodies).toContainEqual({ id: "hermes:hermes_run_11111111111111111111111111111111", action: "delete" });
+    });
     await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
     expect(screen.queryByText("conv-workflow-2")).toBeNull();
   });
 
   it("deletes a Hermes learning record from the table", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes" />);
+    render(<TestApp initialPath="/memory?source=hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "删除 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111")).toMatchObject({
-        method: "DELETE",
+      expect(requests.find((request) => request.path === "/api/v1/admin/memory-center/actions" && request.body && typeof request.body === "object" && "id" in request.body && request.body.id === "hermes:hermes_run_11111111111111111111111111111111" && "action" in request.body && request.body.action === "delete")).toMatchObject({
+        method: "POST",
+        body: { id: "hermes:hermes_run_11111111111111111111111111111111", action: "delete" },
       }),
     );
     await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());

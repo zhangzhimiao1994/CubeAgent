@@ -141,10 +141,16 @@ export function HermesPage() {
   return <HermesLearningTable />;
 }
 
-function HermesLearningTable() {
+type HermesLearningTableProps = {
+  embedded?: boolean;
+  detailBasePath?: "/hermes" | "/memory";
+  unifiedActions?: boolean;
+};
+
+export function HermesLearningTable({ embedded = false, detailBasePath = "/hermes", unifiedActions = false }: HermesLearningTableProps = {}) {
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
-  const { activeSection, navTargetProps } = useNavSection(["category", "status"]);
+  const { activeSection, navTargetProps } = useNavSection(["category", "status", "source"]);
   const searchParamKey = searchParams.toString();
   const [conversationId, setConversationId] = useState("");
   const [lesson, setLesson] = useState(
@@ -197,48 +203,87 @@ function HermesLearningTable() {
     },
   });
   const bulkConfirm = useMutation({
-    mutationFn: (ids: string[]) => api.bulkConfirmHermesInsights(ids),
+    mutationFn: async (ids: string[]) => {
+      if (unifiedActions) {
+        await Promise.all(ids.map((id) => api.memoryCenterAction(`hermes:${id}`, "confirm")));
+        return { confirmed: [], failed: [] };
+      }
+      return api.bulkConfirmHermesInsights(ids);
+    },
     onSuccess: async () => {
       setSelectedIds([]);
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const bulkDelete = useMutation({
-    mutationFn: (ids: string[]) => api.bulkDeleteHermesInsights(ids),
+    mutationFn: async (ids: string[]) => {
+      if (unifiedActions) {
+        await Promise.all(ids.map((id) => api.memoryCenterAction(`hermes:${id}`, "delete")));
+        return { deleted: ids, failed: [] };
+      }
+      return api.bulkDeleteHermesInsights(ids);
+    },
     onSuccess: async (_result, ids) => {
       setSelectedIds((current) => current.filter((item) => !ids.includes(item)));
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const confirmInsight = useMutation({
-    mutationFn: (id: string) => api.confirmHermesInsight(id),
+    mutationFn: async (id: string) => {
+      if (unifiedActions) return api.memoryCenterAction(`hermes:${id}`, "confirm");
+      await api.confirmHermesInsight(id);
+      return { status: "updated" as const, item: null };
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const deleteInsight = useMutation({
-    mutationFn: (id: string) => api.deleteHermesInsight(id),
+    mutationFn: async (id: string) => {
+      if (unifiedActions) return api.memoryCenterAction(`hermes:${id}`, "delete");
+      await api.deleteHermesInsight(id);
+      return { status: "deleted" as const, item: null };
+    },
     onSuccess: async (_result, id) => {
       setSelectedIds((current) => current.filter((item) => item !== id));
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const confirmExperience = useMutation({
-    mutationFn: (id: string) => api.confirmCognitiveExperience(id),
+    mutationFn: async (id: string) => {
+      if (unifiedActions) return api.memoryCenterAction(`cognitive_experience:${id}`, "confirm");
+      await api.confirmCognitiveExperience(id);
+      return { status: "updated" as const, item: null };
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const rejectExperience = useMutation({
-    mutationFn: (id: string) => api.rejectCognitiveExperience(id),
+    mutationFn: async (id: string) => {
+      if (unifiedActions) return api.memoryCenterAction(`cognitive_experience:${id}`, "reject");
+      await api.rejectCognitiveExperience(id);
+      return { status: "updated" as const, item: null };
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const deleteExperience = useMutation({
-    mutationFn: (id: string) => api.deleteCognitiveExperience(id),
+    mutationFn: async (id: string) => {
+      if (unifiedActions) return api.memoryCenterAction(`cognitive_experience:${id}`, "delete");
+      await api.deleteCognitiveExperience(id);
+      return { status: "deleted" as const, item: null };
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["cognitive", "experiences"] });
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
 
@@ -296,16 +341,33 @@ function HermesLearningTable() {
     confirmInsight.isPending ||
     deleteInsight.isPending ||
     experienceBusy;
-  const ledgerNavSection = activeSection ?? "ledger";
+  const ledgerNavSection = activeSection ?? (embedded ? "hermes" : "ledger");
+
+  const detailHref = (insightId: string) =>
+    detailBasePath === "/memory"
+      ? `/memory?source=hermes&insight=${encodeURIComponent(insightId)}`
+      : `/hermes/${encodeURIComponent(insightId)}`;
 
   return (
     <section>
-      <p className="eyebrow">Hermes learning</p>
-      <h2>Hermes 学习</h2>
-      <p>
-        Hermes 是独立学习模块。它按时间和对话 ID 记录运行经验，外层以表格展示，
-        点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
-      </p>
+      {embedded ? (
+        <>
+          <p className="eyebrow">Learning ledger</p>
+          <h3>学习台账与经验候选</h3>
+          <p>
+            Hermes 学习、Cognitive 经验候选和可注入运行时的经验在这里统一管理；旧 Hermes 入口只保留兼容跳转。
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="eyebrow">Hermes learning</p>
+          <h2>Hermes 学习</h2>
+          <p>
+            Hermes 学习现在由记忆 / 经验中心统一承接。它按时间和对话 ID 记录运行经验，
+            外层以表格展示，点击后进入详情查看和确认；学习建议不会绕过主 Agent 的审批策略。
+          </p>
+        </>
+      )}
 
       <section aria-label="Cognitive 经验候选">
         <h3>经验候选</h3>
@@ -553,7 +615,7 @@ function HermesLearningTable() {
                             </button>
                           ) : null}
                           <Link
-                            to={`/hermes/${encodeURIComponent(insight.id)}`}
+                            to={detailHref(insight.id)}
                             aria-label={`查看 ${insight.conversation_id ?? insight.id} 的 Hermes 学习详情`}
                           >
                             查看详情
@@ -636,7 +698,15 @@ function HermesLearningTable() {
   );
 }
 
-function HermesInsightDetail({ insightId }: { insightId: string }) {
+export function HermesInsightDetail({
+  insightId,
+  returnTo = "/hermes",
+  unifiedActions = false,
+}: {
+  insightId: string;
+  returnTo?: string;
+  unifiedActions?: boolean;
+}) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const insight = useQuery({
@@ -644,18 +714,27 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
     queryFn: () => api.hermesInsight(insightId),
   });
   const confirm = useMutation({
-    mutationFn: () => api.confirmHermesInsight(insightId),
+    mutationFn: async () => {
+      if (!unifiedActions) return api.confirmHermesInsight(insightId);
+      await api.memoryCenterAction(`hermes:${insightId}`, "confirm");
+      return api.hermesInsight(insightId);
+    },
     onSuccess: (updated) => {
       queryClient.setQueryData(["hermes", insightId], updated);
       void queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      void queryClient.invalidateQueries({ queryKey: ["memory-center"] });
     },
   });
   const deleteInsight = useMutation({
-    mutationFn: () => api.deleteHermesInsight(insightId),
+    mutationFn: () =>
+      unifiedActions
+        ? api.memoryCenterAction(`hermes:${insightId}`, "delete")
+        : api.deleteHermesInsight(insightId),
     onSuccess: async () => {
       queryClient.removeQueries({ queryKey: ["hermes", insightId] });
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
-      navigate("/hermes");
+      await queryClient.invalidateQueries({ queryKey: ["memory-center"] });
+      navigate(returnTo);
     },
   });
 
@@ -666,8 +745,8 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
   if (!item) return <p role="alert">Hermes 学习详情为空。</p>;
   return (
     <section>
-      <Link to="/hermes" className="button-link">
-        返回学习台账
+      <Link to={returnTo} className="button-link">
+        返回记忆 / 经验中心
       </Link>
       <p className="eyebrow">Hermes detail</p>
       <h2>学习详情</h2>

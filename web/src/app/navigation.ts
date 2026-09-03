@@ -44,7 +44,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     to: "/orchestration",
     label: "编排",
     eyebrow: "Agent Control",
-    description: "主 Agent、协作配置和 Hermes 学习都属于 Agent 编排控制层。",
+    description: "主 Agent、协作配置和计划任务属于 Agent 编排控制层。",
     tone: "green",
     modules: [
       {
@@ -77,18 +77,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "按指定时间提交任务，可用于报表填写、提醒和需要 OpenClaw 审批的本机操作。",
         permission: "run:create",
       },
-      {
-        to: "/hermes",
-        label: "Hermes 学习",
-        description: "按类型查看学习沉淀，确认后再应用到系统行为。",
-        permission: "hermes:read",
-        children: [
-          { to: "/hermes?category=conversation", label: "对话记忆", permission: "hermes:read" },
-          { to: "/hermes?category=scheduler", label: "调度观察", permission: "hermes:read" },
-          { to: "/hermes?status=pending", label: "待确认学习", permission: "hermes:read" },
-          { to: "/hermes?status=confirmed", label: "已确认学习", permission: "hermes:read" },
-        ],
-      },
     ],
   },
   {
@@ -115,9 +103,15 @@ export const MODULE_GROUPS: ModuleGroup[] = [
 
       {
         to: "/memory",
-        label: "记忆",
-        description: "管理可被 Agent 参考的长期记忆、会话摘要和上下文资源。",
+        label: "记忆 / 经验",
+        description: "统一管理普通记忆、Hermes 学习、经验候选和运行时可注入的长期上下文。",
         permission: "memory:read",
+        children: [
+          { to: "/memory?source=memory", label: "普通记忆", permission: "memory:read" },
+          { to: "/memory?source=hermes", label: "学习台账", permission: "hermes:read" },
+          { to: "/memory?status=pending", label: "待确认学习", permission: "hermes:read" },
+          { to: "/memory?status=confirmed", label: "已确认学习", permission: "hermes:read" },
+        ],
       },
       {
         to: "/attachments",

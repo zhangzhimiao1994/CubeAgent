@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Protocol, TypedDict, cast
+from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -702,6 +702,20 @@ class MemoryCenterItemResponse(BaseModel):
     failure_count: int = Field(default=0, ge=0)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class MemoryCenterActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=3, max_length=256)
+    action: Literal["confirm", "reject", "delete", "lock", "unlock"]
+
+
+class MemoryCenterActionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["updated", "deleted"]
+    item: MemoryCenterItemResponse | None = None
 
 
 class AuditEventResponse(BaseModel):
@@ -10079,6 +10093,143 @@ async def list_memory_center(
 
 
 @router.post(
+    "/memory-center/actions",
+    response_model=MemoryCenterActionResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def apply_memory_center_action(
+    body: MemoryCenterActionRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MemoryCenterActionResponse:
+    source, raw_id = _split_memory_center_id(body.id)
+    if source == "memory":
+        _require(principal, "memory:write")
+        if body.action == "delete":
+            try:
+                await service.forget_memory(raw_id)
+            except KeyError:
+                raise PublicAPIError(404, "not_found", "not found") from None
+            return MemoryCenterActionResponse(status="deleted")
+        if body.action in {"lock", "unlock"}:
+            current = await _admin_memory_or_404(service, raw_id)
+            updated_memory = await service.update_memory(
+                raw_id,
+                _memory_request_from_response(current, locked=body.action == "lock"),
+            )
+            return MemoryCenterActionResponse(
+                status="updated",
+                item=_memory_center_item_from_memory(updated_memory),
+            )
+        raise PublicAPIError(
+            422,
+            "memory_center_action_unsupported",
+            "This memory-center action is not supported for ordinary memory records",
+        )
+    if source == "hermes":
+        _require(principal, "hermes:write")
+        if body.action == "confirm":
+            try:
+                updated_hermes = await service.confirm_hermes_insight(
+                    raw_id,
+                    actor_id=principal.user_id,
+                )
+            except KeyError:
+                raise PublicAPIError(
+                    404,
+                    "hermes_not_found",
+                    "Hermes learning record was not found",
+                ) from None
+            return MemoryCenterActionResponse(
+                status="updated",
+                item=_memory_center_item_from_hermes(updated_hermes),
+            )
+        if body.action in {"delete", "reject"}:
+            try:
+                await service.delete_hermes_insight(raw_id)
+            except KeyError:
+                raise PublicAPIError(
+                    404,
+                    "hermes_not_found",
+                    "Hermes learning record was not found",
+                ) from None
+            return MemoryCenterActionResponse(status="deleted")
+        raise PublicAPIError(
+            422,
+            "memory_center_action_unsupported",
+            "This memory-center action is not supported for Hermes learning records",
+        )
+    if source == "cognitive_experience":
+        _require(principal, "hermes:write")
+        experience_id = _parse_memory_center_uuid(raw_id, code="cognitive_experience_invalid_id")
+        try:
+            if body.action == "confirm":
+                experience = await service.confirm_cognitive_experience(
+                    experience_id,
+                    actor_id=principal.user_id,
+                )
+                return MemoryCenterActionResponse(
+                    status="updated",
+                    item=_memory_center_item_from_cognitive_experience(experience),
+                )
+            if body.action == "reject":
+                experience = await service.reject_cognitive_experience(experience_id)
+                return MemoryCenterActionResponse(
+                    status="updated",
+                    item=_memory_center_item_from_cognitive_experience(experience),
+                )
+            if body.action == "delete":
+                await service.delete_cognitive_experience(experience_id)
+                return MemoryCenterActionResponse(status="deleted")
+        except KeyError:
+            raise PublicAPIError(
+                404,
+                "cognitive_experience_not_found",
+                "Cognitive experience was not found",
+            ) from None
+        raise PublicAPIError(
+            422,
+            "memory_center_action_unsupported",
+            "This memory-center action is not supported for cognitive experiences",
+        )
+    if source == "cognitive_strategy":
+        _require(principal, "hermes:write")
+        strategy_id = _parse_memory_center_uuid(raw_id, code="cognitive_strategy_invalid_id")
+        try:
+            if body.action == "confirm":
+                strategy = await service.confirm_cognitive_strategy(
+                    strategy_id,
+                    actor_id=principal.user_id,
+                )
+                return MemoryCenterActionResponse(
+                    status="updated",
+                    item=_memory_center_item_from_cognitive_strategy(strategy),
+                )
+            if body.action == "reject":
+                strategy = await service.reject_cognitive_strategy(strategy_id)
+                return MemoryCenterActionResponse(
+                    status="updated",
+                    item=_memory_center_item_from_cognitive_strategy(strategy),
+                )
+        except KeyError:
+            raise PublicAPIError(
+                404,
+                "cognitive_strategy_not_found",
+                "Cognitive strategy was not found",
+            ) from None
+        raise PublicAPIError(
+            422,
+            "memory_center_action_unsupported",
+            "This memory-center action is not supported for cognitive strategies",
+        )
+    raise PublicAPIError(
+        422,
+        "memory_center_source_unsupported",
+        "This memory-center source does not support write actions yet",
+    )
+
+
+@router.post(
     "/memory", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 422)
 )
 async def create_memory(
@@ -10163,6 +10314,28 @@ async def _admin_memory_or_404(
         if item.id == memory_id:
             return item
     raise PublicAPIError(404, "not_found", "not found")
+
+
+def _split_memory_center_id(item_id: str) -> tuple[str, str]:
+    source, separator, raw_id = item_id.partition(":")
+    if not separator or not source or not raw_id:
+        raise PublicAPIError(
+            422,
+            "memory_center_invalid_id",
+            "Memory-center item id must use '<source>:<id>' format",
+        )
+    return source, raw_id
+
+
+def _parse_memory_center_uuid(value: str, *, code: str) -> UUID:
+    try:
+        return UUID(value)
+    except ValueError:
+        raise PublicAPIError(
+            422,
+            code,
+            "Memory-center item id contains an invalid UUID",
+        ) from None
 
 
 def _memory_request_from_response(

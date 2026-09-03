@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-router-dom";
+import { BrowserRouter, MemoryRouter, Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
@@ -7,7 +7,6 @@ import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { CollaborationPage } from "../pages/CollaborationPage";
 import { ConfigPage } from "../pages/ConfigPage";
-import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
 import { MainAgentPage } from "../pages/MainAgentPage";
@@ -64,8 +63,8 @@ export function AppRoutes() {
         <Route path="mcp" element={<McpPage />} />
         <Route path="channels" element={<ChannelsPage />} />
         <Route path="memory" element={<MemoryPage />} />
-        <Route path="hermes" element={<HermesPage />} />
-        <Route path="hermes/:insightId" element={<HermesPage />} />
+        <Route path="hermes" element={<HermesLegacyRedirect />} />
+        <Route path="hermes/:insightId" element={<HermesLegacyRedirect />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="logs/:module" element={<LogsPage />} />
@@ -74,6 +73,15 @@ export function AppRoutes() {
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
+}
+
+function HermesLegacyRedirect() {
+  const location = useLocation();
+  const { insightId } = useParams();
+  const params = new URLSearchParams(location.search);
+  params.set("source", "hermes");
+  if (insightId) params.set("insight", insightId);
+  return <Navigate to={`/memory?${params.toString()}`} replace />;
 }
 
 export function AppRouter() {
