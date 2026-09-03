@@ -902,22 +902,26 @@ def create_app(
             if (
                 active_secret_service is not None
                 and active_redis is not None
-                and getattr(application.state, "multimedia_generation_executor", None) is None
+                and getattr(application.state, "feishu_media_service_factory", None) is None
             ):
-                admin_service_for_generation = cast(
-                    admin.AdminResourceService,
-                    admin_resource_service
-                    if admin_resource_service is not None
-                    else application.state.admin_resource_service,
-                )
-                application.state.multimedia_generation_executor = (
-                    _ConfigBackedMultimediaGenerationExecutor(
-                        list_models=admin_service_for_generation.list_models,
-                        secret_service=active_secret_service,
-                        tenant_id=configured.bootstrap_tenant_id,
-                        redis_client=active_redis,
+                if (
+                    getattr(application.state, "multimedia_generation_executor", None)
+                    is None
+                ):
+                    admin_service_for_generation = cast(
+                        admin.AdminResourceService,
+                        admin_resource_service
+                        if admin_resource_service is not None
+                        else application.state.admin_resource_service,
                     )
-                )
+                    application.state.multimedia_generation_executor = (
+                        _ConfigBackedMultimediaGenerationExecutor(
+                            list_models=admin_service_for_generation.list_models,
+                            secret_service=active_secret_service,
+                            tenant_id=configured.bootstrap_tenant_id,
+                            redis_client=active_redis,
+                        )
+                    )
                 media_factory = build_feishu_media_service_factory(
                     config_service=cast(ConfigService, application.state.config_service),
                     secret_service=active_secret_service,
