@@ -359,6 +359,11 @@ class _ConfigBackedMultimediaGenerationExecutor:
                     kind=result.kind,
                     uri=result.text,
                     text=result.text,
+                    logical_model=result.logical_model,
+                    deployment_id=result.deployment_id,
+                    file_path=result.file_path,
+                    filename=result.filename,
+                    mime_type=result.mime_type,
                 ),
             ),
         )
@@ -444,6 +449,9 @@ class _ConfigBackedMultimediaGenerationExecutor:
             logical_model=deployment.logical_model,
             deployment_id=deployment.id,
             text=artifact.uri,
+            file_path=artifact.path,
+            filename=artifact.path.name,
+            mime_type=artifact.mime_type,
         )
 
     def _claim_daily_slot(

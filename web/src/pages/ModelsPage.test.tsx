@@ -23,12 +23,14 @@ describe("ModelsPage", () => {
   let failModelSave = false;
   let modelDeleted = false;
   let includeMultimediaModel = false;
+  let includeOverlappingProviderMultimediaModel = false;
 
   beforeEach(() => {
     requests.length = 0;
     failModelSave = false;
     modelDeleted = false;
     includeMultimediaModel = false;
+    includeOverlappingProviderMultimediaModel = false;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -77,6 +79,28 @@ describe("ModelsPage", () => {
               capabilities: ["video_generation"],
               credential_ref: "secret_video",
               quota_scope: "minimax-video-account",
+              max_concurrency: 1,
+              target_utilization: 0.8,
+              reserved_capacity: 0,
+              rpm: 3,
+              tpm: 100000,
+              queue_timeout_seconds: 60,
+              fallback: null,
+              weight: 100,
+              effective_slots: 1,
+              saturation_policy: "queue_first_then_fallback",
+            });
+          }
+          if (includeOverlappingProviderMultimediaModel) {
+            savedModels.push({
+              id: "33333333-3333-4333-8333-333333333333",
+              provider: "qwen-token-plan",
+              api_base: "https://media-token-plan.example/v1",
+              upstream_model: "future-video-model",
+              logical_model: "video_primary",
+              capabilities: ["video_generation"],
+              credential_ref: "secret_media_token",
+              quota_scope: "qwen-token-plan-media-account",
               max_concurrency: 1,
               target_utilization: 0.8,
               reserved_capacity: 0,
@@ -666,6 +690,11 @@ describe("ModelsPage", () => {
     await user.type(screen.getByLabelText("RPM"), "4");
     await user.click(screen.getByRole("button", { name: "更新多媒体模型配置" }));
 
+    await screen.findByText("多媒体模型配置已更新，生成实测请使用对应图片、视频或音频任务。Key 引用：secret_video");
+    expect((screen.getByLabelText("模型大类") as HTMLSelectElement).value).toBe("multimedia");
+    expect(screen.getByRole("tab", { name: "多媒体模型配置" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByRole("button", { name: "测试并保存模型" })).toBeNull();
+
     expect(requests.find((request) => request.path.includes("22222222") && request.method === "PUT")).toMatchObject({
       path: "/api/v1/admin/models/22222222-2222-4222-8222-222222222222",
       method: "PUT",
@@ -676,6 +705,24 @@ describe("ModelsPage", () => {
         rpm: 4,
       }),
     });
+  });
+
+  it("keeps custom multimedia models in multimedia setup when provider overlaps normal models", async () => {
+    includeOverlappingProviderMultimediaModel = true;
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models?category=text" />);
+
+    expect(await screen.findByText("future-video-model")).not.toBeNull();
+    await user.click(screen.getByTestId("edit-model-33333333-3333-4333-8333-333333333333"));
+
+    expect((screen.getByLabelText("模型大类") as HTMLSelectElement).value).toBe("multimedia");
+    expect(screen.getByRole("tab", { name: "多媒体模型配置" }).getAttribute("aria-selected")).toBe("true");
+    expect((screen.getByLabelText("服务商") as HTMLSelectElement).value).toBe("alibaba-token-plan-media");
+    expect((screen.getByLabelText("中转站模型名") as HTMLInputElement).value).toBe("future-video-model");
+    expect(view.container.querySelector('input[value="text"]')).toBeNull();
+    expect((view.container.querySelector('input[value="video_generation"]') as HTMLInputElement).checked).toBe(
+      true,
+    );
   });
 
   it("lets admins configure multi-capability multimedia generators without normal chat capabilities", async () => {

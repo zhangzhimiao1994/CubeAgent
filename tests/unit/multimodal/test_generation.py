@@ -85,6 +85,8 @@ async def test_generation_job_store_receives_executor_artifacts_for_main_agent()
             kind=MultimediaGenerationKind.VIDEO,
             uri="artifact://generated-video",
             text="artifact://generated-video",
+            logical_model="video-primary",
+            deployment_id="video-primary-1",
         ),
     )
     assert store.get(queued.id) == completed

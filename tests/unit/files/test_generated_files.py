@@ -11,6 +11,9 @@ from agent_hub.files.generated import GeneratedFileStore
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 ZIP_MIME = "application/zip"
+PNG_MIME = "image/png"
+MP4_MIME = "video/mp4"
+MP3_MIME = "audio/mpeg"
 
 
 def test_store_bytes_writes_file_under_tenant_run_artifact_scope(tmp_path: Path) -> None:
@@ -75,6 +78,18 @@ def test_store_bytes_allows_docx_pptx_and_zip_mime_types(tmp_path: Path) -> None
     assert docx.mime_type == DOCX_MIME
     assert pptx.mime_type == PPTX_MIME
     assert zip_file.mime_type == ZIP_MIME
+
+
+def test_store_bytes_allows_generated_media_mime_types(tmp_path: Path) -> None:
+    store = GeneratedFileStore(tmp_path)
+
+    image = store.store_bytes(uuid4(), uuid4(), uuid4(), "image.png", PNG_MIME, b"png")
+    video = store.store_bytes(uuid4(), uuid4(), uuid4(), "video.mp4", MP4_MIME, b"mp4")
+    audio = store.store_bytes(uuid4(), uuid4(), uuid4(), "voice.mp3", MP3_MIME, b"mp3")
+
+    assert image.mime_type == PNG_MIME
+    assert video.mime_type == MP4_MIME
+    assert audio.mime_type == MP3_MIME
 
 
 def test_store_bytes_rejects_unknown_mime_type_with_stable_error(tmp_path: Path) -> None:

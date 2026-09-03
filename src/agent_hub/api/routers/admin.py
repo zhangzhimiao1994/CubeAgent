@@ -928,10 +928,12 @@ class MultimediaGenerationRequest(BaseModel):
 class MultimediaGenerationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    job_id: str | None = None
     kind: str
     logical_model: str
     deployment_id: str
     text: str | None
+    artifacts: list[MultimediaArtifactResponse] = Field(default_factory=list)
 
 
 class MultimediaGenerationJobRunRequest(BaseModel):
@@ -946,6 +948,11 @@ class MultimediaArtifactResponse(BaseModel):
     kind: str
     uri: str | None
     text: str | None
+    filename: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    download_url: str | None = None
 
 
 class MultimediaGenerationJobResponse(BaseModel):
@@ -6709,17 +6716,57 @@ def _multimedia_job_response(job: MultimediaGenerationJob) -> MultimediaGenerati
         logical_model=job.logical_model,
         prompt=job.prompt,
         status=job.status.value,
-        artifacts=[_multimedia_artifact_response(artifact) for artifact in job.artifacts],
+        artifacts=[
+            _multimedia_artifact_response(artifact, job_id=job.id, artifact_index=index)
+            for index, artifact in enumerate(job.artifacts)
+        ],
         executor_id=job.executor_id,
         error=job.error,
     )
 
 
-def _multimedia_artifact_response(artifact: MultimediaArtifact) -> MultimediaArtifactResponse:
+def _multimedia_artifact_response(
+    artifact: MultimediaArtifact,
+    *,
+    job_id: str | None = None,
+    artifact_index: int | None = None,
+) -> MultimediaArtifactResponse:
+    file_path = artifact.file_path
+    filename = artifact.filename
+    mime_type = artifact.mime_type
+    size_bytes: int | None = None
+    digest: str | None = None
+    download_url: str | None = None
+    if (
+        file_path is not None
+        and filename is not None
+        and mime_type is not None
+        and job_id is not None
+        and artifact_index is not None
+    ):
+        try:
+            safe_filename = safe_generated_filename(filename)
+            resolved_path = file_path.resolve()
+            if resolved_path.is_file() and mime_type in ALLOWED_GENERATED_FILE_MIME_TYPES:
+                data = resolved_path.read_bytes()
+                filename = safe_filename
+                size_bytes = len(data)
+                digest = hashlib.sha256(data).hexdigest()
+                download_url = (
+                    f"/api/v1/admin/multimedia/jobs/{job_id}/artifacts/{artifact_index}/download"
+                )
+        except (OSError, ValueError):
+            filename = None
+            mime_type = None
     return MultimediaArtifactResponse(
         kind=artifact.kind.value,
         uri=artifact.uri,
         text=artifact.text,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        sha256=digest,
+        download_url=download_url,
     )
 
 
@@ -9172,6 +9219,49 @@ async def run_multimedia_job(
     return _multimedia_job_response(job)
 
 
+@router.get(
+    "/multimedia/jobs/{job_id}/artifacts/{artifact_index}/download",
+    response_model=None,
+    responses=error_responses(401, 403, 404, 422, 503),
+)
+async def download_multimedia_job_artifact(
+    job_id: str,
+    artifact_index: int,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> FileResponse:
+    _require(principal, "run:read")
+    if artifact_index < 0:
+        raise PublicAPIError(404, "multimedia_artifact_not_found", "multimedia artifact not found")
+    executor = _multimedia_generation_executor(request)
+    try:
+        job = executor.get_job(job_id)
+        artifact = job.artifacts[artifact_index]
+    except (KeyError, IndexError) as error:
+        raise PublicAPIError(
+            404, "multimedia_artifact_not_found", "multimedia artifact not found"
+        ) from error
+    file_path = artifact.file_path
+    filename = artifact.filename
+    mime_type = artifact.mime_type
+    if file_path is None or filename is None or mime_type is None:
+        raise PublicAPIError(
+            404, "multimedia_artifact_not_downloadable", "multimedia artifact is not downloadable"
+        )
+    try:
+        safe_filename = safe_generated_filename(filename)
+        resolved_path = file_path.resolve()
+    except (OSError, ValueError) as error:
+        raise PublicAPIError(
+            404, "multimedia_artifact_not_downloadable", "multimedia artifact is not downloadable"
+        ) from error
+    if not resolved_path.is_file() or mime_type not in ALLOWED_GENERATED_FILE_MIME_TYPES:
+        raise PublicAPIError(
+            404, "multimedia_artifact_not_downloadable", "multimedia artifact is not downloadable"
+        )
+    return FileResponse(resolved_path, media_type=mime_type, filename=safe_filename)
+
+
 @router.post(
     "/multimedia/generate",
     response_model=MultimediaGenerationResponse,
@@ -9188,11 +9278,12 @@ async def generate_multimedia(
     await _require_multimedia_generation_enabled(service)
     executor = _multimedia_generation_executor(request)
     try:
-        result = await executor.generate(
+        submitted = executor.submit(
             kind=MultimediaGenerationKind(body.kind),
             logical_model=body.logical_model,
             prompt=body.prompt,
         )
+        job = await executor.run_job(submitted.id, executor_id="admin_multimedia_generate")
     except NoCapableDeployment as error:
         raise PublicAPIError(
             422,
@@ -9216,11 +9307,17 @@ async def generate_multimedia(
                 "reason": str(error),
             },
         ) from error
+    artifact = job.artifacts[0] if job.artifacts else None
     return MultimediaGenerationResponse(
-        kind=result.kind.value,
-        logical_model=result.logical_model,
-        deployment_id=result.deployment_id,
-        text=result.text,
+        job_id=job.id,
+        kind=job.kind.value,
+        logical_model=artifact.logical_model if artifact and artifact.logical_model else job.logical_model,
+        deployment_id=artifact.deployment_id if artifact and artifact.deployment_id else "",
+        text=(artifact.text or artifact.uri) if artifact else None,
+        artifacts=[
+            _multimedia_artifact_response(item, job_id=job.id, artifact_index=index)
+            for index, item in enumerate(job.artifacts)
+        ],
     )
 
 

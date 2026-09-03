@@ -761,10 +761,25 @@ const AttachmentBulkDeleteSchema = z.object({
 });
 
 const MultimediaGenerationSchema = z.object({
+  job_id: z.string().nullable().optional(),
   kind: z.enum(["image", "video", "audio"]),
   logical_model: z.string(),
   deployment_id: z.string(),
   text: z.string().nullable(),
+  artifacts: z
+    .array(
+      z.object({
+        kind: z.enum(["image", "video", "audio"]),
+        uri: z.string().nullable().optional(),
+        text: z.string().nullable().optional(),
+        filename: z.string().nullable().optional(),
+        mime_type: z.string().nullable().optional(),
+        size_bytes: z.number().nullable().optional(),
+        sha256: z.string().nullable().optional(),
+        download_url: z.string().nullable().optional(),
+      }),
+    )
+    .default([]),
 });
 
 export type MultimediaGeneration = z.infer<typeof MultimediaGenerationSchema>;

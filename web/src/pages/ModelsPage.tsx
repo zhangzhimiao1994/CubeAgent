@@ -503,10 +503,12 @@ function displaySaturationPolicy(policy: string) {
 }
 
 function findPresetForSavedModel(model: ModelDeployment): (ProviderPreset & { category: ModelCategory }) | null {
-  const allPresets: Array<ProviderPreset & { category: ModelCategory }> = [
-    ...NORMAL_PROVIDERS.map((preset) => ({ ...preset, category: "normal" as const })),
-    ...MULTIMEDIA_PROVIDERS.map((preset) => ({ ...preset, category: "multimedia" as const })),
-  ];
+  const modelCategory = savedModelCategory(model);
+  const sourcePresets = modelCategory === "normal" ? NORMAL_PROVIDERS : MULTIMEDIA_PROVIDERS;
+  const allPresets: Array<ProviderPreset & { category: ModelCategory }> = sourcePresets.map((preset) => ({
+    ...preset,
+    category: modelCategory,
+  }));
   return (
     allPresets.find(
       (preset) =>
@@ -744,7 +746,9 @@ export function ModelsPage() {
         if (existingIndex === -1) return [...current, model];
         return current.map((item, index) => (index === existingIndex ? model : item));
       });
-      resetModelForm();
+      const savedCategory = savedModelCategory(model);
+      resetModelForm(savedCategory);
+      syncModelCategorySearchParams(savedCategory);
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     },
     onError: async () => {

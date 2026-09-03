@@ -65,8 +65,13 @@ from agent_hub.models.types import (
     TokenUsage,
 )
 from agent_hub.multimodal.generation import (
+    MultimediaArtifact,
     MultimediaDailyLimitExceeded,
     MultimediaGenerationExecutor,
+    MultimediaGenerationJob,
+    MultimediaGenerationJobStatus,
+    MultimediaGenerationKind,
+    MultimediaGenerationResult,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
 from agent_hub.runs.repository import RunRecord, _public_artifact_payload
@@ -183,6 +188,75 @@ class FakeGenerationGateway:
             logical_model=request.logical_model,
             provider_id="minimax",
             provider_model="minimax/MiniMax-Hailuo-02",
+        )
+
+
+class DownloadableMultimediaExecutor:
+    def __init__(self, media_path: Path) -> None:
+        self._media_path = media_path
+        self._job: MultimediaGenerationJob | None = None
+
+    def submit(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationJob:
+        self._job = MultimediaGenerationJob(
+            id="media_downloadable",
+            kind=kind,
+            logical_model=logical_model,
+            prompt=prompt,
+            status=MultimediaGenerationJobStatus.QUEUED,
+        )
+        return self._job
+
+    def get_job(self, job_id: str) -> MultimediaGenerationJob:
+        if self._job is None or self._job.id != job_id:
+            raise KeyError(job_id)
+        return self._job
+
+    async def run_job(self, job_id: str, *, executor_id: str) -> MultimediaGenerationJob:
+        if self._job is None or self._job.id != job_id:
+            raise KeyError(job_id)
+        self._job = MultimediaGenerationJob(
+            id=self._job.id,
+            kind=self._job.kind,
+            logical_model=self._job.logical_model,
+            prompt=self._job.prompt,
+            status=MultimediaGenerationJobStatus.SUCCEEDED,
+            artifacts=(
+                MultimediaArtifact(
+                    kind=self._job.kind,
+                    uri=self._media_path.as_uri(),
+                    text=None,
+                    logical_model=self._job.logical_model,
+                    deployment_id="media_primary_1",
+                    file_path=self._media_path,
+                    filename=self._media_path.name,
+                    mime_type="video/mp4",
+                ),
+            ),
+            executor_id=executor_id,
+        )
+        return self._job
+
+    async def generate(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationResult:
+        return MultimediaGenerationResult(
+            kind=kind,
+            logical_model=logical_model,
+            deployment_id="media_primary_1",
+            text=self._media_path.as_uri(),
+            file_path=self._media_path,
+            filename=self._media_path.name,
+            mime_type="video/mp4",
         )
 
 
@@ -2230,6 +2304,52 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
     }
 
 
+def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path) -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    media_path = tmp_path / "generated-video.mp4"
+    media_path.write_bytes(b"video-bytes")
+    cast(Any, api.app).state.multimedia_generation_executor = DownloadableMultimediaExecutor(
+        media_path
+    )
+
+    response = api.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == "media_downloadable"
+    assert body["text"] == media_path.as_uri()
+    assert body["artifacts"] == [
+        {
+            "kind": "video",
+            "uri": media_path.as_uri(),
+            "text": None,
+            "filename": "generated-video.mp4",
+            "mime_type": "video/mp4",
+            "size_bytes": len(b"video-bytes"),
+            "sha256": "79fd615a866fe7f9eb4da8d9c41ab57e3bd48056df42fd2c13e4d461a87afbe3",
+            "download_url": "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download",
+        }
+    ]
+
+    downloaded = api.get(body["artifacts"][0]["download_url"], headers=headers())
+
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"video-bytes"
+    assert downloaded.headers["content-type"].startswith("video/mp4")
+
+
 def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
@@ -2272,6 +2392,11 @@ def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main
             "kind": "video",
             "uri": "artifact://generated-media",
             "text": "artifact://generated-media",
+            "filename": None,
+            "mime_type": None,
+            "size_bytes": None,
+            "sha256": None,
+            "download_url": None,
         }
     ]
 

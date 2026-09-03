@@ -10,7 +10,25 @@ from uuid import UUID
 DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 ZIP_MIME_TYPE = "application/zip"
-ALLOWED_GENERATED_FILE_MIME_TYPES = frozenset({DOCX_MIME_TYPE, PPTX_MIME_TYPE, ZIP_MIME_TYPE})
+PNG_MIME_TYPE = "image/png"
+JPEG_MIME_TYPE = "image/jpeg"
+WEBP_MIME_TYPE = "image/webp"
+MP4_MIME_TYPE = "video/mp4"
+WAV_MIME_TYPE = "audio/wav"
+MPEG_AUDIO_MIME_TYPE = "audio/mpeg"
+ALLOWED_GENERATED_FILE_MIME_TYPES = frozenset(
+    {
+        DOCX_MIME_TYPE,
+        PPTX_MIME_TYPE,
+        ZIP_MIME_TYPE,
+        PNG_MIME_TYPE,
+        JPEG_MIME_TYPE,
+        WEBP_MIME_TYPE,
+        MP4_MIME_TYPE,
+        WAV_MIME_TYPE,
+        MPEG_AUDIO_MIME_TYPE,
+    }
+)
 _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
     {
         "CON",

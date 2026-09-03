@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
@@ -30,6 +31,9 @@ class MultimediaGenerationResult:
     logical_model: str
     deployment_id: str
     text: str | None
+    file_path: Path | None = None
+    filename: str | None = None
+    mime_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +41,11 @@ class MultimediaArtifact:
     kind: MultimediaGenerationKind
     uri: str | None
     text: str | None = None
+    logical_model: str | None = None
+    deployment_id: str | None = None
+    file_path: Path | None = None
+    filename: str | None = None
+    mime_type: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.kind) is not MultimediaGenerationKind:
@@ -45,6 +54,24 @@ class MultimediaArtifact:
             raise ValueError("artifact uri must be nonblank when provided")
         if self.text is not None and type(self.text) is not str:
             raise ValueError("artifact text must be a string or None")
+        if self.logical_model is not None and (
+            type(self.logical_model) is not str or not self.logical_model.strip()
+        ):
+            raise ValueError("artifact logical_model must be nonblank when provided")
+        if self.deployment_id is not None and (
+            type(self.deployment_id) is not str or not self.deployment_id.strip()
+        ):
+            raise ValueError("artifact deployment_id must be nonblank when provided")
+        if self.file_path is not None and not isinstance(self.file_path, Path):
+            raise TypeError("artifact file_path must be a Path or None")
+        if self.filename is not None and (
+            type(self.filename) is not str or not self.filename.strip()
+        ):
+            raise ValueError("artifact filename must be nonblank when provided")
+        if self.mime_type is not None and (
+            type(self.mime_type) is not str or not self.mime_type.strip()
+        ):
+            raise ValueError("artifact mime_type must be nonblank when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +233,11 @@ class MultimediaGenerationExecutor:
             kind=result.kind,
             uri=result.text,
             text=result.text,
+            logical_model=result.logical_model,
+            deployment_id=result.deployment_id,
+            file_path=result.file_path,
+            filename=result.filename,
+            mime_type=result.mime_type,
         )
         return self._job_store.succeed(job_id, artifacts=(artifact,))
 
