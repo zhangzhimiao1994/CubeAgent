@@ -5160,11 +5160,81 @@ def test_memory_center_lists_memory_and_deduplicated_cognitive_records() -> None
     by_id = {item["id"]: item for item in items}
     assert by_id["memory:project-boundary"]["source"] == "memory"
     assert by_id["memory:project-boundary"]["memory_scope"] == "root"
-    assert f"hermes:{hermes.json()['id']}" not in by_id
-    assert any(item["source"] == "hermes" for item in items)
+    assert by_id[f"hermes:{hermes.json()['id']}"]["source"] == "hermes"
+    assert by_id[f"hermes:{hermes.json()['id']}"]["status"] == "candidate"
+    assert "技术结论" in by_id[f"hermes:{hermes.json()['id']}"]["summary"]
     assert by_id[f"cognitive_experience:{experience.json()['id']}"]["source"] == "cognitive_experience"
     assert by_id[f"cognitive_experience:{experience.json()['id']}"]["evidence_count"] == 1
     assert "模型网络错误" in by_id[f"cognitive_experience:{experience.json()['id']}"]["summary"]
+
+
+def test_persistent_memory_center_lists_posted_hermes_learning_record(tmp_path: Path) -> None:
+    class StoredPersistentMemoryCenterService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            payload = self.payloads.get((kind, resource_id))
+            return None if payload is None else dict(payload)
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (resource_id, dict(payload), None, None)
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = dict(payload)
+            return True
+
+    service = StoredPersistentMemoryCenterService()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        admin_resource_service=service,
+    )
+    api = TestClient(app)
+
+    hermes = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "When users ask for architecture guidance, give the conclusion first.",
+            "conversation_id": "conv-persistent-memory-center",
+            "tags": ["architecture"],
+            "weight": 6,
+        },
+    )
+
+    assert hermes.status_code == 200
+    hermes_item_id = f"hermes:{hermes.json()['id']}"
+    memory_center = api.get("/api/v1/admin/memory-center", headers=headers())
+
+    assert memory_center.status_code == 200
+    candidate = {item["id"]: item for item in memory_center.json()}[hermes_item_id]
+    assert candidate["source"] == "hermes"
+    assert candidate["status"] == "candidate"
+
+    confirmed = api.post(f"/api/v1/admin/hermes/{hermes.json()['id']}/confirm", headers=headers())
+    memory_center = api.get("/api/v1/admin/memory-center", headers=headers())
+
+    assert confirmed.status_code == 200
+    confirmed_item = {item["id"]: item for item in memory_center.json()}[hermes_item_id]
+    assert confirmed_item["source"] == "hermes"
+    assert confirmed_item["status"] == "confirmed"
 
 
 def test_memory_center_actions_manage_unified_memory_and_experience_records() -> None:

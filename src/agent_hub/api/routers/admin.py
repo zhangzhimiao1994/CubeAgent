@@ -3714,16 +3714,10 @@ class InMemoryAdminResourceService:
     async def list_memory_center(self) -> tuple[MemoryCenterItemResponse, ...]:
         items: list[MemoryCenterItemResponse] = []
         experiences = await self.list_cognitive_experiences()
-        derived_hermes_ids = {
-            source_id
-            for experience in experiences
-            for source_id in experience.source_memory_ids
-        }
         items.extend(_memory_center_item_from_memory(item) for item in await self.list_memory())
         items.extend(
             _memory_center_item_from_hermes(item)
             for item in await self.list_hermes_insights()
-            if item.id not in derived_hermes_ids
         )
         items.extend(
             _memory_center_item_from_cognitive_experience(item)
@@ -5689,12 +5683,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return tuple(items)
         existing_ids = {item.id for item in items}
         for resource_id, payload, created_at, updated_at in rows:
-            extra = _memory_center_item_from_cognitive_payload(
-                resource_id=resource_id,
-                payload=payload,
-                created_at=created_at,
-                updated_at=updated_at,
-            )
+            if _is_cognitive_resource_id(resource_id):
+                extra = _memory_center_item_from_cognitive_payload(
+                    resource_id=resource_id,
+                    payload=payload,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            else:
+                extra = _memory_center_item_from_hermes(
+                    _hermes_response_from_payload(payload, resource_id=resource_id)
+                )
             if extra is not None and extra.id not in existing_ids:
                 items.append(extra)
                 existing_ids.add(extra.id)
