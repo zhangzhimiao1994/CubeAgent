@@ -624,6 +624,132 @@ async def test_multimedia_executor_uses_minimax_video_client_for_hailuo_files(tm
 
 
 @pytest.mark.asyncio
+async def test_multimedia_executor_uses_dashscope_client_for_kling_image_files(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    dashscope_provider = FakeDashScopeMultimediaClient(tmp_path / "dashscope-image.png")
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="qwen-token-plan",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                api_protocol="openai_compatible",
+                upstream_model="kling/kling-v3-omni-image-generation",
+                logical_model="image_primary",
+                capabilities=["image_generation", "video_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="dashscope-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        dashscope_multimedia_client=dashscope_provider,  # type: ignore[arg-type]
+    )
+
+    result = await executor.generate(
+        kind=MultimediaGenerationKind.IMAGE,
+        logical_model="image_primary",
+        prompt="生成一张蓝色方块测试图",
+    )
+
+    assert result.deployment_id
+    assert result.text is not None
+    assert result.text.startswith("file://")
+    assert (tmp_path / "media" / str(TENANT_ID) / "dashscope-image.png").read_bytes() == b"image"
+    assert dashscope_provider.image_calls == [
+        {
+            "api_key": "sk-live",
+            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "kling/kling-v3-omni-image-generation",
+            "prompt": "生成一张蓝色方块测试图",
+            "output_dir": tmp_path / "media" / str(TENANT_ID),
+        }
+    ]
+    assert dashscope_provider.video_calls == []
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_uses_dashscope_client_for_kling_video_files(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    dashscope_provider = FakeDashScopeMultimediaClient(tmp_path / "dashscope-video.mp4")
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="qwen-token-plan",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                api_protocol="openai_compatible",
+                upstream_model="kling/kling-v3-omni-video-generation",
+                logical_model="video_primary",
+                capabilities=["video_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="dashscope-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        dashscope_multimedia_client=dashscope_provider,  # type: ignore[arg-type]
+    )
+
+    result = await executor.generate(
+        kind=MultimediaGenerationKind.VIDEO,
+        logical_model="video_primary",
+        prompt="生成一段蓝色方块测试视频",
+    )
+
+    assert result.deployment_id
+    assert result.text is not None
+    assert result.text.startswith("file://")
+    assert (tmp_path / "media" / str(TENANT_ID) / "dashscope-video.mp4").read_bytes() == b"video"
+    assert dashscope_provider.image_calls == []
+    assert dashscope_provider.video_calls == [
+        {
+            "api_key": "sk-live",
+            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "kling/kling-v3-omni-video-generation",
+            "prompt": "生成一段蓝色方块测试视频",
+            "output_dir": tmp_path / "media" / str(TENANT_ID),
+            "duration": 5,
+            "resolution": "std",
+        }
+    ]
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_multimedia_executor_does_not_send_other_video_models_to_minimax(tmp_path: Path) -> None:
     transport = FakeTransport()
     video_provider = FakeTextToVideoProvider(tmp_path / "provider-output.mp4")
@@ -789,6 +915,84 @@ class FakeTextToVideoProvider:
             task_id="task-1",
             file_id="file-1",
             mime_type="video/mp4",
+        )
+
+
+class FakeDashScopeMultimediaClient:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.image_calls: list[dict[str, object]] = []
+        self.video_calls: list[dict[str, object]] = []
+
+    async def generate_text_to_image(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        model: str,
+        prompt: str,
+        output_dir: Path,
+        aspect_ratio: str = "1:1",
+        resolution: str = "1k",
+    ) -> MiniMaxGeneratedVideo:
+        del aspect_ratio, resolution
+        self.image_calls.append(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "prompt": prompt,
+                "output_dir": output_dir,
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stored = output_dir / self.output_path.name
+        stored.write_bytes(b"image")
+        return MiniMaxGeneratedVideo(
+            path=stored,
+            uri=stored.as_uri(),
+            provider="dashscope",
+            model=model,
+            task_id="dashscope-image-1",
+            file_id=None,
+            mime_type="image/png",
+            kind="image",
+        )
+
+    async def generate_text_to_video(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        model: str,
+        prompt: str,
+        output_dir: Path,
+        duration: int = 5,
+        resolution: str = "std",
+    ) -> MiniMaxGeneratedVideo:
+        self.video_calls.append(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "prompt": prompt,
+                "output_dir": output_dir,
+                "duration": duration,
+                "resolution": resolution,
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stored = output_dir / self.output_path.name
+        stored.write_bytes(b"video")
+        return MiniMaxGeneratedVideo(
+            path=stored,
+            uri=stored.as_uri(),
+            provider="dashscope",
+            model=model,
+            task_id="dashscope-video-1",
+            file_id=None,
+            mime_type="video/mp4",
+            kind="video",
         )
 
 

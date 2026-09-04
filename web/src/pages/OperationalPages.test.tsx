@@ -521,6 +521,15 @@ describe("operational management pages", () => {
           }
           return jsonResponse(visibleRunDetail);
         }
+        if (/^\/api\/v1\/admin\/runs\/[^/]+\/artifacts\/[^/]+\/download$/.test(path)) {
+          return new Response(new Blob(["artifact-bytes"], { type: "application/zip" }), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/zip",
+              "Content-Disposition": 'attachment; filename="artifact.zip"',
+            },
+          });
+        }
         if (path === "/api/v1/admin/conversations/conv-previous") {
           return jsonResponse({ conversation_id: "conv-previous", runs: visibleConversationRuns });
         }
@@ -1381,6 +1390,15 @@ describe("operational management pages", () => {
           const category = url.searchParams.get("category");
           return jsonResponse(category ? logs.filter((item) => item.category === category) : logs);
         }
+        if (/^\/api\/v1\/admin\/runs\/[^/]+\/artifacts\/[^/]+\/download$/.test(path)) {
+          return new Response(new Blob(["artifact-bytes"], { type: "application/zip" }), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/zip",
+              "Content-Disposition": 'attachment; filename="hello-world-python.zip"',
+            },
+          });
+        }
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
     );
@@ -1561,10 +1579,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
-    const download = screen.getByRole("link", { name: /下载 run-report\.docx/ });
-    expect(download.getAttribute("href")).toBe(
-      "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333333/download",
-    );
+    expect(screen.getByRole("button", { name: /下载 run-report\.docx/ })).not.toBeNull();
     expect(screen.getByText("2 KB")).not.toBeNull();
   });
 
@@ -1928,8 +1943,33 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const chatDownload = within(stream).getByRole("link", { name: /下载 hello-world-python\.zip/ });
-    expect(chatDownload.getAttribute("href")).toBe(fileArtifact.download_url);
+    const createObjectUrl = vi.fn(() => "blob:download-url");
+    const revokeObjectUrl = vi.fn();
+    const anchorClick = vi.fn();
+    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: createObjectUrl, revokeObjectURL: revokeObjectUrl }));
+    const originalCreateElement = document.createElement.bind(document);
+    vi.spyOn(document, "createElement").mockImplementation((tagName, options) => {
+      const element = originalCreateElement(tagName, options);
+      if (tagName.toLowerCase() === "a") {
+        vi.spyOn(element, "click").mockImplementation(anchorClick);
+      }
+      return element;
+    });
+
+    const streamDownload = within(stream).getByRole("button", { name: /下载 hello-world-python\.zip/ });
+    await user.click(streamDownload);
+    await waitFor(() =>
+      expect(
+        requests.some(
+          (request) =>
+            request.path === fileArtifact.download_url &&
+            request.method === "GET" &&
+            request.headers.authorization === "Bearer owner-token",
+        ),
+      ).toBe(true),
+    );
+    expect(createObjectUrl).toHaveBeenCalled();
+    expect(anchorClick).toHaveBeenCalled();
     expect(within(stream).getByText("zip")).not.toBeNull();
     expect(within(stream).getAllByText("18 KB").length).toBeGreaterThan(0);
 
@@ -1938,8 +1978,8 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByRole("link", { name: /下载 short-video-script\.docx/ })).toBeNull();
     await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 输出/ })[0]);
     const artifactDetail = await screen.findByRole("dialog", { name: "活动详情" });
-    const drawerDownload = within(artifactDetail).getByRole("link", { name: /下载 hello-world-python\.zip/ });
-    expect(drawerDownload.getAttribute("href")).toBe(fileArtifact.download_url);
+    const drawerDownload = within(artifactDetail).getByRole("button", { name: /下载 hello-world-python\.zip/ });
+    expect((drawerDownload as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("renders markdown tables inside assistant chat replies as real tables", async () => {
@@ -2010,6 +2050,16 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("正在读取当前会话...")).toBeNull();
   });
   it("keeps older conversation messages when a later run is appended", async () => {
+    visibleRunListItems = [
+      { ...runListItem, status: "completed" },
+      {
+        ...secondRunListItem,
+        status: "completed",
+        conversation_id: "conv-previous",
+        request: "再给我一个更强的开头。",
+        created_at: "2026-08-07T00:05:00Z",
+      },
+    ];
     visibleConversationRuns = [
       runDetail,
       {
@@ -2030,6 +2080,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: conversationOpenButtonName })).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -3987,13 +4038,14 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     visibleRunListItems = [
       { ...runListItem, status: "cancelled" },
-      secondRunListItem,
+      { ...secondRunListItem, status: "completed", conversation_id: "conv-previous" },
     ];
     visibleRunListItem = visibleRunListItems[0];
     visibleRunDetail = { ...runDetail, status: "cancelled" };
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("checkbox", { name: "Select all deletable conversations" })).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: conversationOpenButtonName })).toHaveLength(1);
     await user.click(screen.getByRole("checkbox", { name: "Select all deletable conversations" }));
     await user.click(screen.getByRole("button", { name: /批量删除已选会话/ }));
 

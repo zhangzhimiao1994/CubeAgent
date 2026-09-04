@@ -216,6 +216,17 @@ class RolePlanner:
         else:
             role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
+        if request.mode is not TaskMode.DISCUSS and _is_standalone_multimedia_generation_request(
+            request.task
+        ):
+            media_specs = tuple(spec for spec in catalog_specs if spec[0] == "multimedia_generator")
+            roles = tuple(_assignment(spec, request) for spec in media_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
         role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
         roles = tuple(_assignment(spec, request) for spec in role_specs)
         return RolePlan(
@@ -1090,6 +1101,10 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "create a video",
     "create video",
     "make a video",
+    "deliver an image",
+    "deliver a video",
+    "produce an image",
+    "produce a video",
     "text-to-image",
     "text to image",
     "text-to-video",
@@ -1105,6 +1120,14 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "生成视频",
     "制作视频",
     "生成语音",
+    "交付图片",
+    "交付视频",
+    "产出图片",
+    "产出视频",
+    "给我一张",
+    "给我一段",
+    "最终结果要",
+    "中间产物需要",
     "语音合成",
     "文生图",
     "文生视频",
@@ -1117,6 +1140,7 @@ _MULTIMEDIA_MEDIA_TERMS = (
     "picture",
     "pictures",
     "poster",
+    "cover image",
     "video",
     "videos",
     "audio",
@@ -1127,8 +1151,11 @@ _MULTIMEDIA_MEDIA_TERMS = (
     "图像",
     "图",
     "海报",
+    "封面图",
+    "配图",
     "视频",
     "短视频",
+    "成片",
     "音频",
     "语音",
     "多媒体",
@@ -1537,6 +1564,40 @@ def _is_multimedia_generation_request(task: str) -> bool:
     )
 
 
+def _is_standalone_multimedia_generation_request(task: str) -> bool:
+    normalized = task.casefold()
+    if not _is_multimedia_generation_request(task):
+        return False
+    blocked_terms = (
+        "代码",
+        "源码",
+        "程序",
+        "函数",
+        "接口",
+        "api",
+        "github",
+        "docker",
+        "部署",
+        "后端",
+        "前端",
+        "网页",
+        "web",
+        "word",
+        "docx",
+        "ppt",
+        "pptx",
+        "文档",
+        "演示稿",
+        "压缩包",
+        "项目包",
+        "prompt",
+        "提示词",
+        "文案",
+        "脚本",
+    )
+    return not any(term in normalized for term in blocked_terms)
+
+
 def _is_document_generation_request(task: str) -> bool:
     normalized = task.casefold()
     if _explicit_tool_request(normalized, "document.generate_docx", "document_generate_docx"):
@@ -1639,13 +1700,17 @@ def _has_delivery_action(normalized: str) -> bool:
             "export",
             "download",
             "call",
+            "deliver",
             "生成",
             "创建",
             "制作",
+            "交付",
+            "产出",
             "输出",
             "导出",
             "下载",
             "调用",
+            "给我",
         )
     )
 

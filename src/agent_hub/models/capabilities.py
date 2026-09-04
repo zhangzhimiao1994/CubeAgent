@@ -14,6 +14,7 @@ _KNOWN_IMAGE_GENERATION_PATTERNS = tuple(
         r"\bdall[-_ ]?e\b",
         r"\bimagen\b",
         r"\bqwen[-_ ]?image\b",
+        r"\bkling\b",
         r"\bflux\b",
         r"\bstable[-_ ]?diffusion\b",
         r"\bsd3\b",

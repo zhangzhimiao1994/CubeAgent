@@ -159,6 +159,10 @@ class HybridRuntime:
                 next_stage = 1
 
             for stage_index in range(next_stage, len(stages)):
+                if stage_index > 0 and _has_new_final_attachment_artifact(
+                    artifacts, input_artifact_ids=input_artifact_ids
+                ):
+                    break
                 child, mode, is_discussion = stages[stage_index]
                 child_events = (
                     self._run_discussion(context, tuple(artifacts), sequence)
@@ -556,6 +560,40 @@ def _partial_hybrid_completion_reason(
     if failure_reason.startswith("hybrid direct failed: model gateway failed"):
         return "partial_hybrid_after_synthesis_failure"
     return None
+
+
+def _has_new_final_attachment_artifact(
+    artifacts: list[Artifact],
+    *,
+    input_artifact_ids: set[UUID],
+) -> bool:
+    return any(
+        artifact.id not in input_artifact_ids and _artifact_has_final_attachment(artifact)
+        for artifact in artifacts
+    )
+
+
+def _artifact_has_final_attachment(artifact: Artifact) -> bool:
+    result = artifact.content.get("result")
+    if not isinstance(result, Mapping) or result.get("presentation") != "final_attachment":
+        return False
+    file_metadata = result.get("file")
+    if not isinstance(file_metadata, Mapping):
+        file_metadata = result.get("metadata")
+    if _is_downloadable_artifact_metadata(file_metadata):
+        return True
+    media_artifacts = result.get("artifacts")
+    if not isinstance(media_artifacts, tuple | list):
+        return False
+    return any(_is_downloadable_artifact_metadata(item) for item in media_artifacts)
+
+
+def _is_downloadable_artifact_metadata(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and type(value.get("filename")) is str
+        and type(value.get("mime_type")) is str
+    )
 
 
 def _has_later_synthesis_stage(

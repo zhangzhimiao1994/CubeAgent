@@ -52,6 +52,19 @@ def test_known_video_generation_models_are_inferred_conservatively() -> None:
     )
 
 
+def test_known_kling_image_generation_models_are_inferred_conservatively() -> None:
+    inferred = infer_model_capabilities(
+        provider="qwen-token-plan",
+        upstream_model="kling/kling-v3-omni-image-generation",
+        declared=set(),
+    )
+
+    assert inferred == (
+        ModelCapability.IMAGE_GENERATION,
+        ModelCapability.VIDEO_GENERATION,
+    )
+
+
 def test_known_audio_generation_models_are_inferred_conservatively() -> None:
     inferred = infer_model_capabilities(
         provider="minimax",

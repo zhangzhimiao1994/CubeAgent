@@ -349,7 +349,10 @@ class ConfigBackedDispatchRuntime:
                 default_model=logical_model,
             )
         ).roles
-        if selected_roles:
+        if selected_roles and not _should_use_standalone_multimedia_roles(
+            selected_roles,
+            planner_roles,
+        ):
             planned_roles = _merge_selected_with_delivery_roles(selected_roles, planner_roles)
         else:
             planned_roles = planner_roles
@@ -553,34 +556,27 @@ class ConfigBackedHybridRuntime:
             purpose=RolePurpose.EXPERTISE,
             output_schema=_DISCUSSION_OUTPUT_SCHEMA,
         )
-        if selected_dispatch_roles:
-            planner_dispatch_roles = self._role_planner.plan(
-                RolePlanningRequest(
-                    task=str(context.request),
-                    mode=TaskMode.DISPATCH,
-                    profile=profile,
-                    profiles=profiles,
-                    high_risk=high_risk,
-                    requested_skills=_requested_skills(context),
-                    default_model=logical_model,
-                )
-            ).roles
+        planner_dispatch_roles = self._role_planner.plan(
+            RolePlanningRequest(
+                task=str(context.request),
+                mode=TaskMode.DISPATCH,
+                profile=profile,
+                profiles=profiles,
+                high_risk=high_risk,
+                requested_skills=_requested_skills(context),
+                default_model=logical_model,
+            )
+        ).roles
+        if selected_dispatch_roles and not _should_use_standalone_multimedia_roles(
+            selected_dispatch_roles,
+            planner_dispatch_roles,
+        ):
             dispatch_roles = _merge_selected_with_delivery_roles(
                 selected_dispatch_roles,
                 planner_dispatch_roles,
             )
         else:
-            dispatch_roles = self._role_planner.plan(
-                RolePlanningRequest(
-                    task=str(context.request),
-                    mode=TaskMode.DISPATCH,
-                    profile=profile,
-                    profiles=profiles,
-                    high_risk=high_risk,
-                    requested_skills=_requested_skills(context),
-                    default_model=logical_model,
-                )
-            ).roles
+            dispatch_roles = planner_dispatch_roles
         if len(selected_discussion_roles) >= 2:
             discussion_roles = selected_discussion_roles
         elif len(selected_dispatch_roles) >= 2:
@@ -722,6 +718,10 @@ def _dispatch_plan(
         context,
         capability_gateway=capability_gateway,
     )
+    single_delivery_role_is_final = (
+        len(selected_roles) == 1
+        and bool(_DELIVERY_TOOL_NAMES.intersection(selected_roles[0].allowed_tools))
+    )
     agents = [
         AgentSpec(
             id=role.id,
@@ -736,7 +736,9 @@ def _dispatch_plan(
         )
         for role in selected_roles
     ]
-    if not any(agent.id == "final_synthesizer" for agent in agents):
+    if not single_delivery_role_is_final and not any(
+        agent.id == "final_synthesizer" for agent in agents
+    ):
         agents.append(
             AgentSpec(
                 id="final_synthesizer",
@@ -790,9 +792,20 @@ def _dispatch_plan(
                 post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
             ),
             cost_budget_usd=Decimal(0),
+            final_synthesizer=single_delivery_role_is_final,
         )
         for role in selected_roles
     )
+    if single_delivery_role_is_final:
+        return DispatchPlan(
+            agents=tuple(agents),
+            steps=role_steps,
+            allowed_tools=plan_allowed_tools,
+            max_parallelism=1,
+            total_token_budget=context.token_budget,
+            total_timeout_seconds=sum(step.timeout_seconds for step in role_steps),
+            total_cost_usd=Decimal(0),
+        )
     final_dependencies = tuple(step.id for step in role_steps)
     final_step = DispatchStep(
         id="final_response_step",
@@ -1082,6 +1095,28 @@ def _merge_selected_with_delivery_roles(
         selected_ids.add(role.id)
         selected_tools.update(delivery_tools)
     return tuple(merged)
+
+
+def _is_standalone_multimedia_role_plan(roles: tuple[RoleAssignment, ...]) -> bool:
+    return len(roles) == 1 and roles[0].id == "multimedia_generator"
+
+
+def _should_use_standalone_multimedia_roles(
+    selected_roles: tuple[RoleAssignment, ...],
+    planner_roles: tuple[RoleAssignment, ...],
+) -> bool:
+    if not _is_standalone_multimedia_role_plan(planner_roles):
+        return False
+    generic_role_ids = {
+        "architect",
+        "implementer",
+        "tester",
+        "security_reviewer",
+        "planner",
+        "reviewer",
+        "quality_reviewer",
+    }
+    return bool(selected_roles) and all(role.id in generic_role_ids for role in selected_roles)
 
 
 def _temporary_role_assignments(

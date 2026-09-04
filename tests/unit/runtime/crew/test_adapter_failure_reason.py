@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import cast
 from uuid import UUID, uuid4
@@ -10,7 +11,7 @@ import pytest
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.crew.adapter import (
     CrewAgentDefinition,
     CrewDispatchRuntime,
@@ -350,6 +351,88 @@ class CapturingFactory(CrewObjectFactory):
         return self.generation
 
 
+class MultimediaToolGateway:
+    def __init__(self, *, legacy_prompt: bool = False, include_legacy_prompt: bool = False) -> None:
+        self.legacy_prompt = legacy_prompt
+        self.include_legacy_prompt = include_legacy_prompt
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        tool_name = request.tools[0].name if request.tools else "generate_multimedia"
+        arguments: Mapping[str, JsonValue]
+        if self.legacy_prompt:
+            arguments = {
+                "kind": "image",
+                "logical_model": "media_primary",
+                "prompt": "生成一张赛博朋克风格海报",
+            }
+        else:
+            arguments = {
+                "kind": "image",
+                "logical_model": "media_primary",
+                "generation_prompt": "生成一张赛博朋克风格海报",
+            }
+            if self.include_legacy_prompt:
+                arguments = dict(arguments)
+                arguments["prompt"] = "不应进入运行轨迹的旧字段"
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="call-media",
+                        name=tool_name,
+                        arguments=arguments,
+                    ),
+                ),
+                usage=TokenUsage(10, 1, 11),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class MultimediaCapabilities:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Mapping[str, JsonValue]]] = []
+
+    async def execute(  # type: ignore[no-untyped-def]
+        self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, idempotency_key
+        self.calls.append((actor, name, arguments))
+        return {
+            "job_id": "media-test",
+            "kind": arguments["kind"],
+            "logical_model": arguments["logical_model"],
+            "status": "completed",
+            "executor_id": actor,
+            "summary": "Generated image artifact with media_primary.",
+            "artifacts": (
+                {
+                    "filename": "poster.png",
+                    "mime_type": "image/png",
+                    "download_url": "/api/v1/admin/multimedia/jobs/media-test/artifacts/0/download",
+                },
+            ),
+            "presentation": "final_attachment",
+        }
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "generate_multimedia"
+
+
+class DirectMultimediaCapabilities(MultimediaCapabilities):
+    async def default_logical_model_for_multimedia(self, *, tenant_id: UUID, kind: str) -> str:
+        assert tenant_id == TENANT_ID
+        assert kind == "image"
+        return "media_primary"
+
+
 def _one_step_plan(*, timeout_seconds: float = 60.0) -> DispatchPlan:
     return DispatchPlan(
         agents=(AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),),
@@ -365,6 +448,36 @@ def _one_step_plan(*, timeout_seconds: float = 60.0) -> DispatchPlan:
         ),
         total_token_budget=100,
         total_timeout_seconds=max(60.0, timeout_seconds * 4),
+    )
+
+
+def _one_step_tool_plan(*, tools: tuple[str, ...], multimedia: bool = False) -> DispatchPlan:
+    agent_id = "multimedia_generator" if multimedia else "writer"
+    role = "Multimedia Generator" if multimedia else "writer"
+    goal = "生成图片和视频产物" if multimedia else "Write"
+    task = "生成一张赛博朋克风格海报" if multimedia else "Answer"
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id=agent_id,
+                role=role,
+                goal=goal,
+                logical_model="general",
+                allowed_tools=tools,
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent=agent_id,
+                task=task,
+                tools=tools,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=tools,
+        total_token_budget=100,
     )
 
 
@@ -409,12 +522,17 @@ def _reviewed_plan_with_retry_budget(reviewer_retries: int = 1) -> DispatchPlan:
     )
 
 
-def _context(*, artifacts: tuple[Artifact, ...] = (), timeout_seconds: float = 60.0) -> TaskContext:
+def _context(
+    *,
+    artifacts: tuple[Artifact, ...] = (),
+    timeout_seconds: float = 60.0,
+    request: str = "Write a short answer",
+) -> TaskContext:
     return TaskContext(
         run_id=RUN_ID,
         tenant_id=TENANT_ID,
         mode=TaskMode.DISPATCH,
-        request="Write a short answer",
+        request=request,
         artifacts=artifacts,
         timeout_seconds=timeout_seconds,
         token_budget=1000,
@@ -456,6 +574,154 @@ def test_text_only_empty_model_response_still_fails() -> None:
 
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
+
+
+async def test_multimedia_final_attachment_tool_uses_safe_arguments_and_finishes_without_text_fallback() -> None:
+    capabilities = MultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        MultimediaToolGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",)),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = await _collect(runtime)
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    final = next(artifact for artifact in artifacts if artifact.type == "text")
+
+    assert capabilities.calls == [
+        (
+            "writer",
+            "generate_multimedia",
+            {
+                "kind": "image",
+                "logical_model": "media_primary",
+                "generation_prompt": "生成一张赛博朋克风格海报",
+            },
+        )
+    ]
+    assert "poster.png" in cast(str, final.content["text"])
+    assert len([artifact for artifact in artifacts if artifact.type == "model_response"]) == 1
+
+
+async def test_multimedia_generator_directly_executes_media_tool_without_text_model() -> None:
+    class FailingTextGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            self.calls += 1
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    gateway = FailingTextGateway()
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="请生成一张修仙世界女主角照片，清冷仙子气质")
+        )
+    ]
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    final = next(artifact for artifact in artifacts if artifact.type == "text")
+
+    assert gateway.calls == 0
+    assert capabilities.calls
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "multimedia_generator"
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["logical_model"] == "media_primary"
+    assert "修仙世界女主角" in cast(str, arguments["generation_prompt"])
+    assert "poster.png" in cast(str, final.content["text"])
+    assert (
+        "[下载图片：poster.png](/api/v1/admin/multimedia/jobs/media-test/artifacts/0/download)"
+        in cast(str, final.content["text"])
+    )
+    assert any(
+        event.kind is EventKind.TOOL_STARTED
+        and event.payload.get("direct_dispatch") is True
+        for event in events
+    )
+    created = next(
+        event
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.actor == "multimedia_generator"
+    )
+    completed = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.actor == "multimedia_generator"
+    )
+    assert created.payload["logical_model"] == "media_primary"
+    assert completed.payload["logical_model"] == "media_primary"
+
+
+async def test_multimedia_legacy_prompt_tool_argument_is_normalized_before_evidence() -> None:
+    capabilities = MultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        MultimediaToolGateway(legacy_prompt=True),
+        _one_step_tool_plan(tools=("generate_multimedia",)),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = await _collect(runtime)
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    model_artifact = next(artifact for artifact in artifacts if artifact.type == "model_response")
+    tool_call = cast(tuple[Mapping[str, JsonValue], ...], model_artifact.content["tool_calls"])[0]
+    arguments = cast(Mapping[str, JsonValue], tool_call["arguments"])
+
+    assert "prompt" not in arguments
+    assert arguments["generation_prompt"] == "生成一张赛博朋克风格海报"
+    assert capabilities.calls == [
+        (
+            "writer",
+            "generate_multimedia",
+            {
+                "kind": "image",
+                "logical_model": "media_primary",
+                "generation_prompt": "生成一张赛博朋克风格海报",
+            },
+        )
+    ]
+
+
+async def test_multimedia_mixed_prompt_fields_drop_legacy_prompt_before_evidence() -> None:
+    capabilities = MultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        MultimediaToolGateway(include_legacy_prompt=True),
+        _one_step_tool_plan(tools=("generate_multimedia",)),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = await _collect(runtime)
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    model_artifact = next(artifact for artifact in artifacts if artifact.type == "model_response")
+    tool_call = cast(tuple[Mapping[str, JsonValue], ...], model_artifact.content["tool_calls"])[0]
+    arguments = cast(Mapping[str, JsonValue], tool_call["arguments"])
+
+    assert "prompt" not in arguments
+    assert arguments["generation_prompt"] == "生成一张赛博朋克风格海报"
+    assert capabilities.calls == [
+        (
+            "writer",
+            "generate_multimedia",
+            {
+                "kind": "image",
+                "logical_model": "media_primary",
+                "generation_prompt": "生成一张赛博朋克风格海报",
+            },
+        )
+    ]
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:

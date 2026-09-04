@@ -336,7 +336,7 @@ def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None
     assert tool.parameters["additionalProperties"] is False
     required = tool.parameters["required"]
     assert isinstance(required, tuple)
-    assert required == ("kind", "logical_model", "prompt")
+    assert required == ("kind", "logical_model", "generation_prompt")
     properties = tool.parameters["properties"]
     assert isinstance(properties, Mapping)
     kind = properties["kind"]
@@ -347,7 +347,7 @@ def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None
     assert isinstance(logical_model, Mapping)
     assert logical_model["type"] == "string"
     assert logical_model["minLength"] == 1
-    prompt = properties["prompt"]
+    prompt = properties["generation_prompt"]
     assert isinstance(prompt, Mapping)
     assert prompt["type"] == "string"
     assert prompt["minLength"] == 1

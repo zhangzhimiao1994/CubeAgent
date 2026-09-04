@@ -2138,11 +2138,13 @@ article:hover {
   margin-left: 0.35rem;
 }
 
-.artifact-file-card a {
+.artifact-file-card a,
+.artifact-file-card button {
   background: rgba(85, 215, 255, 0.12);
   border: 1px solid rgba(85, 215, 255, 0.26);
   border-radius: 999px;
   color: var(--accent);
+  cursor: pointer;
   font-size: 0.82rem;
   font-weight: 900;
   padding: 0.42rem 0.68rem;
@@ -2150,10 +2152,23 @@ article:hover {
   white-space: nowrap;
 }
 
+.artifact-file-card button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
 .artifact-file-card a:hover,
-.artifact-file-card a:focus-visible {
+.artifact-file-card a:focus-visible,
+.artifact-file-card button:hover,
+.artifact-file-card button:focus-visible {
   background: rgba(85, 215, 255, 0.2);
   border-color: rgba(85, 215, 255, 0.42);
+}
+
+.artifact-file-main .artifact-file-error,
+.agent-workforce-activity .artifact-file-main .artifact-file-error {
+  color: var(--danger);
+  white-space: normal;
 }
 
 .agent-workforce-activity time,

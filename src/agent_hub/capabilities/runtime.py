@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -8,6 +9,7 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -17,6 +19,7 @@ from agent_hub.capabilities.tools.workspace_read import WorkspaceReader
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
+    ALLOWED_GENERATED_FILE_MIME_TYPES,
     DOCX_MIME_TYPE,
     PPTX_MIME_TYPE,
     ZIP_MIME_TYPE,
@@ -37,6 +40,7 @@ _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
 _MULTIMEDIA_TOOL = "generate_multimedia"
+_MULTIMEDIA_ARTIFACT_TTL = timedelta(hours=24)
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
@@ -58,6 +62,12 @@ class RuntimeCapabilityError(RuntimeError):
 
 
 class RuntimeMultimediaGenerationExecutor(Protocol):
+    async def default_logical_model_for_multimedia(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+    ) -> str: ...
+
     def submit(
         self,
         *,
@@ -134,7 +144,7 @@ class RuntimeCapabilityGateway:
         if name == _PROJECT_ZIP_TOOL:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if name == _MULTIMEDIA_TOOL:
-            return await self._execute_generate_multimedia(actor, arguments)
+            return await self._execute_generate_multimedia(tenant_id, run_id, actor, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -143,6 +153,16 @@ class RuntimeCapabilityGateway:
             arguments=arguments,
             idempotency_key=idempotency_key,
         )
+
+    async def default_multimedia_logical_model(self, kind: str) -> str | None:
+        executor = self._require_multimedia_generation_executor()
+        selector = getattr(executor, "default_logical_model", None)
+        if not callable(selector):
+            return None
+        result = selector(kind)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, str) and result.strip() else None
 
     def _execute_calculator(self, arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
         expression = arguments.get("expression")
@@ -308,29 +328,57 @@ class RuntimeCapabilityGateway:
 
     async def _execute_generate_multimedia(
         self,
+        tenant_id: UUID,
+        run_id: UUID,
         actor: str,
         arguments: Mapping[str, JsonValue],
     ) -> Mapping[str, JsonValue]:
         executor = self._require_multimedia_generation_executor()
         kind = _multimedia_kind(arguments)
         logical_model = _required_string(arguments, "logical_model").strip()
-        prompt = _required_string(arguments, "prompt").strip()
+        prompt_field = "generation_prompt" if "generation_prompt" in arguments else "prompt"
+        prompt = _required_string(arguments, prompt_field).strip()
         job = executor.submit(kind=kind, logical_model=logical_model, prompt=prompt)
         completed = await executor.run_job(job.id, executor_id=actor)
-        artifacts = tuple(
-            _multimedia_artifact_result(artifact, job_id=completed.id, artifact_index=index)
-            for index, artifact in enumerate(completed.artifacts)
+        media_results: list[Mapping[str, JsonValue]] = []
+        first_file_metadata: dict[str, JsonValue] | None = None
+        expires_at = (
+            completed.expires_at.isoformat() if completed.expires_at is not None else None
         )
-        return {
+        for index, artifact in enumerate(completed.artifacts):
+            file_metadata = _stored_multimedia_file_metadata(
+                self._generated_file_store,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact=artifact,
+                expires_at=expires_at,
+            )
+            if file_metadata is not None and first_file_metadata is None:
+                first_file_metadata = file_metadata
+            media_results.append(
+                _multimedia_artifact_result(
+                    artifact,
+                    job_id=completed.id,
+                    artifact_index=index,
+                    expires_at=expires_at,
+                    file_metadata=file_metadata,
+                )
+            )
+        result: dict[str, JsonValue] = {
             "job_id": completed.id,
             "kind": completed.kind.value,
             "logical_model": completed.logical_model,
             "status": completed.status.value,
             "executor_id": completed.executor_id,
             "summary": f"Generated {completed.kind.value} artifact with {completed.logical_model}.",
-            "artifacts": artifacts,
+            "artifacts": tuple(media_results),
             "presentation": "final_attachment",
         }
+        if first_file_metadata is not None:
+            result["artifact_id"] = first_file_metadata["artifact_id"]
+            result["file"] = first_file_metadata
+            result["metadata"] = first_file_metadata
+        return result
 
     def _require_generated_file_store(self) -> GeneratedFileStore:
         if self._generated_file_store is None:
@@ -341,6 +389,20 @@ class RuntimeCapabilityGateway:
         if self._multimedia_generation_executor is None:
             raise RuntimeCapabilityError("multimedia generation executor is not configured")
         return self._multimedia_generation_executor
+
+    async def default_logical_model_for_multimedia(
+        self,
+        *,
+        tenant_id: UUID,
+        kind: str,
+    ) -> str:
+        del tenant_id
+        executor = self._require_multimedia_generation_executor()
+        try:
+            generation_kind = MultimediaGenerationKind(kind)
+        except ValueError:
+            raise RuntimeCapabilityError("kind must be image, video, or audio") from None
+        return await executor.default_logical_model_for_multimedia(kind=generation_kind)
 
     async def _execute_skill(
         self,
@@ -461,24 +523,96 @@ def _multimedia_artifact_result(
     *,
     job_id: str,
     artifact_index: int,
+    expires_at: str | None = None,
+    file_metadata: Mapping[str, JsonValue] | None = None,
 ) -> Mapping[str, JsonValue]:
+    if file_metadata is not None:
+        return {
+            "kind": artifact.kind.value,
+            "uri": artifact.uri,
+            "text": artifact.text,
+            "logical_model": artifact.logical_model,
+            "deployment_id": artifact.deployment_id,
+            "filename": file_metadata["filename"],
+            "mime_type": file_metadata["mime_type"],
+            "size_bytes": file_metadata["size_bytes"],
+            "sha256": file_metadata["sha256"],
+            "download_url": file_metadata["download_url"],
+            "expires_at": expires_at,
+            "file": dict(file_metadata),
+        }
     download_url: str | None = None
+    size_bytes: int | None = None
+    digest: str | None = None
+    filename = artifact.filename
+    mime_type = artifact.mime_type
     if (
         artifact.file_path is not None
-        and artifact.filename is not None
-        and artifact.mime_type is not None
+        and filename is not None
+        and mime_type is not None
         and artifact.file_path.is_file()
     ):
-        download_url = f"/api/v1/admin/multimedia/jobs/{job_id}/artifacts/{artifact_index}/download"
+        try:
+            filename = safe_generated_filename(filename)
+            if mime_type in ALLOWED_GENERATED_FILE_MIME_TYPES:
+                data = artifact.file_path.read_bytes()
+                size_bytes = len(data)
+                digest = hashlib.sha256(data).hexdigest()
+                download_url = (
+                    f"/api/v1/admin/multimedia/jobs/{job_id}/artifacts/{artifact_index}/download"
+                )
+        except (OSError, ValueError):
+            filename = None
+            mime_type = None
     return {
         "kind": artifact.kind.value,
         "uri": artifact.uri,
         "text": artifact.text,
         "logical_model": artifact.logical_model,
         "deployment_id": artifact.deployment_id,
-        "filename": artifact.filename,
-        "mime_type": artifact.mime_type,
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "sha256": digest,
         "download_url": download_url,
+        "expires_at": expires_at,
+    }
+
+
+def _stored_multimedia_file_metadata(
+    store: GeneratedFileStore | None,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    artifact: MultimediaArtifact,
+    expires_at: str | None,
+) -> dict[str, JsonValue] | None:
+    if (
+        store is None
+        or artifact.file_path is None
+        or artifact.filename is None
+        or artifact.mime_type is None
+        or not artifact.file_path.is_file()
+    ):
+        return None
+    try:
+        artifact_id = uuid4()
+        metadata = store.store_bytes(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            artifact_id=artifact_id,
+            filename=artifact.filename,
+            mime_type=artifact.mime_type,
+            data=artifact.file_path.read_bytes(),
+        )
+    except (OSError, ValueError):
+        return None
+    return {
+        "artifact_id": str(artifact_id),
+        **metadata.to_public_dict(),
+        "expires_at": expires_at
+        if expires_at is not None
+        else (datetime.now(UTC) + _MULTIMEDIA_ARTIFACT_TTL).isoformat(),
     }
 
 

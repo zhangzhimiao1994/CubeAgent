@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
+from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -62,8 +62,8 @@ from agent_hub.files.generated import (
 )
 from agent_hub.hermes.runtime_observation import is_runtime_observation_lesson
 from agent_hub.models.capabilities import infer_model_capabilities
-from agent_hub.models.capacity import safe_operational_limit
-from agent_hub.models.gateway import ModelTransport
+from agent_hub.models.capacity import CapacityUnavailable, safe_operational_limit
+from agent_hub.models.gateway import ModelGatewayError, ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
@@ -291,6 +291,7 @@ class RunArtifactResponse(BaseModel):
     size_bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = None
     download_url: str | None = None
+    expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,11 +307,16 @@ class PublicFileMetadata(TypedDict):
     size_bytes: int
     sha256: str
     download_url: str
+    expires_at: NotRequired[datetime | None]
 
 
 class ValidatedFileMetadata(PublicFileMetadata):
     artifact_id: UUID
     storage_key: str
+
+
+class RunArtifactExpired(RuntimeError):
+    """Raised when a generated run artifact download URL is past its retention window."""
 
 
 class RunEventResponse(BaseModel):
@@ -953,6 +959,7 @@ class MultimediaArtifactResponse(BaseModel):
     size_bytes: int | None = None
     sha256: str | None = None
     download_url: str | None = None
+    expires_at: datetime | None = None
 
 
 class MultimediaGenerationJobResponse(BaseModel):
@@ -963,6 +970,8 @@ class MultimediaGenerationJobResponse(BaseModel):
     logical_model: str
     prompt: str
     status: str
+    created_at: datetime
+    expires_at: datetime | None
     artifacts: list[MultimediaArtifactResponse]
     executor_id: str | None
     error: str | None
@@ -4300,6 +4309,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         file_metadata = _find_file_metadata(artifacts, run_id=run_id, artifact_id=artifact_id)
         if file_metadata is None:
             raise KeyError(artifact_id)
+        if _file_metadata_is_expired(file_metadata):
+            raise RunArtifactExpired(artifact_id)
         if self._generated_file_store is None:
             raise KeyError(artifact_id)
         try:
@@ -6716,8 +6727,15 @@ def _multimedia_job_response(job: MultimediaGenerationJob) -> MultimediaGenerati
         logical_model=job.logical_model,
         prompt=job.prompt,
         status=job.status.value,
+        created_at=job.created_at,
+        expires_at=job.expires_at,
         artifacts=[
-            _multimedia_artifact_response(artifact, job_id=job.id, artifact_index=index)
+            _multimedia_artifact_response(
+                artifact,
+                job_id=job.id,
+                artifact_index=index,
+                expires_at=job.expires_at,
+            )
             for index, artifact in enumerate(job.artifacts)
         ],
         executor_id=job.executor_id,
@@ -6725,11 +6743,65 @@ def _multimedia_job_response(job: MultimediaGenerationJob) -> MultimediaGenerati
     )
 
 
+def _multimedia_job_or_none(
+    executor: MultimediaGenerationExecutorProtocol,
+    job_id: str,
+) -> MultimediaGenerationJob | None:
+    try:
+        return executor.get_job(job_id)
+    except KeyError:
+        return None
+
+
+async def _multimedia_generation_failure_details(
+    service: AdminResourceService,
+    *,
+    job: MultimediaGenerationJob | None,
+    job_id: str,
+    executor_id: str,
+    error: Exception,
+) -> dict[str, str]:
+    kind = job.kind.value if job is not None else "unknown"
+    logical_model = job.logical_model if job is not None else "unknown"
+    capability = f"{kind}_generation" if kind in {"image", "video", "audio"} else "unknown"
+    deployments = "unknown"
+    try:
+        candidates = [
+            model
+            for model in await service.list_models()
+            if model.logical_model == logical_model and capability in model.capabilities
+        ]
+    except Exception:  # noqa: BLE001 - diagnostics must remain best-effort.
+        candidates = []
+    if candidates:
+        deployments = ",".join(
+            _safe_model_check_detail(
+                f"{model.provider}/{model.upstream_model}:{model.id}"
+            )
+            for model in candidates
+        )[:300]
+    reason = _safe_model_check_reason(error)
+    status_code = _model_check_status_code(error) or "unknown"
+    return {
+        "stage": "multimedia_generation",
+        "job_id": _safe_model_check_detail(job_id),
+        "executor_id": _safe_model_check_detail(executor_id),
+        "kind": _safe_model_check_detail(kind),
+        "logical_model": _safe_model_check_detail(logical_model),
+        "required_capability": _safe_model_check_detail(capability),
+        "deployments": _safe_model_check_detail(deployments),
+        "status_code": _safe_model_check_detail(status_code),
+        "reason": _safe_model_check_detail(reason),
+        "hint": _MODEL_CHECK_HINT,
+    }
+
+
 def _multimedia_artifact_response(
     artifact: MultimediaArtifact,
     *,
     job_id: str | None = None,
     artifact_index: int | None = None,
+    expires_at: datetime | None = None,
 ) -> MultimediaArtifactResponse:
     file_path = artifact.file_path
     filename = artifact.filename
@@ -6767,6 +6839,7 @@ def _multimedia_artifact_response(
         size_bytes=size_bytes,
         sha256=digest,
         download_url=download_url,
+        expires_at=expires_at if download_url is not None else None,
     )
 
 
@@ -8257,8 +8330,8 @@ def _admin_run_artifact(
     content = artifact.get("content")
     title = producer if type(producer) is str and producer else artifact_id
     text = _artifact_text(content)
-    file_metadata = _validated_file_metadata(
-        _artifact_file_metadata(content),
+    file_metadata = _public_artifact_file_metadata(
+        content,
         run_id=run_id,
         fallback_artifact_id=artifact_id if type(artifact_id) is str else None,
     )
@@ -8272,6 +8345,7 @@ def _admin_run_artifact(
         size_bytes=None if file_metadata is None else file_metadata["size_bytes"],
         sha256=None if file_metadata is None else file_metadata["sha256"],
         download_url=None if file_metadata is None else file_metadata["download_url"],
+        expires_at=None if file_metadata is None else file_metadata.get("expires_at"),
     )
 
 
@@ -8310,6 +8384,95 @@ def _artifact_file_metadata(content: object) -> Mapping[str, object] | None:
     return None
 
 
+def _public_artifact_file_metadata(
+    content: object,
+    *,
+    run_id: UUID | None,
+    fallback_artifact_id: str | None,
+) -> PublicFileMetadata | None:
+    generated_metadata = _validated_file_metadata(
+        _artifact_file_metadata(content),
+        run_id=run_id,
+        fallback_artifact_id=fallback_artifact_id,
+    )
+    if generated_metadata is not None:
+        public_metadata = PublicFileMetadata(
+            filename=generated_metadata["filename"],
+            mime_type=generated_metadata["mime_type"],
+            size_bytes=generated_metadata["size_bytes"],
+            sha256=generated_metadata["sha256"],
+            download_url=generated_metadata["download_url"],
+        )
+        expires_at = generated_metadata.get("expires_at")
+        if expires_at is not None:
+            public_metadata["expires_at"] = expires_at
+        return public_metadata
+    return _validated_multimedia_file_metadata(_artifact_multimedia_file_metadata(content))
+
+
+def _artifact_multimedia_file_metadata(content: object) -> Mapping[str, object] | None:
+    if not isinstance(content, Mapping):
+        return None
+    result = content.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, list | tuple):
+        return None
+    for artifact in artifacts:
+        if isinstance(artifact, Mapping):
+            return artifact
+    return None
+
+
+def _validated_multimedia_file_metadata(
+    metadata: Mapping[str, object] | None,
+) -> PublicFileMetadata | None:
+    if metadata is None:
+        return None
+    filename = metadata.get("filename")
+    mime_type = metadata.get("mime_type")
+    size_bytes = metadata.get("size_bytes")
+    digest = metadata.get("sha256")
+    download_url = metadata.get("download_url")
+    if (
+        type(filename) is not str
+        or type(mime_type) is not str
+        or type(size_bytes) is not int
+        or type(digest) is not str
+        or type(download_url) is not str
+        or size_bytes < 0
+        or mime_type not in ALLOWED_GENERATED_FILE_MIME_TYPES
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or _safe_multimedia_download_url(download_url) is None
+    ):
+        return None
+    try:
+        safe_filename = safe_generated_filename(filename)
+    except ValueError:
+        return None
+    public_metadata = PublicFileMetadata(
+        filename=safe_filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        sha256=digest,
+        download_url=download_url,
+    )
+    expires_at = _validated_file_expiry(metadata.get("expires_at"))
+    if expires_at is not None:
+        public_metadata["expires_at"] = expires_at
+    return public_metadata
+
+
+def _safe_multimedia_download_url(value: str) -> str | None:
+    if re.fullmatch(
+        r"/api/v1/admin/multimedia/jobs/[A-Za-z0-9_.-]{1,128}/artifacts/[0-9]{1,6}/download",
+        value,
+    ):
+        return value
+    return None
+
+
 def _validated_file_metadata(
     metadata: Mapping[str, object] | None,
     *,
@@ -8335,6 +8498,7 @@ def _validated_file_metadata(
     size_bytes = metadata.get("size_bytes")
     digest = metadata.get("sha256")
     storage_key = metadata.get("storage_key")
+    expires_at = _validated_file_expiry(metadata.get("expires_at"))
     if (
         type(filename) is not str
         or type(mime_type) is not str
@@ -8355,7 +8519,7 @@ def _validated_file_metadata(
         if run_id is not None
         else ""
     )
-    return ValidatedFileMetadata(
+    validated = ValidatedFileMetadata(
         artifact_id=artifact_id,
         filename=safe_filename,
         mime_type=mime_type,
@@ -8364,6 +8528,31 @@ def _validated_file_metadata(
         download_url=download_url,
         storage_key=storage_key,
     )
+    if expires_at is not None:
+        validated["expires_at"] = expires_at
+    return validated
+
+
+def _validated_file_expiry(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        expires_at = value
+    elif type(value) is str and value.strip():
+        try:
+            expires_at = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        return None
+    return expires_at.astimezone(UTC)
+
+
+def _file_metadata_is_expired(metadata: Mapping[str, object]) -> bool:
+    expires_at = _validated_file_expiry(metadata.get("expires_at"))
+    return expires_at is not None and expires_at <= datetime.now(UTC)
 
 
 def _artifact_text(content: object) -> str | None:
@@ -9189,10 +9378,6 @@ async def run_multimedia_job(
         raise PublicAPIError(
             404, "multimedia_job_not_found", "multimedia generation job not found"
         ) from error
-    except RuntimeError as error:
-        raise PublicAPIError(
-            409, "multimedia_job_not_queued", "multimedia generation job is not queued"
-        ) from error
     except NoCapableDeployment as error:
         raise PublicAPIError(
             422,
@@ -9207,14 +9392,52 @@ async def run_multimedia_job(
             "daily multimedia generation limit exceeded",
         ) from error
     except VideoProviderGenerationError as error:
+        failed_job = _multimedia_job_or_none(executor, job_id)
+        details = await _multimedia_generation_failure_details(
+            service,
+            job=failed_job,
+            job_id=job_id,
+            executor_id=body.executor_id,
+            error=error,
+        )
+        details["provider_code"] = _safe_model_check_detail(error.provider_code or "unknown")
         raise PublicAPIError(
             502,
             "multimedia_provider_failed",
             "multimedia provider generation failed",
-            details={
-                "provider_code": error.provider_code or "unknown",
-                "reason": str(error),
-            },
+            details=details,
+        ) from error
+    except (ModelGatewayError, ModelTransportError, CapacityUnavailable) as error:
+        failed_job = _multimedia_job_or_none(executor, job_id)
+        raise PublicAPIError(
+            502,
+            "multimedia_model_failed",
+            "multimedia model generation failed",
+            details=await _multimedia_generation_failure_details(
+                service,
+                job=failed_job,
+                job_id=job_id,
+                executor_id=body.executor_id,
+                error=error,
+            ),
+        ) from error
+    except RuntimeError as error:
+        if str(error).strip() != "multimedia generation job is not queued":
+            failed_job = _multimedia_job_or_none(executor, job_id)
+            raise PublicAPIError(
+                502,
+                "multimedia_model_failed",
+                "multimedia model generation failed",
+                details=await _multimedia_generation_failure_details(
+                    service,
+                    job=failed_job,
+                    job_id=job_id,
+                    executor_id=body.executor_id,
+                    error=error,
+                ),
+            ) from error
+        raise PublicAPIError(
+            409, "multimedia_job_not_queued", "multimedia generation job is not queued"
         ) from error
     return _multimedia_job_response(job)
 
@@ -9241,6 +9464,10 @@ async def download_multimedia_job_artifact(
         raise PublicAPIError(
             404, "multimedia_artifact_not_found", "multimedia artifact not found"
         ) from error
+    if job.expires_at is not None and job.expires_at <= datetime.now(UTC):
+        raise PublicAPIError(
+            404, "multimedia_artifact_expired", "multimedia artifact expired"
+        )
     file_path = artifact.file_path
     filename = artifact.filename
     mime_type = artifact.mime_type
@@ -9266,7 +9493,7 @@ async def download_multimedia_job_artifact(
     "/multimedia/generate",
     response_model=MultimediaGenerationResponse,
     status_code=202,
-    responses=error_responses(401, 403, 409, 422, 503),
+    responses=error_responses(401, 403, 409, 422, 429, 502, 503),
 )
 async def generate_multimedia(
     body: MultimediaGenerationRequest,
@@ -9277,6 +9504,7 @@ async def generate_multimedia(
     _require(principal, "run:create")
     await _require_multimedia_generation_enabled(service)
     executor = _multimedia_generation_executor(request)
+    submitted: MultimediaGenerationJob | None = None
     try:
         submitted = executor.submit(
             kind=MultimediaGenerationKind(body.kind),
@@ -9298,14 +9526,62 @@ async def generate_multimedia(
             "daily multimedia generation limit exceeded",
         ) from error
     except VideoProviderGenerationError as error:
+        failed_job = _multimedia_job_or_none(executor, submitted.id)
+        details = await _multimedia_generation_failure_details(
+            service,
+            job=failed_job,
+            job_id=submitted.id,
+            executor_id="admin_multimedia_generate",
+            error=error,
+        )
+        details["provider_code"] = _safe_model_check_detail(error.provider_code or "unknown")
         raise PublicAPIError(
             502,
             "multimedia_provider_failed",
             "multimedia provider generation failed",
-            details={
-                "provider_code": error.provider_code or "unknown",
-                "reason": str(error),
-            },
+            details=details,
+        ) from error
+    except (ModelGatewayError, ModelTransportError, CapacityUnavailable) as error:
+        failed_job = (
+            _multimedia_job_or_none(executor, submitted.id)
+            if submitted is not None
+            else None
+        )
+        raise PublicAPIError(
+            502,
+            "multimedia_model_failed",
+            "multimedia model generation failed",
+            details=await _multimedia_generation_failure_details(
+                service,
+                job=failed_job,
+                job_id=submitted.id if submitted is not None else "unknown",
+                executor_id="admin_multimedia_generate",
+                error=error,
+            ),
+        ) from error
+    except RuntimeError as error:
+        if str(error).strip() == "multimedia generation job is not queued":
+            raise PublicAPIError(
+                409,
+                "multimedia_job_not_queued",
+                "multimedia generation job is not queued",
+            ) from error
+        failed_job = (
+            _multimedia_job_or_none(executor, submitted.id)
+            if submitted is not None
+            else None
+        )
+        raise PublicAPIError(
+            502,
+            "multimedia_model_failed",
+            "multimedia model generation failed",
+            details=await _multimedia_generation_failure_details(
+                service,
+                job=failed_job,
+                job_id=submitted.id if submitted is not None else "unknown",
+                executor_id="admin_multimedia_generate",
+                error=error,
+            ),
         ) from error
     artifact = job.artifacts[0] if job.artifacts else None
     return MultimediaGenerationResponse(
@@ -9315,7 +9591,12 @@ async def generate_multimedia(
         deployment_id=artifact.deployment_id if artifact and artifact.deployment_id else "",
         text=(artifact.text or artifact.uri) if artifact else None,
         artifacts=[
-            _multimedia_artifact_response(item, job_id=job.id, artifact_index=index)
+            _multimedia_artifact_response(
+                item,
+                job_id=job.id,
+                artifact_index=index,
+                expires_at=job.expires_at,
+            )
             for index, item in enumerate(job.artifacts)
         ],
     )
@@ -9649,7 +9930,7 @@ async def get_operational_run(
 @router.get(
     "/runs/{run_id}/artifacts/{artifact_id}/download",
     response_model=None,
-    responses=error_responses(401, 403, 404, 422),
+    responses=error_responses(401, 403, 404, 410, 422),
 )
 async def download_operational_run_artifact(
     run_id: UUID,
@@ -9662,6 +9943,12 @@ async def download_operational_run_artifact(
         download = await service.download_run_artifact(run_id, artifact_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    except RunArtifactExpired:
+        raise PublicAPIError(
+            410,
+            "run_artifact_expired",
+            "generated multimedia artifact download expired",
+        ) from None
     return FileResponse(
         download.path,
         media_type=download.mime_type,

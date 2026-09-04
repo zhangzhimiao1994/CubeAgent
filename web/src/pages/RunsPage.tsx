@@ -1028,14 +1028,65 @@ function conversationTimestamp(value: string | null | undefined) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function runCreatedAtMs(run: RunListItem) {
+  if (!run.created_at) return 0;
+  const date = new Date(run.created_at);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
 function conversationTitle(run: RunListItem, items: RunListItem[]) {
   const fallback = run.id.slice(0, 8);
   const conversationKey = run.conversation_id?.trim();
   const sameConversation = conversationKey ? items.filter((item) => item.conversation_id === conversationKey) : [];
-  const firstRun = sameConversation.length > 0 ? sameConversation.at(-1) : run;
+  const firstRun =
+    sameConversation.length > 0
+      ? [...sameConversation].sort((left, right) => runCreatedAtMs(left) - runCreatedAtMs(right))[0]
+      : run;
   const question = normalizeConversationQuestion(firstRun?.request, fallback);
   const timestamp = conversationTimestamp(firstRun?.created_at);
   return timestamp ? `${question} · ${timestamp}` : question;
+}
+
+type ConversationListEntry = {
+  key: string;
+  conversationId: string | null;
+  latestRun: RunListItem;
+  runIds: string[];
+  deletableRunIds: string[];
+  allTerminal: boolean;
+};
+
+function conversationListEntries(items: RunListItem[]): ConversationListEntry[] {
+  const grouped = new Map<
+    string,
+    {
+      conversationId: string | null;
+      runs: RunListItem[];
+    }
+  >();
+  for (const run of items) {
+    const conversationId = run.conversation_id?.trim() || null;
+    const key = conversationId ? `conversation:${conversationId}` : `run:${run.id}`;
+    const entry = grouped.get(key);
+    if (entry) {
+      entry.runs.push(run);
+    } else {
+      grouped.set(key, { conversationId, runs: [run] });
+    }
+  }
+  return Array.from(grouped.entries()).map(([key, entry]) => {
+    const latestRun = [...entry.runs].sort((left, right) => runCreatedAtMs(right) - runCreatedAtMs(left))[0];
+    const runIds = entry.runs.map((run) => run.id);
+    const allTerminal = entry.runs.every((run) => TERMINAL_STATUSES.has(run.status));
+    return {
+      key,
+      conversationId: entry.conversationId,
+      latestRun,
+      runIds,
+      deletableRunIds: allTerminal ? runIds : [],
+      allTerminal,
+    };
+  });
 }
 
 function conversationMessages(runs: RunDetail[]) {
@@ -3473,6 +3524,7 @@ export function RunsPage() {
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runListItems;
+  const conversationEntries = conversationListEntries(items);
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
@@ -3527,9 +3579,7 @@ export function RunsPage() {
         }
       : processDetailTarget;
 
-  const deletableConversationIds = items
-    .filter((run) => TERMINAL_STATUSES.has(run.status))
-    .map((run) => run.id);
+  const deletableConversationIds = conversationEntries.flatMap((entry) => entry.deletableRunIds);
   const selectedDeletableConversationIds = selectedConversationIds.filter((id) =>
     deletableConversationIds.includes(id),
   );
@@ -3537,16 +3587,20 @@ export function RunsPage() {
     deletableConversationIds.length > 0 &&
     deletableConversationIds.every((id) => selectedConversationIds.includes(id));
 
-  function deleteConversation(run: (typeof items)[number]) {
-    if (!TERMINAL_STATUSES.has(run.status)) {
+  function deleteConversation(entry: ConversationListEntry) {
+    if (!entry.allTerminal) {
       setSubmitNotice("这条对话仍在运行或等待处理，请先取消后再删除。");
       return;
     }
-    const title = conversationTitle(run, items);
-    if (!window.confirm(`确认删除对话「${title}」？删除后运行详情和产物记录也会移除。`)) {
+    const title = conversationTitle(entry.latestRun, items);
+    if (!window.confirm(`确认删除对话「${title}」？删除后 ${entry.runIds.length} 条运行详情和产物记录也会移除。`)) {
       return;
     }
-    deleteRun.mutate(run.id);
+    if (entry.runIds.length === 1) {
+      deleteRun.mutate(entry.runIds[0]);
+    } else {
+      bulkDeleteRuns.mutate(entry.runIds);
+    }
   }
 
   function toggleAllConversations() {
@@ -3554,10 +3608,6 @@ export function RunsPage() {
       if (allDeletableSelected) return current.filter((id) => !deletableConversationIds.includes(id));
       return Array.from(new Set([...current, ...deletableConversationIds]));
     });
-  }
-
-  function toggleConversation(runId: string) {
-    setSelectedConversationIds((current) => toggle(current, runId));
   }
 
   function chooseRunMode(nextMode: RunMode) {
@@ -3633,7 +3683,7 @@ export function RunsPage() {
           <div className="conversation-list-header">
             <div>
               <h3>会话</h3>
-              <span>{items.length} 条</span>
+              <span>{conversationEntries.length} 条</span>
             </div>
             <div className="conversation-list-actions">
               <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
@@ -3644,7 +3694,7 @@ export function RunsPage() {
               </button>
             </div>
           </div>
-          {items.length > 0 ? (
+          {conversationEntries.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
                 <input
@@ -3668,24 +3718,39 @@ export function RunsPage() {
               <small>已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
-          {items.length === 0 ? (
+          {conversationEntries.length === 0 ? (
             <p className="field-help">还没有会话。直接发送消息即可开始。</p>
           ) : (
-            items.map((run) => {
-              const canDelete = TERMINAL_STATUSES.has(run.status);
+            conversationEntries.map((entry) => {
+              const run = entry.latestRun;
+              const canDelete = entry.allTerminal;
               const title = conversationTitle(run, items);
+              const active = entry.conversationId
+                ? entry.conversationId === activeConversationId
+                : entry.runIds.includes(selectedRunId ?? "");
               return (
                 <div
-                  key={run.id}
-                  className={`conversation-row${selectedRunId === run.id ? " conversation-row-active" : ""}`}
+                  key={entry.key}
+                  className={`conversation-row${active ? " conversation-row-active" : ""}`}
                 >
                   <input
                     type="checkbox"
                     className="conversation-select"
                     aria-label={`选择会话 ${title}`}
-                    checked={selectedConversationIds.includes(run.id)}
+                    checked={
+                      entry.deletableRunIds.length > 0 &&
+                      entry.deletableRunIds.every((id) => selectedConversationIds.includes(id))
+                    }
                     disabled={!canDelete || bulkDeleteRuns.isPending}
-                    onChange={() => toggleConversation(run.id)}
+                    onChange={() => {
+                      setSelectedConversationIds((current) => {
+                        const selected =
+                          entry.deletableRunIds.length > 0 &&
+                          entry.deletableRunIds.every((id) => current.includes(id));
+                        if (selected) return current.filter((id) => !entry.deletableRunIds.includes(id));
+                        return Array.from(new Set([...current, ...entry.deletableRunIds]));
+                      });
+                    }}
                   />
                   <button
                     type="button"
@@ -3693,7 +3758,7 @@ export function RunsPage() {
                     aria-label={`进入会话 ${title}`}
                     onClick={() => {
                       setShowModeEntry(false);
-                      if (run.conversation_id) setConversationId(run.conversation_id);
+                      if (entry.conversationId) setConversationId(entry.conversationId);
                       setSelectedRunId(run.id);
                       setHistoryOpen(false);
                     }}
@@ -3705,9 +3770,9 @@ export function RunsPage() {
                     type="button"
                     className="conversation-branch-button"
                     aria-label={`按原思路新建分支 ${title}`}
-                    title={run.conversation_id ? "引用这段会话新建分支" : "这条运行没有会话 ID"}
-                    disabled={!run.conversation_id}
-                    onClick={() => startBranchConversation(run.conversation_id)}
+                    title={entry.conversationId ? "引用这段会话新建分支" : "这条运行没有会话 ID"}
+                    disabled={!entry.conversationId}
+                    onClick={() => startBranchConversation(entry.conversationId)}
                   >
                     分支
                   </button>
@@ -3717,7 +3782,7 @@ export function RunsPage() {
                     aria-label={`删除会话 ${title}`}
                     title={canDelete ? "删除对话" : "运行中先取消"}
                     disabled={!canDelete || deleteRun.isPending}
-                    onClick={() => deleteConversation(run)}
+                    onClick={() => deleteConversation(entry)}
                   >
                     删除
                   </button>

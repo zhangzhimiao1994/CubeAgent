@@ -6,7 +6,7 @@ import tarfile
 import threading
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -28,6 +28,7 @@ from agent_hub.api.routers.admin import (
     MainAgentModelConfig,
     McpServerRequest,
     ModelDeploymentRequest,
+    ModelDeploymentResponse,
     PersistentAdminResourceService,
     RunArtifactResponse,
     RunDetailResponse,
@@ -192,8 +193,16 @@ class FakeGenerationGateway:
 
 
 class DownloadableMultimediaExecutor:
-    def __init__(self, media_path: Path) -> None:
+    def __init__(
+        self,
+        media_path: Path,
+        *,
+        created_at: datetime | None = None,
+        expires_at: datetime | None = None,
+    ) -> None:
         self._media_path = media_path
+        self._created_at = created_at or datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+        self._expires_at = expires_at or self._created_at + timedelta(hours=24)
         self._job: MultimediaGenerationJob | None = None
 
     def submit(
@@ -209,6 +218,8 @@ class DownloadableMultimediaExecutor:
             logical_model=logical_model,
             prompt=prompt,
             status=MultimediaGenerationJobStatus.QUEUED,
+            created_at=self._created_at,
+            expires_at=self._expires_at,
         )
         return self._job
 
@@ -239,6 +250,8 @@ class DownloadableMultimediaExecutor:
                 ),
             ),
             executor_id=executor_id,
+            created_at=self._created_at,
+            expires_at=self._expires_at,
         )
         return self._job
 
@@ -2298,10 +2311,12 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "multimedia_provider_failed"
-    assert response.json()["error"]["details"] == {
-        "provider_code": "2049",
-        "reason": "MiniMax video submit failed: invalid api key",
-    }
+    details = response.json()["error"]["details"]
+    assert details["provider_code"] == "2049"
+    assert details["reason"] == "MiniMax video submit failed: invalid api key"
+    assert details["stage"] == "multimedia_generation"
+    assert details["kind"] == "video"
+    assert details["logical_model"] == "video_primary"
 
 
 def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path) -> None:
@@ -2330,6 +2345,9 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
     body = response.json()
     assert body["job_id"] == "media_downloadable"
     assert body["text"] == media_path.as_uri()
+    assert datetime.fromisoformat(body["artifacts"][0]["expires_at"]) == datetime(
+        2026, 9, 5, 8, 0, tzinfo=UTC
+    )
     assert body["artifacts"] == [
         {
             "kind": "video",
@@ -2340,6 +2358,7 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
             "size_bytes": len(b"video-bytes"),
             "sha256": "79fd615a866fe7f9eb4da8d9c41ab57e3bd48056df42fd2c13e4d461a87afbe3",
             "download_url": "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download",
+            "expires_at": "2026-09-05T08:00:00Z",
         }
     ]
 
@@ -2348,6 +2367,39 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
     assert downloaded.status_code == 200
     assert downloaded.content == b"video-bytes"
     assert downloaded.headers["content-type"].startswith("video/mp4")
+
+
+def test_expired_multimedia_generated_file_cannot_be_downloaded(tmp_path: Path) -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    media_path = tmp_path / "expired-video.mp4"
+    media_path.write_bytes(b"video-bytes")
+    cast(Any, api.app).state.multimedia_generation_executor = DownloadableMultimediaExecutor(
+        media_path,
+        created_at=datetime(2020, 1, 1, 8, 0, tzinfo=UTC),
+        expires_at=datetime(2020, 1, 2, 8, 0, tzinfo=UTC),
+    )
+
+    response = api.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 202
+    download_url = response.json()["artifacts"][0]["download_url"]
+
+    downloaded = api.get(download_url, headers=headers())
+
+    assert downloaded.status_code == 404
+    assert downloaded.json()["error"]["code"] == "multimedia_artifact_expired"
 
 
 def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent() -> None:
@@ -2397,13 +2449,83 @@ def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main
             "size_bytes": None,
             "sha256": None,
             "download_url": None,
+            "expires_at": None,
         }
     ]
+    assert datetime.fromisoformat(body["expires_at"]) - datetime.fromisoformat(
+        body["created_at"]
+    ) == timedelta(hours=24)
 
     readable = api.get(f"/api/v1/admin/multimedia/jobs/{queued['id']}", headers=headers())
 
     assert readable.status_code == 200
     assert readable.json() == body
+
+
+def test_multimedia_generation_job_model_failure_returns_model_diagnostics() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    service = cast(InMemoryAdminResourceService, api.app.state.admin_resource_service)
+    model_id = uuid4()
+    service.models[model_id] = ModelDeploymentResponse(
+        id=model_id,
+        provider="minimax",
+        api_base="https://api.minimax.chat/v1",
+        api_protocol="openai_compatible",
+        upstream_model="MiniMax-Hailuo-02",
+        logical_model="video_primary",
+        capabilities=["text", "video_generation"],
+        credential_ref="secret://media",
+        quota_scope="media",
+        max_concurrency=1,
+        target_utilization=0.8,
+        reserved_capacity=0,
+        rpm=None,
+        tpm=None,
+        queue_timeout_seconds=60,
+        fallback=None,
+        weight=100,
+        effective_slots=1,
+        saturation_policy="queue_first_then_fallback",
+    )
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(
+        FakeGenerationGateway(error=RuntimeError("model transport failed"))
+    )
+
+    submitted = api.post(
+        "/api/v1/admin/multimedia/jobs",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+    queued = submitted.json()
+    failed = api.post(
+        f"/api/v1/admin/multimedia/jobs/{queued['id']}/run",
+        headers=headers(),
+        json={"executor_id": "multimedia_generator"},
+    )
+
+    assert failed.status_code == 502
+    body = failed.json()
+    assert body["error"]["code"] == "multimedia_model_failed"
+    details = body["error"]["details"]
+    assert details["stage"] == "multimedia_generation"
+    assert details["job_id"] == queued["id"]
+    assert details["executor_id"] == "multimedia_generator"
+    assert details["kind"] == "video"
+    assert details["logical_model"] == "video_primary"
+    assert details["required_capability"] == "video_generation"
+    assert "minimax/MiniMax-Hailuo-02" in details["deployments"]
+    assert details["reason"] == "model transport failed"
+    assert api.get(f"/api/v1/admin/multimedia/jobs/{queued['id']}", headers=headers()).json()[
+        "status"
+    ] == "failed"
 
 
 def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:
@@ -3230,6 +3352,105 @@ def test_admin_run_artifact_exposes_public_file_metadata_without_storage_key(
     assert "storage_key" not in artifact.model_dump(exclude_none=True)
 
 
+def test_admin_run_artifact_rejects_legacy_multimedia_run_download_metadata() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "type": "tool_result",
+            "producer": "multimedia_generator",
+            "content": {
+                "result": {
+                    "presentation": "final_attachment",
+                    "artifacts": [
+                        {
+                            "kind": "image",
+                            "uri": "artifact://generated-image",
+                            "text": "artifact://generated-image",
+                            "logical_model": "kilin-ima",
+                            "deployment_id": "kilin-ima_1",
+                            "filename": "generated-image.png",
+                            "mime_type": "image/png",
+                            "size_bytes": 13,
+                            "sha256": "e" * 64,
+                            "download_url": (
+                                "/api/v1/admin/runs/"
+                                "22222222-2222-4222-8222-222222222222/"
+                                "artifacts/33333333-3333-4333-8333-333333333333/"
+                                "download"
+                            ),
+                            "expires_at": "2026-09-05T08:00:00+00:00",
+                        }
+                    ],
+                }
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename is None
+    assert artifact.mime_type is None
+    assert artifact.size_bytes is None
+    assert artifact.sha256 is None
+    assert artifact.expires_at is None
+    assert artifact.download_url is None
+
+
+def test_admin_run_artifact_rejects_external_multimedia_download_url() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "type": "tool_result",
+            "producer": "multimedia_generator",
+            "content": {
+                "result": {
+                    "presentation": "final_attachment",
+                    "artifacts": [
+                        {
+                            "kind": "video",
+                            "filename": "generated-video.mp4",
+                            "mime_type": "video/mp4",
+                            "size_bytes": 13,
+                            "sha256": "f" * 64,
+                            "download_url": "https://attacker.example/video.mp4",
+                        }
+                    ],
+                }
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename is None
+    assert artifact.mime_type is None
+    assert artifact.download_url is None
+
+
+def test_admin_run_artifact_download_rejects_expired_generated_file(tmp_path: Path) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="poster.png",
+        mime_type="image/png",
+        data=b"png-bytes",
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    file_metadata["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "run_artifact_expired"
+
+
 def test_admin_run_artifact_ignores_invalid_file_metadata() -> None:
     artifact = _admin_run_artifact(
         {
@@ -3244,6 +3465,78 @@ def test_admin_run_artifact_ignores_invalid_file_metadata() -> None:
                     "sha256": "not-a-digest",
                     "storage_key": "invalid",
                     "download_url": "https://attacker.example/download",
+                }
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename is None
+    assert artifact.mime_type is None
+    assert artifact.size_bytes is None
+    assert artifact.sha256 is None
+    assert artifact.download_url is None
+
+
+def test_admin_run_artifact_exposes_multimedia_job_download_metadata() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "media-tool-result",
+            "type": "tool_result",
+            "producer": "generate_multimedia",
+            "content": {
+                "result": {
+                    "presentation": "final_attachment",
+                    "artifacts": [
+                        {
+                            "kind": "image",
+                            "filename": "poster.png",
+                            "mime_type": "image/png",
+                            "size_bytes": 8,
+                            "sha256": "f" * 64,
+                            "expires_at": "2026-09-05T08:00:00+00:00",
+                            "download_url": (
+                                "/api/v1/admin/multimedia/jobs/media_downloadable/"
+                                "artifacts/0/download"
+                            ),
+                        }
+                    ],
+                }
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename == "poster.png"
+    assert artifact.mime_type == "image/png"
+    assert artifact.size_bytes == 8
+    assert artifact.sha256 == "f" * 64
+    assert artifact.expires_at == datetime(2026, 9, 5, 8, 0, tzinfo=UTC)
+    assert (
+        artifact.download_url
+        == "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download"
+    )
+
+
+def test_admin_run_artifact_rejects_unsafe_multimedia_download_metadata() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "media-tool-result",
+            "type": "tool_result",
+            "producer": "generate_multimedia",
+            "content": {
+                "result": {
+                    "presentation": "final_attachment",
+                    "artifacts": [
+                        {
+                            "kind": "image",
+                            "filename": "../poster.png",
+                            "mime_type": "image/png",
+                            "size_bytes": 8,
+                            "sha256": "f" * 64,
+                            "download_url": "https://attacker.example/poster.png",
+                        }
+                    ],
                 }
             },
         },

@@ -600,6 +600,7 @@ const RunArtifactSchema = z.object({
   size_bytes: z.number().nullable().optional(),
   sha256: z.string().nullable().optional(),
   download_url: z.string().nullable().optional(),
+  expires_at: z.string().nullable().optional(),
 });
 
 const RunEventSchema = z.object({
@@ -777,6 +778,7 @@ const MultimediaGenerationSchema = z.object({
         size_bytes: z.number().nullable().optional(),
         sha256: z.string().nullable().optional(),
         download_url: z.string().nullable().optional(),
+        expires_at: z.string().nullable().optional(),
       }),
     )
     .default([]),
@@ -1203,6 +1205,48 @@ async function requestBinary<T>(
     );
   }
   return parsed.data;
+}
+
+function contentDispositionFilename(value: string | null): string | null {
+  if (!value) return null;
+  const encoded = value.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return null;
+    }
+  }
+  const quoted = value.match(/filename="([^"]+)"/i)?.[1];
+  if (quoted) return quoted;
+  return value.match(/filename=([^;]+)/i)?.[1]?.trim() ?? null;
+}
+
+async function requestDownload(path: string): Promise<{ blob: Blob; filename: string | null }> {
+  const url = new URL(path, window.location.href);
+  if (url.origin !== window.location.origin) {
+    throw new ApiError("download URL must be same origin", 0, "unsafe_download_url");
+  }
+
+  let response: Response;
+  const token = currentAccessToken();
+  try {
+    response = await fetch(path, {
+      credentials: "include",
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+  } catch {
+    throw new ApiError("network request failed", 0, "network_error");
+  }
+  if (!response.ok) {
+    throw clearExpiredSession(await errorFromResponse(response));
+  }
+  return {
+    blob: await response.blob(),
+    filename: contentDispositionFilename(response.headers.get("content-disposition")),
+  };
 }
 
 export const api = {
@@ -1647,6 +1691,9 @@ export const api = {
   },
   run(id: string): Promise<RunDetail> {
     return request(`/api/v1/admin/runs/${id}`, { method: "GET" }, RunDetailSchema);
+  },
+  downloadGeneratedFile(path: string): Promise<{ blob: Blob; filename: string | null }> {
+    return requestDownload(path);
   },
   conversation(conversationId: string): Promise<Conversation> {
     return request(

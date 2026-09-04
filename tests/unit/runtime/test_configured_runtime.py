@@ -230,7 +230,8 @@ class ProbeHybridRuntime(ProbeDispatchRuntime):
     instances: ClassVar[list[ProbeDispatchRuntime]] = []
 
     def __init__(self, dispatch: object, discussion: object, direct: object) -> None:
-        del dispatch, discussion
+        self.dispatch: Any = dispatch
+        self.discussion: Any = discussion
         self.direct: Any = direct
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
@@ -696,6 +697,74 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_multimedia_hybrid_ignores_selected_execution_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "architect",
+                        "role": "Architect",
+                        "prompt": "Plan software changes.",
+                        "model": "main",
+                        "skills": [],
+                    },
+                    {
+                        "id": "implementer",
+                        "role": "Implementer",
+                        "prompt": "Implement software changes.",
+                        "model": "main",
+                        "skills": [],
+                    },
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+    )
+
+    async for _event in runtime.run(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.HYBRID,
+            request="请生成一张极简蓝色方块测试图，最终结果需要可下载图片。",
+            routing_decision={
+                "selected_agent_ids": ("architect", "implementer"),
+                "main_agent_model": "main",
+            },
+        )
+    ):
+        pass
+
+    hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[0])
+    dispatch_plan = hybrid.dispatch._plan
+    assert [agent.id for agent in dispatch_plan.agents] == ["multimedia_generator"]
 
 
 @pytest.mark.asyncio

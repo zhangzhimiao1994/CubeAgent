@@ -79,11 +79,20 @@ from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.models.capabilities import is_known_video_generation_model
-from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
+from agent_hub.models.capacity import (
+    CapacityPool,
+    CredentialDescriptor,
+    CredentialRegistry,
+    safe_operational_limit,
+)
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.multimodal.dashscope import (
+    DashScopeMultimediaGenerationClient,
+    is_dashscope_multimedia_deployment,
+)
 from agent_hub.multimodal.generation import (
     InMemoryMultimediaGenerationJobStore,
     MultimediaArtifact,
@@ -307,6 +316,7 @@ class _ConfigBackedMultimediaGenerationExecutor:
         capacity_factory: MultimediaCapacityFactory | None = None,
         media_store_dir: Path | None = None,
         video_provider_router: TextToVideoProviderRouter | None = None,
+        dashscope_multimedia_client: DashScopeMultimediaGenerationClient | None = None,
     ) -> None:
         self._list_models = list_models
         self._secret_service = secret_service
@@ -317,6 +327,9 @@ class _ConfigBackedMultimediaGenerationExecutor:
         self._media_store_dir = (media_store_dir or Path("/var/lib/agent-hub/media")).resolve()
         self._video_provider_router = video_provider_router or TextToVideoProviderRouter(
             (("minimax", MiniMaxVideoGenerationClient()),)
+        )
+        self._dashscope_multimedia_client = (
+            dashscope_multimedia_client or DashScopeMultimediaGenerationClient()
         )
         self._daily_usage: dict[tuple[date, str, str], int] = {}
         self._job_store = InMemoryMultimediaGenerationJobStore()
@@ -334,8 +347,55 @@ class _ConfigBackedMultimediaGenerationExecutor:
             prompt=prompt.strip(),
         )
 
+    async def default_logical_model_for_multimedia(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+    ) -> str:
+        logical_model = await self.default_logical_model(kind.value)
+        if logical_model is None:
+            raise NoCapableDeployment(f"no capable multimedia generation deployment: {kind.value}")
+        return logical_model
+
     def get_job(self, job_id: str) -> MultimediaGenerationJob:
         return self._job_store.get(job_id)
+
+    async def default_logical_model(self, kind: str) -> str | None:
+        generation_kind = MultimediaGenerationKind(kind)
+        deployments = tuple(
+            _deployment_from_model_resource(model) for model in await self._list_models()
+        )
+        required_capability = _multimedia_required_capability(generation_kind)
+        direct_candidates: list[Deployment] = []
+        gateway_candidates: list[Deployment] = []
+        for deployment in deployments:
+            if required_capability not in deployment.capabilities:
+                continue
+            provider, upstream_model = _deployment_provider_and_model(deployment)
+            if is_dashscope_multimedia_deployment(provider, upstream_model, deployment.api_base):
+                direct_candidates.append(deployment)
+                continue
+            if generation_kind is MultimediaGenerationKind.VIDEO and (
+                self._video_provider_router.provider_for(deployment) is not None
+            ):
+                direct_candidates.append(deployment)
+                continue
+            gateway_candidates.append(deployment)
+        candidates = direct_candidates or gateway_candidates
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (
+                safe_operational_limit(
+                    item.max_concurrency,
+                    item.target_utilization,
+                    item.reserved_slots,
+                ),
+                item.weight,
+                item.logical_model,
+            ),
+        ).logical_model
 
     async def run_job(
         self,
@@ -424,6 +484,47 @@ class _ConfigBackedMultimediaGenerationExecutor:
         prompt: str,
         candidates: tuple[Deployment, ...],
     ) -> MultimediaGenerationResult | None:
+        for candidate in candidates:
+            provider, upstream_model = _deployment_provider_and_model(candidate)
+            if is_dashscope_multimedia_deployment(provider, upstream_model, candidate.api_base):
+                api_key = await self._secret_service.resolve(self._tenant_id, candidate.secret_ref)
+                output_dir = self._media_store_dir / str(self._tenant_id)
+                if kind is MultimediaGenerationKind.IMAGE:
+                    image = await self._dashscope_multimedia_client.generate_text_to_image(
+                        api_key=api_key,
+                        api_base=candidate.api_base,
+                        model=candidate.request_model or upstream_model,
+                        prompt=prompt,
+                        output_dir=output_dir,
+                    )
+                    return MultimediaGenerationResult(
+                        kind=kind,
+                        logical_model=candidate.logical_model,
+                        deployment_id=candidate.id,
+                        text=image.uri,
+                        file_path=image.path,
+                        filename=image.path.name,
+                        mime_type=image.mime_type,
+                    )
+                if kind is MultimediaGenerationKind.VIDEO:
+                    video = await self._dashscope_multimedia_client.generate_text_to_video(
+                        api_key=api_key,
+                        api_base=candidate.api_base,
+                        model=candidate.request_model or upstream_model,
+                        prompt=prompt,
+                        output_dir=output_dir,
+                        duration=5,
+                        resolution="std",
+                    )
+                    return MultimediaGenerationResult(
+                        kind=kind,
+                        logical_model=candidate.logical_model,
+                        deployment_id=candidate.id,
+                        text=video.uri,
+                        file_path=video.path,
+                        filename=video.path.name,
+                        mime_type=video.mime_type,
+                    )
         if kind is not MultimediaGenerationKind.VIDEO:
             return None
         selected: tuple[Deployment, TextToVideoProvider] | None = None
@@ -554,7 +655,10 @@ def _is_supported_video_generation_deployment(deployment: Deployment) -> bool:
     provider, upstream_model = _deployment_provider_and_model(deployment)
     return (
         ModelCapability.VIDEO_GENERATION in deployment.capabilities
-        and is_known_video_generation_model(provider, upstream_model)
+        and (
+            is_known_video_generation_model(provider, upstream_model)
+            or is_dashscope_multimedia_deployment(provider, upstream_model, deployment.api_base)
+        )
     )
 
 

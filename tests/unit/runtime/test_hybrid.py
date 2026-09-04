@@ -333,6 +333,64 @@ async def test_hybrid_runtime_synthesizes_when_discussion_gateway_fails_after_di
 
 
 @pytest.mark.asyncio
+async def test_hybrid_runtime_does_not_synthesize_after_final_multimedia_attachment() -> None:
+    run_id = uuid4()
+    media_tool_result = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "tool": "generate_multimedia",
+            "result": {
+                "presentation": "final_attachment",
+                "summary": "Generated image artifact with kilin-ima.",
+                "artifacts": (
+                    {
+                        "filename": "image.png",
+                        "mime_type": "image/png",
+                        "download_url": "/api/files/image.png",
+                    },
+                ),
+            },
+        },
+    )
+    media_summary = artifact(
+        "multimedia_generator",
+        "Generated image artifact with kilin-ima. Download: image.png (image/png).",
+        sources=(str(media_tool_result.id),),
+    )
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (media_tool_result, media_summary)),
+        UnusedRuntime(TaskMode.DISCUSS, "discussion should be skipped"),
+        UnusedRuntime(TaskMode.DIRECT, "synthesis should be skipped"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成一张蓝色方块测试图片",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == media_tool_result
+        for event in events
+    )
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == media_summary
+        for event in events
+    )
+    assert not any(event.actor == "hybrid" and event.step_id == "hybrid_discussion_fallback" for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_synthesizes_when_discussion_fails_with_only_history_context() -> None:
     run_id = uuid4()
     history = artifact("conversation_history", "上一轮已经给过两个风格。")

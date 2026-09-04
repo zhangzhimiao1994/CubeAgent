@@ -1,3 +1,6 @@
+import { useState } from "react";
+
+import { api, formatApiError } from "../api/client";
 import type { RunDetail } from "../api/client";
 
 type ArtifactFile = RunDetail["artifacts"][number] | NonNullable<RunDetail["events"][number]["artifact"]>;
@@ -24,6 +27,13 @@ function formatFileSize(sizeBytes: number | null | undefined) {
   return `${value.toFixed(precision)} ${units[unitIndex]}`;
 }
 
+function formatExpiry(expiresAt: string | null | undefined) {
+  if (typeof expiresAt !== "string" || expiresAt.trim().length === 0) return "";
+  const date = new Date(expiresAt);
+  if (Number.isNaN(date.getTime())) return "";
+  return `有效至 ${date.toLocaleString("zh-CN", { hour12: false })}`;
+}
+
 export function ArtifactFileCard({
   artifact,
   compact = false,
@@ -31,11 +41,37 @@ export function ArtifactFileCard({
   artifact: ArtifactFile & { download_url: string };
   compact?: boolean;
 }) {
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState("");
   const filename = artifactFileName(artifact);
   const size = formatFileSize(artifact.size_bytes);
   const mimeType = artifact.mime_type?.trim();
   const checksum = artifact.sha256?.trim();
-  const meta = [artifact.kind, size, mimeType].filter(Boolean);
+  const expiry = formatExpiry(artifact.expires_at);
+  const meta = [artifact.kind, size, mimeType, expiry].filter(Boolean);
+
+  async function downloadFile(event: React.MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    setDownloading(true);
+    setError("");
+    try {
+      const downloaded = await api.downloadGeneratedFile(artifact.download_url);
+      const url = URL.createObjectURL(downloaded.blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = downloaded.filename || filename;
+      anchor.rel = "noopener";
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    } catch (caught) {
+      setError(formatApiError(caught, "下载失败"));
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   return (
     <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}`}>
@@ -52,10 +88,21 @@ export function ArtifactFileCard({
           </small>
         ) : null}
         {checksum ? <small title={checksum}>SHA-256 {checksum.slice(0, 12)}</small> : null}
+        {error ? (
+          <small className="artifact-file-error" role="alert">
+            {error}
+          </small>
+        ) : null}
       </div>
-      <a href={artifact.download_url} download={filename} aria-label={`下载 ${filename}`}>
-        下载
-      </a>
+      <button
+        type="button"
+        className="artifact-file-download"
+        onClick={downloadFile}
+        disabled={downloading}
+        aria-label={`下载 ${filename}`}
+      >
+        {downloading ? "下载中" : "下载"}
+      </button>
     </div>
   );
 }

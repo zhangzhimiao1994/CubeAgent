@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 import weakref
 from collections.abc import AsyncIterator, Coroutine, Mapping
 from contextlib import contextmanager
@@ -90,6 +91,8 @@ _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
     + _RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DIRECT_MULTIMEDIA_PROMPT_BYTES = 8_192
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CREWAI_IMPORT_LOCK = threading.Lock()
 _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
     "agent_hub_crewai_storage", default=None
@@ -295,7 +298,7 @@ def _tool_description(internal_name: str, external_name: str) -> str:
             "Approved Agent Hub capability: generate_multimedia. Use the model "
             f"function name {external_name} to generate an image, video, or audio "
             "artifact through the configured multimedia executor. Required fields "
-            "are kind, logical_model, and prompt."
+            "are kind, logical_model, and generation_prompt."
         )
     return f"Approved Agent Hub capability: {internal_name}"
 
@@ -409,7 +412,7 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
         return {
             "type": "object",
             "additionalProperties": False,
-            "required": ("kind", "logical_model", "prompt"),
+            "required": ("kind", "logical_model", "generation_prompt"),
             "properties": {
                 "kind": {
                     "type": "string",
@@ -423,7 +426,7 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                     ),
                     "minLength": 1,
                 },
-                "prompt": {
+                "generation_prompt": {
                     "type": "string",
                     "description": "The final generation prompt for the media provider.",
                     "minLength": 1,
@@ -437,18 +440,23 @@ def _map_completion_tool_names(
     completion: GatewayCompletion,
     external_to_internal: Mapping[str, str],
 ) -> GatewayCompletion:
-    if not external_to_internal or not completion.response.tool_calls:
+    if not completion.response.tool_calls:
         return completion
     mapped_calls: list[ToolCall] = []
     changed = False
     for tool_call in completion.response.tool_calls:
         mapped_name = external_to_internal.get(tool_call.name, tool_call.name)
-        changed = changed or mapped_name != tool_call.name
+        mapped_arguments = _normalize_tool_call_arguments(mapped_name, tool_call.arguments)
+        changed = (
+            changed
+            or mapped_name != tool_call.name
+            or mapped_arguments is not tool_call.arguments
+        )
         mapped_calls.append(
             ToolCall(
                 id=tool_call.id,
                 name=mapped_name,
-                arguments=tool_call.arguments,
+                arguments=mapped_arguments,
             )
         )
     if not changed:
@@ -466,6 +474,23 @@ def _map_completion_tool_names(
         provider_model=completion.provider_model,
         cost_usd=completion.cost_usd,
     )
+
+
+def _normalize_tool_call_arguments(
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    if tool_name != "generate_multimedia":
+        return arguments
+    if "prompt" not in arguments:
+        return arguments
+    prompt = arguments["prompt"]
+    if type(prompt) is not str:
+        return arguments
+    normalized = dict(arguments)
+    normalized.setdefault("generation_prompt", prompt)
+    del normalized["prompt"]
+    return normalized
 
 
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
@@ -567,22 +592,70 @@ def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
         file_metadata = result.get("file")
         if not isinstance(file_metadata, Mapping):
             file_metadata = result.get("metadata")
-        if not isinstance(file_metadata, Mapping):
-            continue
-        filename = file_metadata.get("filename")
-        mime_type = file_metadata.get("mime_type")
-        if type(filename) is not str or type(mime_type) is not str:
-            continue
-        summary = result.get("summary")
-        if type(summary) is str and summary.strip():
-            return summary.strip()
-        return f"Generated downloadable artifact {filename} ({mime_type})."
+        if isinstance(file_metadata, Mapping):
+            filename = file_metadata.get("filename")
+            mime_type = file_metadata.get("mime_type")
+            if type(filename) is str and type(mime_type) is str:
+                summary = result.get("summary")
+                if type(summary) is str and summary.strip():
+                    return summary.strip()
+                return f"Generated downloadable artifact {filename} ({mime_type})."
+        media_artifacts = result.get("artifacts")
+        if isinstance(media_artifacts, tuple | list):
+            for artifact in media_artifacts:
+                if not isinstance(artifact, Mapping):
+                    continue
+                filename = artifact.get("filename")
+                mime_type = artifact.get("mime_type")
+                download_url = artifact.get("download_url")
+                if type(filename) is not str or type(mime_type) is not str:
+                    continue
+                link_label = _download_link_label(mime_type)
+                expiry_note = _download_expiry_note(artifact)
+                summary = result.get("summary")
+                if type(summary) is str and summary.strip():
+                    if type(download_url) is str and download_url.strip():
+                        return (
+                            f"{summary.strip()} "
+                            f"[{link_label}：{filename}]({download_url.strip()})"
+                            f"（{mime_type}，{expiry_note}）。"
+                        )
+                    return f"{summary.strip()} 已生成文件：{filename}（{mime_type}，{expiry_note}）。"
+                if type(download_url) is str and download_url.strip():
+                    return (
+                        f"已生成可下载的多媒体文件："
+                        f"[{link_label}：{filename}]({download_url.strip()})"
+                        f"（{mime_type}，{expiry_note}）。"
+                    )
     return None
+
+
+def _download_link_label(mime_type: str) -> str:
+    if mime_type.startswith("image/"):
+        return "下载图片"
+    if mime_type.startswith("video/"):
+        return "下载视频"
+    if mime_type.startswith("audio/"):
+        return "下载音频"
+    return "下载文件"
+
+
+def _download_expiry_note(artifact: Mapping[str, object]) -> str:
+    expires_at = artifact.get("expires_at")
+    if type(expires_at) is str and expires_at.strip():
+        return "下载链接24小时内有效"
+    return "下载链接24小时内有效"
 
 
 def _requires_final_attachment_tool(tools: tuple[str, ...]) -> bool:
     return any(
-        tool in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+        tool
+        in {
+            "document.generate_docx",
+            "generate_multimedia",
+            "presentation.generate_pptx",
+            "project.generate_zip",
+        }
         for tool in tools
     )
 
@@ -605,6 +678,83 @@ def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
         f"Call the provided final attachment tool now: {exposed_tools}. "
         "Set presentation to final_attachment when the tool schema supports it. "
         "Do not answer with text only."
+    )
+
+
+_DIRECT_MULTIMEDIA_AGENT_HINTS = frozenset(("multimedia", "多媒体", "图片", "视频", "生成"))
+_VIDEO_GENERATION_HINTS = frozenset(("视频", "短片", "影片", "动画", "动图", "mp4", "video"))
+_IMAGE_GENERATION_HINTS = frozenset(
+    ("图片", "图像", "照片", "海报", "插画", "封面", "头像", "配图", "生成一张", "image", "photo")
+)
+_AUDIO_GENERATION_HINTS = frozenset(("音频", "语音", "配音", "声音", "audio", "voice", "speech"))
+
+
+def _should_direct_execute_multimedia(step: DispatchStep, agent: AgentSpec) -> bool:
+    if "generate_multimedia" not in step.tools:
+        return False
+    text = f"{step.agent} {agent.role} {agent.goal} {step.task}".casefold()
+    return any(hint in text for hint in _DIRECT_MULTIMEDIA_AGENT_HINTS)
+
+
+def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
+    request_text = context.request.casefold()
+    request_kind = _infer_direct_multimedia_kind_from_text(request_text)
+    if request_kind is not None:
+        return request_kind
+    task_match = re.search(r"user task:\s*(.+?)(?:\n|$)", step.task, flags=re.IGNORECASE)
+    if task_match is not None:
+        task_kind = _infer_direct_multimedia_kind_from_text(task_match.group(1).casefold())
+        if task_kind is not None:
+            return task_kind
+    return _infer_direct_multimedia_kind_from_text(step.task.casefold())
+
+
+def _infer_direct_multimedia_kind_from_text(text: str) -> str | None:
+    if any(hint in text for hint in _VIDEO_GENERATION_HINTS):
+        return "video"
+    if any(hint in text for hint in _AUDIO_GENERATION_HINTS):
+        return "audio"
+    if any(hint in text for hint in _IMAGE_GENERATION_HINTS):
+        return "image"
+    return None
+
+
+def _direct_multimedia_generation_prompt(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> str:
+    source_previews: list[str] = []
+    for artifact in sources[:6]:
+        preview = _artifact_text_preview(artifact, max_bytes=512)
+        if preview:
+            source_previews.append(f"- {artifact.producer}: {preview}")
+    parts = [context.request.strip(), f"执行任务：{step.task.strip()}"]
+    if source_previews:
+        parts.append("参考上游产物：\n" + "\n".join(source_previews))
+    prompt = "\n\n".join(part for part in parts if part)
+    prompt = unicodedata.normalize("NFC", prompt)
+    prompt = "".join(
+        " " if unicodedata.category(character) == "Cf" else character
+        for character in prompt
+    )
+    prompt = _CONTROL_CHARS.sub(" ", prompt)
+    return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+
+
+def _direct_runtime_completion(
+    *,
+    logical_model: str,
+    text: str | None,
+    tool_calls: tuple[ToolCall, ...] = (),
+) -> GatewayCompletion:
+    return GatewayCompletion(
+        response=ModelResponse(text=text, tool_calls=tool_calls, usage=TokenUsage(0, 0, 0)),
+        deployment_id="runtime_direct",
+        logical_model=logical_model,
+        provider_id="agent_hub",
+        provider_model="agent_hub/direct-multimedia",
+        cost_usd=Decimal(0),
     )
 
 
@@ -1929,7 +2079,7 @@ class CrewDispatchRuntime:
                     payload={
                         "role": agent.role,
                         "task": step.task,
-                        "logical_model": agent.logical_model,
+                        "logical_model": completion.logical_model,
                         "artifact_id": str(artifact.id),
                         "output": _artifact_text_preview(artifact) or "角色已完成本步骤输出。",
                     },
@@ -2075,7 +2225,7 @@ class CrewDispatchRuntime:
                         "attempts": retries + 1,
                         "task": step.task,
                         "role": agent.role,
-                        "logical_model": agent.logical_model,
+                        "logical_model": completion.logical_model,
                         "artifact_id": str(artifact.id),
                         "output": _artifact_text_preview(artifact) or "step completed",
                     },
@@ -2128,6 +2278,23 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
+        direct_multimedia = await self._complete_direct_multimedia_agent(
+            context,
+            step,
+            agent,
+            sources,
+            emit,
+            tool_boundary,
+            model_state_boundary,
+            usage_boundary,
+            tool_ledger,
+            model_ledger,
+            retries,
+            run_state,
+            step_deadline,
+        )
+        if direct_multimedia is not None:
+            return direct_multimedia
         generation = run_state.crew_generation
         if generation is None:
             _fail("CrewAI generation is unavailable")
@@ -2308,6 +2475,270 @@ class CrewDispatchRuntime:
                     cost_usd=completion.cost_usd,
                 )
             return completion, tuple(evidence)
+
+    async def _complete_direct_multimedia_agent(
+        self,
+        context: TaskContext,
+        step: DispatchStep,
+        agent: AgentSpec,
+        sources: tuple[Artifact, ...],
+        emit: EventEmitter,
+        tool_boundary: ToolBoundary,
+        model_state_boundary: ModelStateBoundary,
+        usage_boundary: UsageBoundary,
+        tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
+        retries: int,
+        run_state: _RunState,
+        step_deadline: float,
+    ) -> tuple[GatewayCompletion, tuple[Artifact, ...]] | None:
+        if self._capabilities is None or not _should_direct_execute_multimedia(step, agent):
+            return None
+        kind = _infer_direct_multimedia_kind(context, step)
+        if kind is None:
+            return None
+        selector = getattr(self._capabilities, "default_logical_model_for_multimedia", None)
+        selected: object = (
+            selector(tenant_id=context.tenant_id, kind=kind) if callable(selector) else None
+        )
+        if hasattr(selected, "__await__"):
+            selected = await cast(Coroutine[Any, Any, object], selected)
+        logical_model = selected if isinstance(selected, str) and selected.strip() else None
+        if logical_model is None:
+            _fail(f"capability failed: no configured {kind} generation model")
+        generation_prompt = _direct_multimedia_generation_prompt(context, step, sources)
+        if not generation_prompt:
+            _fail("capability failed: multimedia generation prompt is empty")
+        arguments: Mapping[str, JsonValue] = {
+            "kind": kind,
+            "logical_model": logical_model,
+            "generation_prompt": generation_prompt,
+        }
+        completion = _direct_runtime_completion(
+            logical_model=logical_model,
+            text="Multimedia generation dispatched directly.",
+        )
+        model_key = self._model_call_key(
+            context.run_id,
+            step.id,
+            retries,
+            "step",
+            agent.id,
+            0,
+        )
+        request_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "direct_capability": "generate_multimedia",
+                    "step_id": step.id,
+                    "actor": agent.id,
+                    "arguments": _mutable_json(arguments),
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        existing_model = model_ledger.states.get(model_key)
+        if existing_model is not None and existing_model.get("status") == "succeeded":
+            model_artifact = model_ledger.artifacts.get(model_key)
+            if model_artifact is None:
+                _fail("model response artifact is unavailable")
+            completion = self._completion_from_model_artifact(model_artifact)
+        else:
+            if existing_model is not None and existing_model.get("status") not in {
+                "prepared",
+                "running",
+            }:
+                _fail("model ledger state is invalid")
+            prepared: Mapping[str, JsonValue] = {
+                "status": "prepared",
+                "step_id": step.id,
+                "attempt": retries,
+                "purpose": "step",
+                "actor": agent.id,
+                "call_index": 0,
+                "request_sha256": request_sha256,
+                "artifact_id": None,
+                "sha256": None,
+                "provenance": None,
+            }
+            await model_state_boundary(model_key, prepared)
+            running = dict(prepared)
+            running["status"] = "running"
+            await model_state_boundary(model_key, running)
+            model_artifact = self._model_artifact(
+                completion,
+                agent.id,
+                self._ordered_artifacts(sources),
+            )
+            succeeded = dict(running)
+            succeeded.update(
+                status="succeeded",
+                artifact_id=str(model_artifact.id),
+                sha256=model_artifact.content_sha256,
+                provenance={
+                    "logical_model": completion.logical_model,
+                    "deployment_id": completion.deployment_id,
+                    "provider_id": completion.provider_id,
+                    "provider_model": completion.provider_model,
+                },
+            )
+            await self._run_commit(
+                usage_boundary(
+                    completion,
+                    step.agent,
+                    step.id,
+                    model_key,
+                    succeeded,
+                    model_artifact,
+                ),
+                run_state,
+            )
+        canonical_arguments = json.dumps(
+            _mutable_json(arguments),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(canonical_arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
+            _fail("capability arguments exceed limit")
+        arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+        tool_key = self._tool_call_key(
+            context.run_id,
+            step.id,
+            retries,
+            0,
+            0,
+            "generate_multimedia",
+            arguments_sha256,
+        )
+        call_id = f"call-{tool_key[:32]}"
+        existing_tool = tool_ledger.states.get(tool_key)
+        result: Mapping[str, JsonValue]
+        tool_artifact: Artifact
+        if existing_tool is not None and existing_tool.get("status") == "succeeded":
+            existing_artifact = tool_ledger.artifacts.get(tool_key)
+            if existing_artifact is None:
+                _fail("capability result artifact is unavailable")
+            tool_artifact = existing_artifact
+            result = cast(Mapping[str, JsonValue], tool_artifact.content["result"])
+            await emit(
+                kind=EventKind.TOOL_COMPLETED,
+                actor=step.agent,
+                tool_call_id=call_id,
+                tool_name="generate_multimedia",
+                artifact=tool_artifact,
+            )
+        else:
+            replay_safe = bool(self._capabilities.is_replay_safe("generate_multimedia"))
+            if (
+                existing_tool is not None
+                and existing_tool.get("status") in {"running", "uncertain"}
+                and not (existing_tool.get("status") == "running" and replay_safe)
+            ):
+                raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
+            prepared_tool: Mapping[str, JsonValue] = {
+                "status": "prepared",
+                "step_id": step.id,
+                "attempt": retries,
+                "round": 0,
+                "tool_index": 0,
+                "name": "generate_multimedia",
+                "arguments_sha256": arguments_sha256,
+                "trigger_model_artifact_id": str(model_artifact.id),
+                "replay_safe": replay_safe,
+                "artifact_id": None,
+                "sha256": None,
+            }
+            await tool_boundary(tool_key, prepared_tool, None)
+            await emit(
+                kind=EventKind.TOOL_STARTED,
+                actor=step.agent,
+                tool_call_id=call_id,
+                tool_name="generate_multimedia",
+                payload={
+                    "kind": kind,
+                    "logical_model": logical_model,
+                    "direct_dispatch": True,
+                },
+            )
+            running_tool = dict(prepared_tool)
+            running_tool["status"] = "running"
+            await tool_boundary(tool_key, running_tool, None)
+            try:
+                async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+                    result = await self._capabilities.execute(
+                        tenant_id=context.tenant_id,
+                        run_id=context.run_id,
+                        actor=step.agent,
+                        name="generate_multimedia",
+                        arguments=arguments,
+                        idempotency_key=tool_key,
+                    )
+                encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+                if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                    _fail("capability result exceeds limit")
+            except asyncio.CancelledError:
+                if not replay_safe:
+                    uncertain = dict(running_tool)
+                    uncertain["status"] = "uncertain"
+                    await asyncio.shield(tool_boundary(tool_key, uncertain, None))
+                raise
+            except Exception as error:  # noqa: BLE001
+                failure_reason = safe_runtime_failure_reason(
+                    error,
+                    fallback="capability execution failed",
+                )
+                if not failure_reason.startswith("capability failed:"):
+                    failure_reason = f"capability failed: {failure_reason}"
+                error.__traceback__ = None
+                del error
+                await emit(
+                    kind=EventKind.TOOL_FAILED,
+                    actor=step.agent,
+                    tool_call_id=call_id,
+                    tool_name="generate_multimedia",
+                    reason=failure_reason,
+                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                )
+                uncertain = dict(running_tool)
+                uncertain["status"] = "uncertain"
+                await tool_boundary(tool_key, uncertain, None)
+                raise CapabilityOutcomeUncertain(failure_reason) from None
+            tool_artifact = Artifact(
+                id=uuid4(),
+                type="tool_result",
+                producer=step.agent,
+                content={"result": result},
+                source_ids=(str(model_artifact.id),),
+            )
+            await emit(
+                kind=EventKind.TOOL_COMPLETED,
+                actor=step.agent,
+                tool_call_id=call_id,
+                tool_name="generate_multimedia",
+                artifact=tool_artifact,
+            )
+            succeeded_tool = dict(running_tool)
+            succeeded_tool.update(
+                status="succeeded",
+                artifact_id=str(tool_artifact.id),
+                sha256=tool_artifact.content_sha256,
+            )
+            await tool_boundary(tool_key, succeeded_tool, tool_artifact)
+        final_summary = _final_attachment_summary(
+            [{"name": "generate_multimedia", "result": result}]
+        )
+        if final_summary is None:
+            final_summary = f"Generated {kind} artifact with {logical_model}."
+        final_completion = _direct_runtime_completion(
+            logical_model=logical_model,
+            text=final_summary,
+        )
+        return final_completion, (model_artifact, tool_artifact)
 
     async def _complete_gateway_messages(
         self,

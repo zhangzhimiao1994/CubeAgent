@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
@@ -23,6 +23,13 @@ class MultimediaGenerationJobStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+MULTIMEDIA_ARTIFACT_TTL = timedelta(hours=24)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +91,24 @@ class MultimediaGenerationJob:
     artifacts: tuple[MultimediaArtifact, ...] = ()
     executor_id: str | None = None
     error: str | None = None
+    created_at: datetime = field(default_factory=_utcnow)
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        _validate_aware_datetime(self.created_at, field_name="created_at")
+        expires_at = self.expires_at
+        if expires_at is None:
+            expires_at = self.created_at + MULTIMEDIA_ARTIFACT_TTL
+            object.__setattr__(self, "expires_at", expires_at)
+        _validate_aware_datetime(expires_at, field_name="expires_at")
 
 
 class InMemoryMultimediaGenerationJobStore:
     """Small process-local job inbox for async multimedia executor handoff."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, now: Callable[[], datetime] = _utcnow) -> None:
         self._jobs: dict[str, MultimediaGenerationJob] = {}
+        self._now = now
 
     def create(
         self,
@@ -99,17 +117,23 @@ class InMemoryMultimediaGenerationJobStore:
         logical_model: str,
         prompt: str,
     ) -> MultimediaGenerationJob:
+        self._prune_expired()
+        now = self._now()
+        _validate_aware_datetime(now, field_name="now")
         job = MultimediaGenerationJob(
             id=f"media_{uuid4().hex}",
             kind=kind,
             logical_model=logical_model,
             prompt=prompt,
             status=MultimediaGenerationJobStatus.QUEUED,
+            created_at=now,
+            expires_at=now + MULTIMEDIA_ARTIFACT_TTL,
         )
         self._jobs[job.id] = job
         return job
 
     def get(self, job_id: str) -> MultimediaGenerationJob:
+        self._prune_expired()
         try:
             return self._jobs[job_id]
         except KeyError:
@@ -128,6 +152,8 @@ class InMemoryMultimediaGenerationJobStore:
             artifacts=job.artifacts,
             executor_id=_validate_executor_id(executor_id),
             error=None,
+            created_at=job.created_at,
+            expires_at=job.expires_at,
         )
         self._jobs[job_id] = running
         return running
@@ -148,6 +174,8 @@ class InMemoryMultimediaGenerationJobStore:
             artifacts=tuple(artifacts),
             executor_id=job.executor_id,
             error=None,
+            created_at=job.created_at,
+            expires_at=job.expires_at,
         )
         self._jobs[job_id] = succeeded
         return succeeded
@@ -163,9 +191,21 @@ class InMemoryMultimediaGenerationJobStore:
             artifacts=job.artifacts,
             executor_id=job.executor_id,
             error=error[:512],
+            created_at=job.created_at,
+            expires_at=job.expires_at,
         )
         self._jobs[job_id] = failed
         return failed
+
+    def _prune_expired(self) -> None:
+        now = self._now()
+        _validate_aware_datetime(now, field_name="now")
+        expired_ids = [
+            job_id for job_id, job in self._jobs.items() if _job_expired(job, now=now)
+        ]
+        for job_id in expired_ids:
+            job = self._jobs.pop(job_id)
+            _remove_job_files(job)
 
 
 class MultimediaDailyLimitExceeded(RuntimeError):
@@ -300,7 +340,32 @@ def _validate_executor_id(executor_id: str) -> str:
     return executor_id.strip()
 
 
+def _job_expired(job: MultimediaGenerationJob, *, now: datetime) -> bool:
+    expires_at = job.expires_at
+    if expires_at is None:
+        return False
+    return expires_at <= now
+
+
+def _remove_job_files(job: MultimediaGenerationJob) -> None:
+    for artifact in job.artifacts:
+        file_path = artifact.file_path
+        if file_path is None:
+            continue
+        try:
+            if file_path.is_file():
+                file_path.unlink()
+        except OSError:
+            continue
+
+
+def _validate_aware_datetime(value: datetime, *, field_name: str) -> None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+
+
 __all__ = [
+    "MULTIMEDIA_ARTIFACT_TTL",
     "InMemoryMultimediaGenerationJobStore",
     "MultimediaArtifact",
     "MultimediaDailyLimitExceeded",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 from zipfile import ZipFile
@@ -45,6 +46,8 @@ class FakeSandbox:
 class FakeMultimediaExecutor:
     def __init__(self, media_path: Path) -> None:
         self.media_path = media_path
+        self.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+        self.expires_at = self.created_at + timedelta(hours=24)
         self.submitted: list[tuple[MultimediaGenerationKind, str, str]] = []
         self.run_requests: list[tuple[str, str]] = []
 
@@ -62,6 +65,8 @@ class FakeMultimediaExecutor:
             logical_model=logical_model,
             prompt=prompt,
             status=MultimediaGenerationJobStatus.QUEUED,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
         )
 
     async def run_job(
@@ -78,6 +83,8 @@ class FakeMultimediaExecutor:
             prompt="生成 5 秒产品视频",
             status=MultimediaGenerationJobStatus.SUCCEEDED,
             executor_id=executor_id,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
             artifacts=(
                 MultimediaArtifact(
                     kind=MultimediaGenerationKind.VIDEO,
@@ -115,6 +122,7 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
     media_executor = FakeMultimediaExecutor(media_path)
     gateway = RuntimeCapabilityGateway(
         skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
         multimedia_generation_executor=media_executor,
     )
 
@@ -129,7 +137,7 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
         arguments={
             "kind": "video",
             "logical_model": "video_primary",
-            "prompt": "生成 5 秒产品视频",
+            "generation_prompt": "生成 5 秒产品视频",
         },
         idempotency_key="media_1",
     )
@@ -141,6 +149,20 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
     assert result["job_id"] == "media_test"
     assert result["status"] == "succeeded"
     assert result["summary"] == "Generated video artifact with video_primary."
+    file_metadata = result["file"]
+    assert isinstance(file_metadata, dict)
+    assert file_metadata["filename"] == "generated-video.mp4"
+    assert file_metadata["mime_type"] == "video/mp4"
+    assert file_metadata["size_bytes"] == len(b"video")
+    assert file_metadata["sha256"] == (
+        "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+    )
+    assert isinstance(file_metadata["artifact_id"], str)
+    assert file_metadata["download_url"] == (
+        f"/api/v1/admin/runs/{RUN_ID}/artifacts/{file_metadata['artifact_id']}/download"
+    )
+    assert isinstance(file_metadata["expires_at"], str)
+    assert datetime.fromisoformat(file_metadata["expires_at"]) == media_executor.expires_at
     assert result["artifacts"] == (
         {
             "kind": "video",
@@ -150,9 +172,41 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
             "deployment_id": "video_primary_1",
             "filename": "generated-video.mp4",
             "mime_type": "video/mp4",
-            "download_url": "/api/v1/admin/multimedia/jobs/media_test/artifacts/0/download",
+            "size_bytes": len(b"video"),
+            "sha256": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
+            "download_url": file_metadata["download_url"],
+            "expires_at": file_metadata["expires_at"],
+            "file": file_metadata,
         },
     )
+    assert result["metadata"] == file_metadata
+
+
+async def test_runtime_gateway_multimedia_generation_tool_keeps_legacy_prompt_compatible(tmp_path: Path) -> None:
+    media_path = tmp_path / "generated-video.mp4"
+    media_path.write_bytes(b"video")
+    media_executor = FakeMultimediaExecutor(media_path)
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        multimedia_generation_executor=media_executor,
+    )
+
+    await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="multimedia_generator",
+        name="generate_multimedia",
+        arguments={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "生成 5 秒产品视频",
+        },
+        idempotency_key="media_legacy",
+    )
+
+    assert media_executor.submitted == [
+        (MultimediaGenerationKind.VIDEO, "video_primary", "生成 5 秒产品视频")
+    ]
 
 
 async def test_runtime_gateway_multimedia_tool_requires_executor(tmp_path: Path) -> None:

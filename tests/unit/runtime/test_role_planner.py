@@ -240,6 +240,44 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生产验收：请生成一张极简蓝色方块测试图，最终结果需要可下载图片。",
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.GENERAL,
+            profiles=(TaskProfile.SOFTWARE, TaskProfile.GENERAL),
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        "请派单完成宣传方案，最终结果要给我一张海报和一段短视频。",
+        "先讨论脚本方向，中间产物需要生成一张封面图用于确认风格。",
+        "混合执行：文案先出提示词，然后调用多媒体模型生成成片。",
+    ),
+)
+def test_multimedia_generation_dispatch_covers_final_and_intermediate_media_artifacts(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    executor = plan.role("multimedia_generator")
+
+    assert executor.purpose is RolePurpose.EXECUTE
+    assert "generate_multimedia" in executor.allowed_tools
+
+
 def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

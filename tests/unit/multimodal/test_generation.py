@@ -1,4 +1,6 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -107,6 +109,43 @@ async def test_generation_job_cannot_be_run_twice_by_competing_executor_agents()
         await executor.run_job(queued.id, executor_id="media-agent-2")
 
     assert len(gateway.requests) == 1
+
+
+def test_generation_job_store_expires_after_24_hours_and_removes_files(tmp_path: Path) -> None:
+    current = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+
+    def now() -> datetime:
+        return current
+
+    store = InMemoryMultimediaGenerationJobStore(now=now)
+    queued = store.create(
+        kind=MultimediaGenerationKind.IMAGE,
+        logical_model="image-primary",
+        prompt="generate a poster",
+    )
+    media_path = tmp_path / "poster.png"
+    media_path.write_bytes(b"image")
+    completed = store.succeed(
+        queued.id,
+        artifacts=(
+            MultimediaArtifact(
+                kind=MultimediaGenerationKind.IMAGE,
+                uri=media_path.as_uri(),
+                file_path=media_path,
+                filename=media_path.name,
+                mime_type="image/png",
+            ),
+        ),
+    )
+
+    assert completed.expires_at == current + timedelta(hours=24)
+    assert store.get(queued.id).status is MultimediaGenerationJobStatus.SUCCEEDED
+
+    current = current + timedelta(hours=24, seconds=1)
+
+    with pytest.raises(KeyError, match="unknown multimedia generation job"):
+        store.get(queued.id)
+    assert not media_path.exists()
 
 
 async def test_generation_prompt_is_required() -> None:
