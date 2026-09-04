@@ -938,6 +938,10 @@ article:hover {
   display: none;
 }
 
+.chat-mobile-module-strip {
+  display: none;
+}
+
 .run-compose {
   margin: 1rem 0;
 }
@@ -3636,11 +3640,6 @@ article:hover {
     overflow: hidden;
   }
 
-  .app-shell-chat > .sidebar,
-  .app-shell-chat .mobile-nav-bar {
-    display: none;
-  }
-
   .sidebar {
     height: auto;
     padding: 0.65rem;
@@ -3718,12 +3717,66 @@ article:hover {
     color: #57606a;
     font-size: 0.66rem;
     font-weight: 850;
+    overflow: hidden;
+    text-overflow: ellipsis;
     text-transform: uppercase;
+    white-space: nowrap;
   }
 
   .mobile-nav-title strong {
     color: #1f2328;
     font-size: 0.92rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .app-shell-chat > .sidebar {
+    height: 0;
+    left: 0;
+    padding: 0;
+    pointer-events: none;
+    position: fixed;
+    right: 0;
+    top: 0;
+    z-index: 48;
+  }
+
+  .app-shell-chat .mobile-nav-bar {
+    background:
+      linear-gradient(145deg, rgba(12, 22, 36, 0.94), rgba(9, 18, 32, 0.9)),
+      rgba(5, 12, 24, 0.92);
+    border-color: rgba(123, 225, 255, 0.18);
+    box-shadow: 0 14px 38px rgba(0, 0, 0, 0.24);
+    color: var(--ink);
+    margin: 0.75rem 4.25rem 0 0.75rem;
+    min-height: 3.05rem;
+    pointer-events: auto;
+    position: static;
+  }
+
+  .app-shell-chat .mobile-nav-title span {
+    color: rgba(186, 242, 255, 0.76);
+  }
+
+  .app-shell-chat .mobile-nav-title strong {
+    color: var(--ink);
+  }
+
+  .app-shell-chat .mobile-nav-trigger {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(123, 225, 255, 0.18);
+    color: var(--ink);
+  }
+
+  .app-shell-chat .conversation-drawer-trigger {
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.94), rgba(246, 248, 250, 0.92)),
+      rgba(246, 248, 250, 0.92);
+    position: fixed;
+    right: 0.75rem;
+    top: 0.95rem;
+    z-index: 53;
   }
 
   .floating-nav-rail {
@@ -4136,9 +4189,10 @@ article:hover {
 
   .page-surface-chat > .chat-page {
     gap: 0;
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
     height: 100%;
     min-height: 0;
+    padding-top: 4.35rem;
   }
 
   .page-surface-chat .eyebrow,
@@ -4172,6 +4226,76 @@ article:hover {
     letter-spacing: 0.02em;
     padding: 0.45rem 0.35rem;
     text-align: center;
+  }
+
+  .chat-mobile-module-strip {
+    align-items: center;
+    background:
+      radial-gradient(circle at 14% 8%, rgba(85, 215, 255, 0.16), transparent 34%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03)),
+      rgba(6, 14, 26, 0.74);
+    border: 1px solid rgba(123, 225, 255, 0.16);
+    border-radius: 1.05rem;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 12px 32px rgba(0, 0, 0, 0.18);
+    display: grid;
+    gap: 0.65rem;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    margin: 0 0.75rem 0.55rem;
+    min-height: 3.6rem;
+    padding: 0.6rem 0.7rem;
+  }
+
+  .chat-mobile-module-title {
+    display: grid;
+    gap: 0.08rem;
+    line-height: 1.1;
+  }
+
+  .chat-mobile-module-title span {
+    color: rgba(186, 242, 255, 0.68);
+    font-size: 0.64rem;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+  }
+
+  .chat-mobile-module-title strong {
+    color: var(--ink);
+    font-size: 1.05rem;
+    letter-spacing: -0.03em;
+  }
+
+  .chat-mobile-module-meta {
+    color: rgba(232, 249, 255, 0.82);
+    display: grid;
+    gap: 0.12rem;
+    min-width: 0;
+  }
+
+  .chat-mobile-module-meta span,
+  .chat-mobile-module-meta small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-mobile-module-meta span {
+    font-size: 0.78rem;
+    font-weight: 850;
+  }
+
+  .chat-mobile-module-meta small {
+    color: rgba(186, 242, 255, 0.6);
+    font-size: 0.68rem;
+  }
+
+  .chat-mobile-module-strip .conversation-new-button {
+    border-radius: 999px;
+    flex: 0 0 auto;
+    min-height: 2.35rem;
+    padding: 0.42rem 0.78rem;
+    width: auto;
   }
 
   .chat-console {
@@ -4220,12 +4344,7 @@ article:hover {
   }
 
   .page-surface-chat .chat-session-toolbar {
-    justify-content: flex-end;
-    pointer-events: none;
-    position: absolute;
-    right: 3.65rem;
-    top: 0.75rem;
-    z-index: 6;
+    display: none;
   }
 
   .page-surface-chat .chat-session-toolbar .chat-conversation-status {

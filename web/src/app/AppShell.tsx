@@ -83,8 +83,8 @@ export function AppShell() {
             </span>
           </button>
           <div className="mobile-nav-title">
-            <span>{APP_BRAND_NAME}</span>
-            <strong>魔方工作台</strong>
+            <span>{isChatRoute ? "CHAT" : APP_BRAND_NAME}</span>
+            <strong>{isChatRoute ? "魔方工作台 · 对话" : "魔方工作台"}</strong>
           </div>
         </div>
         <button

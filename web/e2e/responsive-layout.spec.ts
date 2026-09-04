@@ -584,8 +584,27 @@ test.describe("mobile chat composer layout", () => {
       const sendButton = document.querySelector(".chat-composer button[type='submit']");
       const streamModeEntry = document.querySelector(".chat-stream .mode-entry-panel");
       const mobileNavBar = document.querySelector(".app-shell-chat .mobile-nav-bar");
-      const newConversationButton = document.querySelector(".chat-session-toolbar button[aria-label='新建对话']");
-      if (!surface || !panel || !stream || !footer || !modeTabs || !statusLine || !sendButton || !newConversationButton) {
+      const mobileNavTrigger = document.querySelector(".app-shell-chat .mobile-nav-bar button[aria-label='打开导航栏']");
+      const mobileNavTitle = document.querySelector(".app-shell-chat .mobile-nav-title");
+      const mobileModuleStrip = document.querySelector(".chat-mobile-module-strip");
+      const mobileModuleTitle = document.querySelector(".chat-mobile-module-title");
+      const newConversationButton = document.querySelector(".chat-mobile-module-strip button[aria-label='新建对话']");
+      const desktopStreamToolbar = document.querySelector(".chat-stream .chat-session-toolbar");
+      if (
+        !surface ||
+        !panel ||
+        !stream ||
+        !footer ||
+        !modeTabs ||
+        !statusLine ||
+        !sendButton ||
+        !mobileNavBar ||
+        !mobileNavTrigger ||
+        !mobileNavTitle ||
+        !mobileModuleStrip ||
+        !mobileModuleTitle ||
+        !newConversationButton
+      ) {
         return null;
       }
 
@@ -593,6 +612,9 @@ test.describe("mobile chat composer layout", () => {
       const panelRect = panel.getBoundingClientRect();
       const streamRect = stream.getBoundingClientRect();
       const footerRect = footer.getBoundingClientRect();
+      const mobileNavBarRect = mobileNavBar.getBoundingClientRect();
+      const mobileNavTriggerRect = mobileNavTrigger.getBoundingClientRect();
+      const mobileModuleStripRect = mobileModuleStrip.getBoundingClientRect();
       const modeTabsRect = modeTabs.getBoundingClientRect();
       const newConversationRect = newConversationButton.getBoundingClientRect();
       const statusLineRect = statusLine.getBoundingClientRect();
@@ -604,10 +626,24 @@ test.describe("mobile chat composer layout", () => {
         footerBottomGap: Math.abs(panelRect.bottom - footerRect.bottom),
         modeTabsBottom: modeTabsRect.bottom,
         modeTabsTop: modeTabsRect.top,
-        mobileNavBarVisible:
-          !!mobileNavBar &&
-          getComputedStyle(mobileNavBar).display !== "none" &&
-          mobileNavBar.getBoundingClientRect().height > 1,
+        mobileNavBarHeight: mobileNavBarRect.height,
+        mobileNavBarBottom: mobileNavBarRect.bottom,
+        mobileNavBarVisible: getComputedStyle(mobileNavBar).display !== "none" && mobileNavBarRect.height > 1,
+        mobileNavTitleText: mobileNavTitle.textContent ?? "",
+        mobileNavTriggerVisible:
+          getComputedStyle(mobileNavTrigger).display !== "none" &&
+          mobileNavTriggerRect.width > 1 &&
+          mobileNavTriggerRect.height > 1,
+        mobileModuleStripHeight: mobileModuleStripRect.height,
+        mobileModuleStripBottom: mobileModuleStripRect.bottom,
+        mobileModuleStripTop: mobileModuleStripRect.top,
+        mobileModuleStripVisible:
+          getComputedStyle(mobileModuleStrip).display !== "none" && mobileModuleStripRect.height > 1,
+        mobileModuleTitleText: mobileModuleTitle.textContent ?? "",
+        desktopStreamToolbarVisible:
+          !!desktopStreamToolbar &&
+          getComputedStyle(desktopStreamToolbar).display !== "none" &&
+          desktopStreamToolbar.getBoundingClientRect().height > 1,
         newConversationButtonVisible:
           getComputedStyle(newConversationButton).display !== "none" &&
           newConversationRect.width > 1 &&
@@ -615,6 +651,7 @@ test.describe("mobile chat composer layout", () => {
         panelHeightRatio: panelRect.height / surfaceRect.height,
         sendButtonTop: sendButtonRect.top,
         streamHeight: streamRect.height,
+        streamTop: streamRect.top,
         streamModeEntryExists: !!streamModeEntry,
         surfaceOverflows: surface.scrollHeight > surface.clientHeight + 2,
         statusLineBottom: statusLineRect.bottom,
@@ -624,7 +661,17 @@ test.describe("mobile chat composer layout", () => {
     expect(metrics).not.toBeNull();
     expect(metrics!.documentOverflows).toBe(false);
     expect(metrics!.surfaceOverflows).toBe(false);
-    expect(metrics!.mobileNavBarVisible).toBe(false);
+    expect(metrics!.mobileNavBarVisible).toBe(true);
+    expect(metrics!.mobileNavBarHeight).toBeLessThanOrEqual(68);
+    expect(metrics!.mobileNavTriggerVisible).toBe(true);
+    expect(metrics!.mobileNavTitleText).toContain("对话");
+    expect(metrics!.mobileNavTitleText).not.toContain("魔方 agent");
+    expect(metrics!.mobileModuleStripVisible).toBe(true);
+    expect(metrics!.mobileModuleStripHeight).toBeLessThanOrEqual(76);
+    expect(metrics!.mobileModuleStripTop).toBeGreaterThanOrEqual(metrics!.mobileNavBarBottom - 1);
+    expect(metrics!.streamTop).toBeGreaterThanOrEqual(metrics!.mobileModuleStripBottom - 1);
+    expect(metrics!.mobileModuleTitleText).toContain("对话");
+    expect(metrics!.desktopStreamToolbarVisible).toBe(false);
     expect(metrics!.newConversationButtonVisible).toBe(true);
     expect(metrics!.streamModeEntryExists).toBe(false);
     expect(metrics!.panelHeightRatio).toBeGreaterThan(0.82);

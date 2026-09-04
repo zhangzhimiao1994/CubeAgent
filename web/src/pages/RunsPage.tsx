@@ -3505,6 +3505,13 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
+  const mobileModuleModeLabel =
+    mode === "auto"
+      ? "自动 · 主 Agent 判断"
+      : mode === "direct"
+        ? `直连 · ${directModelName}`
+        : `${displayMode(mode)} · 本会话倾向`;
+  const mobileModuleConversationLabel = conversationId.trim().slice(0, 12) || "新会话";
   const refreshedRunForProcessDetail = processDetailTarget
     ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
       (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
@@ -3581,6 +3588,20 @@ export function RunsPage() {
         <span>1 · 会话</span>
         <span>2 · 对话</span>
         <span>3 · 设置 / 详情</span>
+      </div>
+
+      <div className="chat-mobile-module-strip" aria-label="聊天模块基本信息">
+        <div className="chat-mobile-module-title">
+          <span>当前模块</span>
+          <strong>对话</strong>
+        </div>
+        <div className="chat-mobile-module-meta">
+          <span>{mobileModuleModeLabel}</span>
+          <small>会话：{mobileModuleConversationLabel}</small>
+        </div>
+        <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
+          新建
+        </button>
       </div>
 
       <button
