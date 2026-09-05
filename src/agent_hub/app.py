@@ -31,6 +31,7 @@ from agent_hub.api.errors import (
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
 from agent_hub.api.routers import admin, auth, config, runs, system, users
+from agent_hub.api.routers.robot import create_robot_router
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
@@ -67,6 +68,7 @@ from agent_hub.channels.submitter import (
     RunServiceInboundSubmitter,
     RunSubmissionService,
 )
+from agent_hub.robot.tokens import DeviceTokenService
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
 from agent_hub.cognitive.repository import (
     PersistentCognitiveRecordRepository,
@@ -790,6 +792,8 @@ def create_app(
     feishu_websocket_client_factory: FeishuWebSocketClientFactoryForSettings | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
     redis_factory: Callable[[str], RedisResource] = Redis.from_url,
+    robot_device_tokens: DeviceTokenService | None = None,
+    robot_submitter: RunServiceInboundSubmitter | None = None,
 ) -> FastAPI:
     """Create an application without opening network resources at import time."""
 
@@ -967,6 +971,7 @@ def create_app(
                 )
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router
+            _bind_robot_channel(application, configured)
             if (
                 getattr(application.state, "schedule_service", None) is None
                 and getattr(application.state, "run_service", None) is not None
@@ -1106,6 +1111,9 @@ def create_app(
     application.state.feishu_websocket_connector = None
     application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
+    application.state.robot_device_tokens = robot_device_tokens
+    application.state.robot_submitter = robot_submitter
+    _bind_robot_channel(application, configured_settings)
 
     async def refresh_channel_runtime_config(runtime_config: Mapping[str, str]) -> None:
         application.state.channel_runtime_config = dict(runtime_config)
@@ -1139,6 +1147,7 @@ def create_app(
     application.router.routes.extend(runs.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)
+    application.router.routes.extend(create_robot_router().routes)
     application.router.routes.extend(
         create_lazy_feishu_webhook_router(
             gateway_provider=_feishu_gateway_from_request,
@@ -1178,6 +1187,26 @@ async def _cancel_background_tasks(tasks: set[asyncio.Task[object]]) -> None:
         task.cancel()
     await asyncio.gather(*tuple(tasks), return_exceptions=True)
     tasks.clear()
+
+
+def _bind_robot_channel(application: FastAPI, configured: Settings) -> None:
+    if getattr(application.state, "robot_device_tokens", None) is None:
+        application.state.robot_device_tokens = DeviceTokenService(
+            configured.jwt_signing_key_value()
+        )
+    if getattr(application.state, "robot_submitter", None) is not None:
+        return
+    run_service = getattr(application.state, "run_service", None)
+    tenant_id = getattr(application.state, "bootstrap_tenant_id", None)
+    if run_service is None or not isinstance(tenant_id, UUID):
+        return
+    application.state.robot_submitter = RunServiceInboundSubmitter(
+        run_service=cast(RunSubmissionService, run_service),
+        tenant_id=tenant_id,
+        mode=TaskMode.DIRECT,
+        extra_channel_context={"requested_channel_features": "voice_companion"},
+        skip_evolution_proposal=True,
+    )
 
 
 def _web_ui_response(web_dir: Path, path: str) -> Response:

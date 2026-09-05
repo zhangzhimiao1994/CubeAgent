@@ -788,6 +788,24 @@ class RunService:
             )
             return _submitted(record)
 
+        if (
+            mode is TaskMode.DIRECT
+            and str(operator_selection.get("source_channel") or "") == "robot"
+        ):
+            hermes_advice = await self._safe_hermes_advice(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=mode,
+                agent_ids=agent_ids,
+                workflow_id=workflow_id,
+            )
+            if hermes_advice is not None:
+                operator_selection = {
+                    **operator_selection,
+                    "hermes": _hermes_advice_payload(hermes_advice),
+                }
+
         proposal = await self._safe_temporary_agent_proposal(
             tenant_id=tenant_id,
             actor_id=actor_id,

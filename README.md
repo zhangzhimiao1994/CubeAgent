@@ -8,6 +8,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 
 ## What You Can Do
 
+- Act as the cloud brain of a voice companion robot: the Raspberry Pi stays a mic/speaker/WebSocket frontend, while turns reuse RunService, memory injection, and the model pool. See `device/README.md` and `docs/architecture.md`.
 - Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration. Without that harness, Cube Agent can analyze code and provide modification plans or patch suggestions, but it cannot directly edit a repository, run the resulting tests, review the changes, and debug them end to end.
 - Inspect dispatch and discussion runs from compact child-agent work seats. Each seat uses a Chinese display name and status first; long activity and output content is summarized into cards, and detailed fields open only in the drawer. Open drawers stay synced with live run updates, close from the backdrop, and lock background scrolling while active.
 - Configure normal chat/tool models separately from multimedia AI models.

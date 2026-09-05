@@ -15,6 +15,7 @@ class Channel(StrEnum):
     QQ = "qq"
     SLACK = "slack"
     TELEGRAM = "telegram"
+    ROBOT = "robot"
     WEB = "web"
     WECHAT_CUSTOMER_SERVICE = "wechat_customer_service"
     WECHAT_OFFICIAL = "wechat_official"
