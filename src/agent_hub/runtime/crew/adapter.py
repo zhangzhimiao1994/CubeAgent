@@ -484,12 +484,11 @@ def _normalize_tool_call_arguments(
         return arguments
     if "prompt" not in arguments:
         return arguments
-    prompt = arguments["prompt"]
-    if type(prompt) is not str:
-        return arguments
     normalized = dict(arguments)
-    normalized.setdefault("generation_prompt", prompt)
-    del normalized["prompt"]
+    prompt = normalized.pop("prompt")
+    generation_prompt = normalized.get("generation_prompt")
+    if (type(generation_prompt) is not str or not generation_prompt.strip()) and type(prompt) is str and prompt.strip():
+        normalized["generation_prompt"] = prompt
     return normalized
 
 
@@ -681,12 +680,128 @@ def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
     )
 
 
-_DIRECT_MULTIMEDIA_AGENT_HINTS = frozenset(("multimedia", "多媒体", "图片", "视频", "生成"))
-_VIDEO_GENERATION_HINTS = frozenset(("视频", "短片", "影片", "动画", "动图", "mp4", "video"))
-_IMAGE_GENERATION_HINTS = frozenset(
-    ("图片", "图像", "照片", "海报", "插画", "封面", "头像", "配图", "生成一张", "image", "photo")
+_OPTIONAL_REVIEW_AGENT_MARKERS = frozenset(
+    (
+        "review",
+        "reviewer",
+        "quality",
+        "critic",
+        "verifier",
+        "evaluator",
+        "审查",
+        "质检",
+        "评估",
+        "复核",
+        "校验",
+        "检查",
+    )
 )
-_AUDIO_GENERATION_HINTS = frozenset(("音频", "语音", "配音", "声音", "audio", "voice", "speech"))
+
+
+def _is_optional_review_agent_step(step: DispatchStep, agent: AgentSpec) -> bool:
+    if step.tools or not step.depends_on:
+        return False
+    text = f"{step.id} {step.agent} {step.task} {agent.id} {agent.role} {agent.goal}".casefold()
+    return any(marker in text for marker in _OPTIONAL_REVIEW_AGENT_MARKERS)
+
+
+def _optional_review_fallback_text(
+    step: DispatchStep,
+    agent: AgentSpec,
+    sources: tuple[Artifact, ...],
+    failure_reason: str,
+) -> str:
+    previews = [
+        preview
+        for artifact in sources
+        if (preview := _artifact_text_preview(artifact, max_bytes=1_500)) is not None
+    ]
+    upstream = "\n\n".join(previews).strip()
+    diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
+    model_context = ""
+    logical_models = diagnostic.get("logical_models")
+    deployments = diagnostic.get("deployments")
+    if type(logical_models) is str and type(deployments) is str:
+        model_context = f" 相关模型：{logical_models}；相关部署：{deployments}。"
+    prefix = (
+        f"{agent.role} 步骤因模型调用失败已跳过，系统沿用上游产物继续执行。"
+        f"{model_context}"
+    )
+    if upstream:
+        return f"{prefix}\n\n上游产物摘要：\n{upstream}"
+    return f"{prefix}\n\n失败摘要：{failure_reason[:500]}\n\n该审查步骤没有可用上游产物。"
+
+
+_DIRECT_MULTIMEDIA_AGENT_HINTS = frozenset(
+    ("multimedia", "多媒体", "图片", "图像", "视频", "音频", "语音", "生成", "合成")
+)
+_VIDEO_GENERATION_HINTS = frozenset(
+    (
+        "视频",
+        "短视频",
+        "短片",
+        "影片",
+        "动画",
+        "动图",
+        "成片",
+        "mp4",
+        "video",
+        "animation",
+        "short film",
+        "clip",
+    )
+)
+_IMAGE_GENERATION_HINTS = frozenset(
+    (
+        "图片",
+        "图像",
+        "照片",
+        "海报",
+        "插画",
+        "封面",
+        "头像",
+        "配图",
+        "概念图",
+        "设定图",
+        "设定板",
+        "图片版",
+        "分镜图",
+        "分镜",
+        "表情包",
+        "贴纸",
+        "渲染图",
+        "生成一张",
+        "image",
+        "photo",
+        "poster",
+        "cover",
+        "concept art",
+        "storyboard",
+        "sticker",
+        "render",
+        "rendering",
+    )
+)
+_AUDIO_GENERATION_HINTS = frozenset(
+    (
+        "音频",
+        "语音",
+        "配音",
+        "声音",
+        "旁白",
+        "口播音频",
+        "音乐",
+        "背景音乐",
+        "bgm",
+        "audio",
+        "voice",
+        "speech",
+        "voiceover",
+        "voice-over",
+        "narration",
+        "music",
+    )
+)
 
 
 def _should_direct_execute_multimedia(step: DispatchStep, agent: AgentSpec) -> bool:
@@ -2237,6 +2352,20 @@ class CrewDispatchRuntime:
                 failure_reason = safe_runtime_failure_reason(
                     error, fallback="step execution failed"
                 )
+                if _is_optional_review_agent_step(step, agent):
+                    return await self._complete_skipped_optional_review_step(
+                        context,
+                        step,
+                        agent,
+                        attempt_sources,
+                        failure_reason,
+                        event,
+                        checkpoint_boundary,
+                        usage_boundary,
+                        model_ledger,
+                        retries,
+                        run_state,
+                    )
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,
@@ -2259,6 +2388,136 @@ class CrewDispatchRuntime:
                     payload=runtime_failure_diagnostic_from_reason(failure_reason),
                 )
                 _fail(failure_reason)
+
+    async def _complete_skipped_optional_review_step(
+        self,
+        context: TaskContext,
+        step: DispatchStep,
+        agent: AgentSpec,
+        sources: tuple[Artifact, ...],
+        failure_reason: str,
+        emit: EventEmitter,
+        checkpoint_boundary: CheckpointBoundary,
+        usage_boundary: UsageBoundary,
+        model_ledger: _ModelLedger,
+        retries: int,
+        run_state: _RunState,
+    ) -> _StepResult:
+        fallback_text = _optional_review_fallback_text(step, agent, sources, failure_reason)
+        completion = GatewayCompletion(
+            response=ModelResponse(text=fallback_text, usage=TokenUsage(0, 0, 0)),
+            deployment_id="skipped-optional-review",
+            logical_model=agent.logical_model,
+            provider_id="internal",
+            provider_model="internal/optional-review-step-fallback",
+            cost_usd=Decimal(0),
+        )
+        diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
+        matching_states = [
+            (key, state)
+            for key, state in model_ledger.states.items()
+            if state.get("step_id") == step.id
+            and state.get("attempt") == retries
+            and state.get("purpose") == "step"
+            and state.get("actor") == agent.id
+            and state.get("status") in {"prepared", "running"}
+        ]
+        if matching_states:
+            key, existing_state = min(
+                matching_states,
+                key=lambda item: cast(int, item[1].get("call_index")),
+            )
+            call_index = cast(int, existing_state["call_index"])
+            request_sha256 = cast(str, existing_state["request_sha256"])
+        else:
+            call_index = 0
+            key = self._model_call_key(
+                context.run_id,
+                step.id,
+                retries,
+                "step",
+                agent.id,
+                call_index,
+            )
+            request_sha256 = hashlib.sha256(
+                f"{context.run_id}:{step.id}:{agent.id}:optional-review-skipped".encode()
+            ).hexdigest()
+        model_artifact = self._model_artifact(
+            completion,
+            agent.id,
+            self._ordered_artifacts(sources),
+        )
+        succeeded: Mapping[str, JsonValue] = {
+            "status": "succeeded",
+            "step_id": step.id,
+            "attempt": retries,
+            "purpose": "step",
+            "actor": agent.id,
+            "call_index": call_index,
+            "request_sha256": request_sha256,
+            "artifact_id": str(model_artifact.id),
+            "sha256": model_artifact.content_sha256,
+            "provenance": {
+                "logical_model": completion.logical_model,
+                "deployment_id": completion.deployment_id,
+                "provider_id": completion.provider_id,
+                "provider_model": completion.provider_model,
+            },
+        }
+        await self._run_commit(
+            usage_boundary(
+                completion,
+                step.agent,
+                step.id,
+                key,
+                succeeded,
+                model_artifact,
+            ),
+            run_state,
+        )
+        artifact = self._artifact(
+            step,
+            completion,
+            self._ordered_artifacts((*sources, model_artifact)),
+            version=retries + 1,
+        )
+        await emit(
+            kind=EventKind.ARTIFACT_CREATED,
+            artifact=artifact,
+            actor=step.agent,
+            message=f"{agent.role} 模型失败，已跳过审查并沿用上游产物。",
+            payload={
+                "role": agent.role,
+                "task": step.task,
+                "logical_model": completion.logical_model,
+                "artifact_id": str(artifact.id),
+                "output": _artifact_text_preview(artifact) or "审查步骤已跳过。",
+                "review_status": "skipped",
+                "fallback_policy": "skip_optional_review_step",
+                "warning": failure_reason,
+                **diagnostic,
+            },
+        )
+        await emit(
+            kind=EventKind.STEP_COMPLETED,
+            step_id=step.id,
+            actor=step.agent,
+            inputs=(artifact,),
+            payload={
+                "attempts": retries + 1,
+                "task": step.task,
+                "role": agent.role,
+                "logical_model": completion.logical_model,
+                "artifact_id": str(artifact.id),
+                "output": _artifact_text_preview(artifact) or "optional review step skipped",
+                "review_status": "skipped",
+                "fallback_policy": "skip_optional_review_step",
+                "warning": failure_reason,
+                **diagnostic,
+            },
+        )
+        await checkpoint_boundary(step.id, retries)
+        return _StepResult(step=step, artifact=artifact, retries=retries)
 
     async def _complete_agent(
         self,

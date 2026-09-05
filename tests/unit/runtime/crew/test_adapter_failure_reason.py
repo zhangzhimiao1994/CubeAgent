@@ -22,6 +22,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _normalize_tool_call_arguments,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -87,6 +88,30 @@ class EmptyThenSuccessGateway:
         text = "" if self.calls == 1 else "recovered answer"
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class FailingReviewerStepGateway:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls.append(request.logical_model)
+        if request.logical_model == "deepseek-mutil":
+            raise RuntimeExecutionError(
+                "model gateway failed: model transport failed "
+                "(logical_models=deepseek-mutil; deployments=deepseek-mutil_1)"
+            )
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=f"{request.logical_model} usable output",
+                usage=TokenUsage(1, 1, 2),
+            ),
             deployment_id="primary",
             logical_model=request.logical_model,
             provider_id="deepseek",
@@ -429,7 +454,7 @@ class MultimediaCapabilities:
 class DirectMultimediaCapabilities(MultimediaCapabilities):
     async def default_logical_model_for_multimedia(self, *, tenant_id: UUID, kind: str) -> str:
         assert tenant_id == TENANT_ID
-        assert kind == "image"
+        assert kind in {"image", "video", "audio"}
         return "media_primary"
 
 
@@ -519,6 +544,51 @@ def _reviewed_plan_with_retry_budget(reviewer_retries: int = 1) -> DispatchPlan:
             ),
         ),
         total_token_budget=200,
+    )
+
+
+def _optional_reviewer_step_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(
+                id="quality_reviewer",
+                role="质量审查员",
+                goal="Review upstream answer quality",
+                logical_model="deepseek-mutil",
+            ),
+            AgentSpec(
+                id="final_writer",
+                role="final writer",
+                goal="Return final answer",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="draft",
+                agent="writer",
+                task="Draft an answer",
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="quality_reviewer_step",
+                agent="quality_reviewer",
+                task="Review the draft and provide quality notes",
+                depends_on=("draft",),
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final",
+                agent="final_writer",
+                task="Return final answer using available upstream artifacts",
+                depends_on=("quality_reviewer_step",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=300,
+        total_timeout_seconds=300,
     )
 
 
@@ -664,6 +734,41 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     assert completed.payload["logical_model"] == "media_primary"
 
 
+@pytest.mark.parametrize(
+    ("task_text", "expected_kind"),
+    [
+        ("给我做一张图片版设定板。", "image"),
+        ("出一张赛博朋克产品概念图。", "image"),
+        ("生成三张可下载表情包贴纸。", "image"),
+        ("做一张商品 3D 渲染图。", "image"),
+        ("把这个故事做成 8 秒动画短片成片。", "video"),
+        ("为这段开场白合成一段旁白配音。", "audio"),
+        ("给品牌发布会做一段 BGM 背景音乐。", "audio"),
+    ],
+)
+async def test_multimedia_generator_direct_kind_inference_covers_business_media_terms(
+    task_text: str,
+    expected_kind: str,
+) -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(request=task_text))]
+
+    assert events
+    assert capabilities.calls[0][2]["kind"] == expected_kind
+
+
 async def test_multimedia_legacy_prompt_tool_argument_is_normalized_before_evidence() -> None:
     capabilities = MultimediaCapabilities()
     runtime = CrewDispatchRuntime(
@@ -722,6 +827,21 @@ async def test_multimedia_mixed_prompt_fields_drop_legacy_prompt_before_evidence
             },
         )
     ]
+
+
+def test_multimedia_empty_generation_prompt_falls_back_to_legacy_prompt_without_sensitive_key() -> None:
+    arguments = _normalize_tool_call_arguments(
+        "generate_multimedia",
+        {
+            "kind": "image",
+            "logical_model": "media_primary",
+            "generation_prompt": " ",
+            "prompt": "生成一张赛博朋克风格海报",
+        },
+    )
+
+    assert "prompt" not in arguments
+    assert arguments["generation_prompt"] == "生成一张赛博朋克风格海报"
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:
@@ -838,6 +958,43 @@ async def test_dispatch_step_empty_model_response_retries_before_failing() -> No
     assert retry.reason == "model returned empty response; retrying with explicit output request"
     assert retry.payload["strategy"] == "empty_response_retry"
     assert retry.payload["error_code"] == "model.empty_response"
+
+
+async def test_optional_reviewer_agent_step_model_failure_is_skipped_with_model_context() -> None:
+    gateway = FailingReviewerStepGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _optional_reviewer_step_plan(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert "deepseek-mutil" in gateway.calls
+    skipped = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_COMPLETED and event.actor == "quality_reviewer"
+    )
+    assert skipped.payload["review_status"] == "skipped"
+    assert skipped.payload["fallback_policy"] == "skip_optional_review_step"
+    assert skipped.payload["error_code"] == "model.provider_transport_failed"
+    assert skipped.payload["logical_models"] == "deepseek-mutil"
+    assert skipped.payload["deployments"] == "deepseek-mutil_1"
+    created = next(
+        event
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.actor == "quality_reviewer"
+        and event.artifact is not None
+        and event.artifact.type == "text"
+    )
+    artifact = created.artifact
+    assert artifact is not None
+    assert artifact.provenance is not None
+    assert artifact.provenance.deployment_id == "skipped-optional-review"
+    assert "general usable output" in cast(str, artifact.content["text"])
 
 
 async def test_dispatch_step_retry_is_suppressed_when_runtime_budget_is_exhausted() -> None:

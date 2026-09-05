@@ -1948,6 +1948,7 @@ function RunProcessSummary({
   mainAgentModelName?: string;
 }) {
   const workItems = buildAgentWorkItems(detail, agentNames, mainAgentModelName);
+  const milestoneItems = runMilestones(detail, workItems);
   const highlightedIds = new Set<string>();
   const outputHighlights = [
     ...workItems.flatMap((item) => item.outputs.map((output) => ({ ...output, agentId: item.id }))),
@@ -1987,6 +1988,13 @@ function RunProcessSummary({
         <small>
           {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
         </small>
+      </div>
+      <div className="run-milestones" aria-label="本轮里程碑">
+        {milestoneItems.map((item) => (
+          <span key={item.label} className={`run-milestone run-milestone-${item.state}`}>
+            {item.label}
+          </span>
+        ))}
       </div>
       <div className="agent-cluster-actions">
         {highlights.map((item, index) => (
@@ -2029,6 +2037,38 @@ function RunProcessSummary({
       </div>
     </section>
   );
+}
+
+function runMilestones(
+  detail: RunDetail,
+  workItems: AgentWorkItem[],
+): { label: string; state: "done" | "active" | "pending" | "failed" }[] {
+  const eventKinds = new Set(detail.events.map((event) => event.kind));
+  const hasAgentActivity =
+    workItems.length > 0 ||
+    detail.events.some((event) =>
+      Boolean(event.actor || event.step_id || event.kind.startsWith("dispatch.") || event.kind.startsWith("model.")),
+    );
+  const hasOutput = detail.events.some((event) =>
+    ["artifact.created", "message.created", "tool.completed", "step.completed"].includes(event.kind),
+  );
+  const isTerminal = TERMINAL_STATUSES.has(detail.status);
+  const failed = detail.status === "failed" || eventKinds.has("runtime.failed");
+  return [
+    { label: "接收", state: "done" as const },
+    {
+      label: "执行",
+      state: hasAgentActivity ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
+    },
+    {
+      label: "产物",
+      state: hasOutput ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
+    },
+    {
+      label: failed ? "失败" : isTerminal ? "完成" : "运行中",
+      state: failed ? ("failed" as const) : isTerminal ? ("done" as const) : ("active" as const),
+    },
+  ];
 }
 
 function HermesMemorySummaryRow({
@@ -2796,6 +2836,7 @@ export function RunsPage() {
     proposal: OpenClawProposal;
     createdOperationId: string | null;
   } | null>(null);
+  const chatStreamRef = useRef<HTMLDivElement | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -3557,13 +3598,6 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
-  const mobileModuleModeLabel =
-    mode === "auto"
-      ? "自动 · 主 Agent 判断"
-      : mode === "direct"
-        ? `直连 · ${directModelName}`
-        : `${displayMode(mode)} · 本会话倾向`;
-  const mobileModuleConversationLabel = conversationId.trim().slice(0, 12) || "新会话";
   const refreshedRunForProcessDetail = processDetailTarget
     ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
       (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
@@ -3626,6 +3660,12 @@ export function RunsPage() {
     bulkDeleteRuns.mutate(selectedDeletableConversationIds);
   }
 
+  function scrollChatToLatest() {
+    const stream = chatStreamRef.current;
+    if (!stream) return;
+    stream.scrollTo({ top: stream.scrollHeight, behavior: "smooth" });
+  }
+
   return (
     <section className="chat-page">
       <p className="eyebrow">Conversation</p>
@@ -3641,14 +3681,10 @@ export function RunsPage() {
       </div>
 
       <div className="chat-mobile-module-strip" aria-label="聊天模块基本信息">
-        <div className="chat-mobile-module-title">
-          <span>当前模块</span>
-          <strong>对话</strong>
-        </div>
-        <div className="chat-mobile-module-meta">
-          <span>{mobileModuleModeLabel}</span>
-          <small>会话：{mobileModuleConversationLabel}</small>
-        </div>
+        <p className="chat-mobile-conversation-id">
+          <span>conversation_id</span>
+          <strong>{conversationId}</strong>
+        </p>
         <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
           新建
         </button>
@@ -3799,7 +3835,7 @@ export function RunsPage() {
 
         <div className="chat-panel">
 
-          <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
+          <div ref={chatStreamRef} className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
             {selectedRun.isError ? <p role="alert">{formatApiError(selectedRun.error, "会话加载失败")}</p> : null}
             {activeConversation.isLoading ? <p>正在读取当前会话...</p> : null}
@@ -3920,6 +3956,9 @@ export function RunsPage() {
               );
             })}
           </div>
+          <button type="button" className="chat-jump-latest" aria-label="跳到最新消息" onClick={scrollChatToLatest}>
+            最新
+          </button>
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
               target={refreshedProcessDetailTarget}
@@ -4137,7 +4176,8 @@ export function RunsPage() {
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入消息，继续当前对话。例如：这个方案继续往更玄幻一点改。"
+              placeholder="输入消息..."
+              rows={1}
               required
             />
             <div className="composer-actions">

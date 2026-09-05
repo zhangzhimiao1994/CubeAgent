@@ -593,6 +593,95 @@ async def test_selected_dispatch_agents_do_not_hide_required_multimedia_generati
     )
 
 
+@pytest.mark.parametrize(
+    "task_text",
+    [
+        "请混合完成方案，最后直接生成一张图片版设定板。",
+        "先让文案规划，再调用多媒体模型生成短视频成片。",
+        "给发布会方案合成一段旁白配音作为最终产物。",
+    ],
+)
+@pytest.mark.asyncio
+async def test_selected_hybrid_agents_do_not_hide_required_multimedia_generation_role(
+    monkeypatch: pytest.MonkeyPatch,
+    task_text: str,
+) -> None:
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft campaign copy.",
+                        "model": "creative",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    async for _event in runtime.run(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.HYBRID,
+            request=task_text,
+            routing_decision={
+                "selected_agent_ids": ("copywriter",),
+                "main_agent_model": "main",
+            },
+        )
+    ):
+        pass
+
+    hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[0])
+    dispatch_plan = hybrid.dispatch._plan
+
+    assert {agent.id for agent in dispatch_plan.agents} >= {"copywriter", "multimedia_generator"}
+    media_step = next(step for step in dispatch_plan.steps if step.agent == "multimedia_generator")
+    assert media_step.tools == ("read_context", "generate_multimedia")
+
+
 @pytest.mark.asyncio
 async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,

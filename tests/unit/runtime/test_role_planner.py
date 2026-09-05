@@ -260,6 +260,16 @@ def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -
         "请派单完成宣传方案，最终结果要给我一张海报和一段短视频。",
         "先讨论脚本方向，中间产物需要生成一张封面图用于确认风格。",
         "混合执行：文案先出提示词，然后调用多媒体模型生成成片。",
+        "给这个修仙世界女主角做一张角色设定板，最终要可下载图片。",
+        "出一张赛博朋克产品概念图，作为后续海报主视觉。",
+        "把这个故事做成 8 秒动画短片成片。",
+        "为这段开场白合成一段旁白配音。",
+        "给品牌发布会做一段 BGM 背景音乐。",
+        "生成三张可下载表情包贴纸。",
+        "做一张商品 3D 渲染图。",
+        "输出一张分镜图和一段口播音频。",
+        "不要让我去 Midjourney，直接调用系统里的多媒体模型生成图片。",
+        "不用外部工具，直接给我生成一张图片版设定板。",
     ),
 )
 def test_multimedia_generation_dispatch_covers_final_and_intermediate_media_artifacts(task: str) -> None:
@@ -282,6 +292,30 @@ def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None
     plan = RolePlanner().plan(
         RolePlanningRequest(
             task="请做一个产品发布方案，分析是否需要图片、视频或语音素材，但暂不生成视频。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" not in role_ids
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        "What is image generation?",
+        "Explain video generation concepts.",
+        "什么是图片生成？",
+        "解释一下文生图的基本原理。",
+    ),
+)
+def test_multimedia_generator_is_not_selected_for_explanation_requests(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
             mode=TaskMode.DISPATCH,
             profile=TaskProfile.GENERAL,
             default_model="general-model",

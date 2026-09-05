@@ -18,6 +18,7 @@ _COMMANDS = {
 }
 _DIRECT = re.compile(
     r"^(what|who|when|where|define|explain|calculate|compute|check status|search for|find)\b|"
+    r"^(什么是|解释|介绍|定义|说明一下|帮我解释)|"
     r"^(hi|hello|thanks|thank you)[.!? ]*$",
     re.IGNORECASE,
 )
@@ -29,6 +30,140 @@ _DISCUSS = re.compile(
     r"\b(multiple|several|different)\s+agents?\s+(debate|discuss)|"
     r"\bdebate\s+(this|the)|\breach\s+(a\s+)?consensus\b",
     re.IGNORECASE,
+)
+_MULTIMEDIA_GENERATION_TERMS = (
+    "generate image",
+    "generate an image",
+    "generate a picture",
+    "generate video",
+    "generate a video",
+    "generate audio",
+    "generate speech",
+    "generate music",
+    "create image",
+    "create an image",
+    "create video",
+    "make an image",
+    "make a video",
+    "make music",
+    "render image",
+    "text-to-image",
+    "text to image",
+    "text-to-video",
+    "text to video",
+    "text-to-speech",
+    "text to speech",
+    "生成图片",
+    "生成一张图",
+    "生成一张图片",
+    "生成图像",
+    "生成照片",
+    "生成视频",
+    "生成短视频",
+    "生成音频",
+    "生成语音",
+    "生成配音",
+    "生成旁白",
+    "生成音乐",
+    "合成音频",
+    "合成语音",
+    "合成配音",
+    "合成旁白",
+    "制作视频",
+    "制作短视频",
+    "做一张图",
+    "做一张图片",
+    "做一张海报",
+    "做一张封面",
+    "做一张设定板",
+    "做一张概念图",
+    "做一段 bgm",
+    "做一段bgm",
+    "做一段背景音乐",
+    "做成动画",
+    "做成短片",
+    "做成成片",
+    "出一张图",
+    "出一张图片",
+    "出一张海报",
+    "出一张概念图",
+    "画一张图",
+    "画一张图片",
+    "绘制图片",
+    "渲染图",
+    "文生图",
+    "文生视频",
+    "文生语音",
+)
+_MULTIMEDIA_MEDIA_TERMS = (
+    "image",
+    "picture",
+    "photo",
+    "poster",
+    "cover",
+    "concept art",
+    "storyboard",
+    "sticker",
+    "render",
+    "rendering",
+    "video",
+    "animation",
+    "short film",
+    "clip",
+    "audio",
+    "speech",
+    "voiceover",
+    "voice-over",
+    "narration",
+    "music",
+    "bgm",
+    "图片",
+    "图像",
+    "照片",
+    "海报",
+    "封面",
+    "概念图",
+    "设定图",
+    "设定板",
+    "图片版",
+    "分镜图",
+    "分镜",
+    "表情包",
+    "贴纸",
+    "渲染图",
+    "视频",
+    "短视频",
+    "动画",
+    "短片",
+    "成片",
+    "音频",
+    "语音",
+    "配音",
+    "旁白",
+    "音乐",
+    "背景音乐",
+)
+_MULTIMEDIA_GENERATION_NEGATIONS = (
+    "暂不生成",
+    "不要生成",
+    "不用生成",
+    "无需生成",
+    "不需要生成",
+    "不生成",
+    "只写提示词",
+    "只生成提示词",
+    "只给提示词",
+    "仅写提示词",
+    "仅生成提示词",
+    "仅分析",
+    "只分析",
+    "do not generate",
+    "don't generate",
+    "dont generate",
+    "not generate",
+    "no need to generate",
+    "prompt only",
+    "analysis only",
 )
 
 
@@ -332,6 +467,8 @@ def assess_rules(task_text: str, *, risk_policy: RiskRulePolicy | None = None) -
         TaskMode.DISPATCH: _DISPATCH.search(task_text) is not None,
         TaskMode.DISCUSS: _DISCUSS.search(task_text) is not None,
     }
+    if _is_multimedia_generation_request(task_text):
+        signals[TaskMode.DISPATCH] = True
     matched = tuple(mode for mode, present in signals.items() if present)
     risk = RiskLevel.HIGH if high_risk else RiskLevel.LOW
     if high_risk:
@@ -339,5 +476,94 @@ def assess_rules(task_text: str, *, risk_policy: RiskRulePolicy | None = None) -
     if len(matched) > 1:
         return RuleResult(None, "conflicting_deterministic_rules", risk, False, True)
     if len(matched) == 1:
-        return RuleResult(matched[0], "deterministic_rule", risk, False)
+        reason = (
+            "multimedia_generation_rule"
+            if matched[0] is TaskMode.DISPATCH and _is_multimedia_generation_request(task_text)
+            else "deterministic_rule"
+        )
+        return RuleResult(matched[0], reason, risk, False)
     return RuleResult(None, None, risk, False)
+
+
+def _is_multimedia_generation_request(task_text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task_text).casefold()
+    if any(term in normalized for term in _MULTIMEDIA_GENERATION_NEGATIONS):
+        return False
+    if _looks_like_multimedia_explanation(normalized):
+        return False
+    if any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS):
+        return True
+    if not any(term in normalized for term in _MULTIMEDIA_MEDIA_TERMS):
+        return False
+    return any(
+        action in normalized
+        for action in (
+            "generate",
+            "create",
+            "make",
+            "produce",
+            "render",
+            "deliver",
+            "output",
+            "生成",
+            "创建",
+            "制作",
+            "做",
+            "出",
+            "画",
+            "绘制",
+            "渲染",
+            "合成",
+            "交付",
+            "产出",
+            "输出",
+            "给我",
+        )
+    )
+
+
+def _looks_like_multimedia_explanation(normalized: str) -> bool:
+    explanation_prefixes = (
+        "what is",
+        "what are",
+        "explain",
+        "define",
+        "什么是",
+        "啥是",
+        "解释",
+        "介绍",
+        "定义",
+        "说明一下",
+        "帮我解释",
+    )
+    if not normalized.strip().startswith(explanation_prefixes):
+        return False
+    explicit_delivery = (
+        "generate an",
+        "generate a",
+        "create an",
+        "create a",
+        "make an",
+        "make a",
+        "directly generate",
+        "生成一张",
+        "生成一个",
+        "生成一段",
+        "直接生成",
+        "做一张",
+        "做一个",
+        "做一段",
+        "出一张",
+        "画一张",
+        "绘制",
+        "渲染",
+        "合成",
+        "可下载",
+        "最终结果",
+        "交付",
+        "产出",
+        "输出",
+        "调用系统",
+        "调用多媒体",
+    )
+    return not any(term in normalized for term in explicit_delivery)

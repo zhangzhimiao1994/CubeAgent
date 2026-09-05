@@ -239,6 +239,41 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
     assert primary.calls == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请生成一张修仙世界女主角照片。",
+        "给我做一张图片版设定板。",
+        "出一张赛博朋克产品概念图。",
+        "生成一段 8 秒动画短片。",
+        "为开场白合成一段旁白配音。",
+        "给发布会做一段 BGM 背景音乐。",
+    ],
+)
+async def test_multimedia_generation_auto_routes_to_dispatch_without_classifier(text: str) -> None:
+    primary = FakeClassifier(assessment(TaskMode.DIRECT))
+    result = await router(primary).route(text)
+    assert result.mode is TaskMode.DISPATCH
+    assert result.assessments[0].reason == "multimedia_generation_rule"
+    assert primary.calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What is image generation?",
+        "Explain video generation concepts.",
+        "什么是图片生成？",
+        "解释一下文生图的基本原理。",
+    ],
+)
+async def test_multimedia_explanation_requests_still_route_to_direct(text: str) -> None:
+    primary = FakeClassifier(RuntimeError("must not run"))
+    result = await router(primary).route(text)
+    assert result.mode is TaskMode.DIRECT
+    assert primary.calls == []
+
+
 async def test_conflicting_or_high_risk_rules_ask_user() -> None:
     conflict = await router().route("Run the fixed workflow and have multiple agents debate it")
     risky = await router().route("Delete the production database")
