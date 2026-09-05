@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
+from xml.etree import ElementTree
 
 from agent_hub.runtime.contracts import Artifact
 
 _MAX_TEXT_ATTACHMENT_BYTES = 24_000
 _MAX_ARCHIVE_FILES = 80
+_MAX_OFFICE_ATTACHMENT_CHARS = 12_000
 _TEXT_CONTENT_TYPES = (
     "text/",
     "application/json",
@@ -21,6 +24,13 @@ _TEXT_CONTENT_TYPES = (
     "application/typescript",
     "application/x-python-code",
 )
+_DOCX_CONTENT_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+}
+_PPTX_CONTENT_TYPES = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
 
 
 class FileSystemAttachmentArtifactLoader:
@@ -99,6 +109,18 @@ def _attachment_text(
         content = _read_text_attachment(tenant_dir / f"{attachment_id}.bin")
         if content:
             lines.extend(("文本内容：", content))
+    elif _is_docx_attachment(filename, content_type):
+        content = _read_docx_attachment(tenant_dir / f"{attachment_id}.bin")
+        if content:
+            lines.extend(("Office 文档正文：", content))
+        else:
+            lines.append("内容摘要：Word 文档正文解析失败；当前只注入文件元数据。")
+    elif _is_pptx_attachment(filename, content_type):
+        content = _read_pptx_attachment(tenant_dir / f"{attachment_id}.bin")
+        if content:
+            lines.extend(("Office 演示正文：", content))
+        else:
+            lines.append("内容摘要：PPT 文档正文解析失败；当前只注入文件元数据。")
     else:
         lines.append("内容摘要：该附件是非文本或二进制文件，当前只注入文件元数据；需要视觉/多模态模型时由后续链路处理。")
 
@@ -142,6 +164,57 @@ def _read_text_attachment(path: Path) -> str:
     return text
 
 
+def _read_docx_attachment(path: Path) -> str:
+    return _read_openxml_text(path, xml_paths=("word/document.xml",))
+
+
+def _read_pptx_attachment(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_paths = sorted(
+                name
+                for name in archive.namelist()
+                if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            )
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    return _read_openxml_text(path, xml_paths=tuple(slide_paths))
+
+
+def _read_openxml_text(path: Path, *, xml_paths: tuple[str, ...]) -> str:
+    fragments: list[str] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for xml_path in xml_paths:
+                try:
+                    body = archive.read(xml_path)
+                except KeyError:
+                    continue
+                fragments.extend(_extract_xml_text(body))
+                if sum(len(fragment) for fragment in fragments) >= _MAX_OFFICE_ATTACHMENT_CHARS:
+                    break
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    text = "\n".join(fragment for fragment in fragments if fragment).strip()
+    if len(text) > _MAX_OFFICE_ATTACHMENT_CHARS:
+        text = f"{text[:_MAX_OFFICE_ATTACHMENT_CHARS]}\n[Office 文档正文已截断，仅保留前 {_MAX_OFFICE_ATTACHMENT_CHARS} 字符]"
+    return text
+
+
+def _extract_xml_text(body: bytes) -> list[str]:
+    try:
+        root = ElementTree.fromstring(body)
+    except ElementTree.ParseError:
+        return []
+    fragments: list[str] = []
+    for element in root.iter():
+        if not element.tag.endswith("}t") and not element.tag.endswith("}instrText"):
+            continue
+        if element.text and element.text.strip():
+            fragments.append(element.text.strip())
+    return fragments
+
+
 def _read_json(path: Path) -> dict[str, object] | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -165,3 +238,21 @@ def _expired(value: object) -> bool:
 def _is_textual_content_type(content_type: str) -> bool:
     normalized = content_type.split(";", 1)[0].strip().lower()
     return any(normalized.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES)
+
+
+def _normalized_content_type(content_type: str) -> str:
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _is_docx_attachment(filename: str, content_type: str) -> bool:
+    return (
+        _normalized_content_type(content_type) in _DOCX_CONTENT_TYPES
+        or filename.lower().endswith(".docx")
+    )
+
+
+def _is_pptx_attachment(filename: str, content_type: str) -> bool:
+    return (
+        _normalized_content_type(content_type) in _PPTX_CONTENT_TYPES
+        or filename.lower().endswith(".pptx")
+    )

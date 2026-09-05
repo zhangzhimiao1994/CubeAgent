@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -93,3 +94,80 @@ async def test_attachment_loader_includes_archive_manifest_without_raw_binary(tm
     assert "src/main.py" in text
     assert "README.md" in text
     assert "PK" not in text
+
+
+@pytest.mark.asyncio
+async def test_attachment_loader_extracts_docx_body_text(tmp_path: Path) -> None:
+    tenant_dir = tmp_path / str(TENANT_ID)
+    tenant_dir.mkdir()
+    attachment_id = "att_33333333333333333333333333333333"
+    expires_at = datetime.now(UTC) + timedelta(days=1)
+    (tenant_dir / f"{attachment_id}.json").write_text(
+        json.dumps(
+            {
+                "id": attachment_id,
+                "filename": "需求说明.docx",
+                "kind": "context",
+                "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "size_bytes": 2048,
+                "sha256": "ghi",
+                "expires_at": expires_at.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with zipfile.ZipFile(tenant_dir / f"{attachment_id}.bin", "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                "<w:body><w:p><w:r><w:t>请生成项目方案</w:t></w:r></w:p>"
+                "<w:p><w:r><w:t>必须包含测试计划</w:t></w:r></w:p></w:body></w:document>"
+            ),
+        )
+
+    artifacts = await FileSystemAttachmentArtifactLoader(tmp_path)(
+        tenant_id=TENANT_ID,
+        attachment_ids=(attachment_id,),
+    )
+
+    assert len(artifacts) == 1
+    text = str(artifacts[0].content["text"])
+    assert "Office 文档正文" in text
+    assert "请生成项目方案" in text
+    assert "必须包含测试计划" in text
+    assert "当前只注入文件元数据" not in text
+
+
+@pytest.mark.asyncio
+async def test_attachment_loader_reports_docx_parse_failure_without_crashing(tmp_path: Path) -> None:
+    tenant_dir = tmp_path / str(TENANT_ID)
+    tenant_dir.mkdir()
+    attachment_id = "att_44444444444444444444444444444444"
+    expires_at = datetime.now(UTC) + timedelta(days=1)
+    (tenant_dir / f"{attachment_id}.json").write_text(
+        json.dumps(
+            {
+                "id": attachment_id,
+                "filename": "坏文件.docx",
+                "kind": "context",
+                "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "size_bytes": 10,
+                "sha256": "bad",
+                "expires_at": expires_at.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tenant_dir / f"{attachment_id}.bin").write_bytes(b"not-a-docx")
+
+    artifacts = await FileSystemAttachmentArtifactLoader(tmp_path)(
+        tenant_id=TENANT_ID,
+        attachment_ids=(attachment_id,),
+    )
+
+    assert len(artifacts) == 1
+    text = str(artifacts[0].content["text"])
+    assert "Word 文档正文解析失败" in text
+    assert "文件名：坏文件.docx" in text
