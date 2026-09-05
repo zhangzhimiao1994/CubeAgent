@@ -119,7 +119,16 @@ class WebsocketBridgeClient:
 def envelope_from_cloud(data: dict[str, Any]) -> Envelope:
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
     merged = dict(payload)
-    for key in ("text", "state", "message", "device_id", "session_id"):
+    for key in (
+        "text",
+        "state",
+        "message",
+        "device_id",
+        "session_id",
+        "audio",
+        "format",
+        "mime_type",
+    ):
         if key in data and key not in merged:
             merged[key] = data[key]
     turn_id = data.get("turn_id")

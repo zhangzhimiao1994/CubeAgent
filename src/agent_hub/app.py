@@ -108,6 +108,8 @@ from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVide
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.robot.tokens import DeviceTokenService
+from agent_hub.robot.voice.factory import build_robot_voice
+from agent_hub.robot.voice.gateway import RobotVoiceGateway
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (
@@ -794,6 +796,7 @@ def create_app(
     redis_factory: Callable[[str], RedisResource] = Redis.from_url,
     robot_device_tokens: DeviceTokenService | None = None,
     robot_submitter: RunServiceInboundSubmitter | None = None,
+    robot_voice: RobotVoiceGateway | None = None,
 ) -> FastAPI:
     """Create an application without opening network resources at import time."""
 
@@ -1113,6 +1116,7 @@ def create_app(
     application.state.multimedia_generation_executor = None
     application.state.robot_device_tokens = robot_device_tokens
     application.state.robot_submitter = robot_submitter
+    application.state.robot_voice = robot_voice
     _bind_robot_channel(application, configured_settings)
 
     async def refresh_channel_runtime_config(runtime_config: Mapping[str, str]) -> None:
@@ -1194,6 +1198,8 @@ def _bind_robot_channel(application: FastAPI, configured: Settings) -> None:
         application.state.robot_device_tokens = DeviceTokenService(
             configured.jwt_signing_key_value()
         )
+    if getattr(application.state, "robot_voice", None) is None:
+        application.state.robot_voice = build_robot_voice(configured)
     if getattr(application.state, "robot_submitter", None) is not None:
         return
     run_service = getattr(application.state, "run_service", None)

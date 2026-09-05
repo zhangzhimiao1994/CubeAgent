@@ -16,9 +16,10 @@
 ## 开箱路径
 
 1. **部署 CubeAgent**（服务器上 `install.sh` 或现有生产指针 `/opt/agent-hub/current`）
-2. **注册设备**，拿到 `device_token`
-3. **树莓派 firstboot**，指向 `wss://YOUR_HOST/api/robot/v1/ws`
-4. **对着麦克风说话**（接好真实声卡后）；云端主 Agent + 记忆回复文本
+2. **配置云端 STT/TTS 凭证**（`AGENT_HUB_ROBOT_STT_*` / `AGENT_HUB_ROBOT_TTS_*`，见 `docs/architecture.md`）。未配置时仍可用文本调试回合。
+3. **注册设备**，拿到 `device_token`
+4. **树莓派 firstboot**，指向 `wss://YOUR_HOST/api/robot/v1/ws`
+5. **对着麦克风说话**（接好真实声卡后）；云端 STT → 主 Agent + 记忆 → TTS 播报
 
 ---
 
@@ -39,7 +40,7 @@
 - 后端公网或局域网地址，且派能访问，例如：`https://agent.example.com`
 - 后端已开启 WebSocket：`wss://agent.example.com/api/robot/v1/ws`
 
-派负责采集/播放与回合；CubeAgent 复用 RunService、记忆注入和控制台模型池。不要在派上装 DeepSeek 或本地大模型。
+派负责采集/播放与回合；CubeAgent 复用 RunService、记忆注入、控制台模型池，以及云端 STT/TTS。不要在派上装 DeepSeek、本地大模型或端上 ASR/TTS。
 
 ---
 
@@ -157,9 +158,9 @@ arecord -D hw:1,0 -f S16_LE -r 16000 -c 1 /tmp/test.wav
 aplay /tmp/test.wav
 ```
 
-当前 `robot_runtime` 里的采集/播放默认是占位实现（Null）。要「开箱出声」，还需要在派上接好 ALSA 设备并把 `audio/capture.py`、`audio/playback.py` 换成真实驱动（后续迭代）。
+当前 `robot_runtime` 里的采集/播放默认是占位实现（Null）。协议已会把 PCM 以 `audio_chunk` 发给云端，并把 `audio_delta` 送进播放队列。要「开箱出声」，还需要在派上接好 ALSA 设备并把 `audio/capture.py`、`audio/playback.py` 换成真实驱动（后续迭代）。若云端 TTS 下发的是 mp3，真实喇叭驱动需要按 `format` / `mime_type` 解码。
 
-在驱动接好之前，你可以用 CubeAgent HTTP/WS 先验证注册、握手和主 Agent 文本回合。
+在驱动接好之前，你可以用 CubeAgent HTTP/WS 先验证注册、握手、文本回合，以及（配置了 STT/TTS 后）音频转写与回推。
 
 ---
 
@@ -188,11 +189,11 @@ aplay /tmp/test.wav
 
 正常流程：
 
-1. 派采集人声 → 回合结束  
-2. 通过 WS 把转写发给 CubeAgent  
-3. 云端用主 Agent + 记忆 + 模型池生成回复  
-4. 派接收 `text_delta` / `final`（后续可播 TTS）  
-5. 说话时可打断（barge-in，云端取消进行中的 run）
+1. 派采集人声 → `audio_chunk` / `audio.end`  
+2. 云端 STT 转写后提交主 Agent  
+3. 云端用记忆 + 模型池生成回复  
+4. 派接收 `text_delta` / `final` 以及 `audio_delta` / `audio.final` 并播放  
+5. 说话时可打断（barge-in：停播，并取消进行中的 run 与 TTS）
 
 ---
 
@@ -226,7 +227,7 @@ sudo systemctl daemon-reload
 ## 11. 和后端的分工（别搞反）
 
 - **树莓派**：前端。只负责听、说、打断、联网。  
-- **CubeAgent**：大脑。RunService、记忆、模型池、流式文本。  
-- **不要**在派上装 DeepSeek/本地大模型来「陪聊」。
+- **CubeAgent**：大脑。STT/TTS、RunService、记忆、模型池、流式文本与音频。  
+- **不要**在派上装 DeepSeek/本地大模型/端上 ASR 来「陪聊」。
 
-后端 API Key 配在**服务器环境变量 / 控制台模型池**里，不要写进派的 SD 卡镜像，也不要提交 Git。
+后端 LLM 与 STT/TTS 的 API Key 配在**服务器环境变量 / 控制台模型池**里，不要写进派的 SD 卡镜像，也不要提交 Git。开箱前请在 CubeAgent 上设置 `AGENT_HUB_ROBOT_STT_*` 与 `AGENT_HUB_ROBOT_TTS_*`（见 `docs/architecture.md`）。

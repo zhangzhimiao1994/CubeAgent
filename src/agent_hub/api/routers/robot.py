@@ -10,6 +10,7 @@ from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.channels.submitter import RunServiceInboundSubmitter
 from agent_hub.robot.session import RobotChannelSession, RobotRunControl
 from agent_hub.robot.tokens import DeviceTokenService
+from agent_hub.robot.voice.gateway import RobotVoiceGateway
 
 
 class DeviceRegisterRequest(BaseModel):
@@ -82,6 +83,7 @@ def create_robot_router() -> APIRouter:
             await websocket.send_json({"type": "error", "message": "robot channel unavailable"})
             await websocket.close(code=1011)
             return
+        voice = getattr(websocket.app.state, "robot_voice", None)
         session = RobotChannelSession(
             websocket,
             device=device,
@@ -89,6 +91,7 @@ def create_robot_router() -> APIRouter:
             run_service=cast(RobotRunControl, run_service),
             tenant_id=tenant_id,
             tenant_external_id=str(tenant_id),
+            voice=voice if isinstance(voice, RobotVoiceGateway) else None,
         )
         await session.run()
 

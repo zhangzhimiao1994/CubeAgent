@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import uuid
 
@@ -77,7 +78,7 @@ class RobotRuntime:
                 payload={
                     "device_id": self.config.device_id,
                     "role": "frontend",
-                    "capabilities": ["vad", "barge_in", "pcm16"],
+                    "capabilities": ["vad", "barge_in", "pcm16", "audio_chunk"],
                 },
             )
         )
@@ -99,9 +100,13 @@ class RobotRuntime:
         if self.loop.state is LoopState.CAPTURING and self.session.turn_id:
             await self.bridge.send(
                 Envelope(
-                    type="utterance.audio",
+                    type="audio_chunk",
                     turn_id=self.session.turn_id,
-                    payload={"bytes": len(cleaned)},
+                    payload={
+                        "audio": base64.b64encode(cleaned).decode("ascii"),
+                        "format": "pcm16",
+                        "sample_rate_hz": self.config.sample_rate_hz,
+                    },
                 )
             )
         if (
@@ -121,20 +126,38 @@ class RobotRuntime:
             transcript = self.session.pending_transcript.strip()
             await self.bridge.send(
                 Envelope(
-                    type="final_transcript" if transcript else "utterance.end",
+                    type="audio.end",
                     turn_id=self.session.turn_id,
                     payload={
                         "route": self.router.choose().value,
                         "text": transcript,
                         "transcript": transcript,
+                        "format": "pcm16",
+                        "sample_rate_hz": self.config.sample_rate_hz,
                     },
                 )
             )
             self.session.pending_transcript = ""
 
     async def _on_cloud(self, envelope: Envelope) -> None:
-        if envelope.type in {"text_delta", "assistant.text", "final"}:
+        if envelope.type in {"text_delta", "assistant.text", "final", "audio_delta"}:
             self.loop.on_assistant_start()
-        if envelope.type in {"final", "cancelled", "error", "assistant.end"}:
+        if envelope.type in {"audio_delta", "assistant.audio"}:
+            audio = _decode_b64(envelope.payload.get("audio"))
+            if audio:
+                await self.playback.enqueue(audio)
+        if envelope.type in {"cancelled", "error", "assistant.end"}:
             self.loop.on_assistant_end()
             await self.playback.clear()
+        elif envelope.type in {"final", "audio.final"}:
+            self.loop.on_assistant_end()
+
+
+def _decode_b64(value: object) -> bytes | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        padded = value + "=" * ((4 - len(value) % 4) % 4)
+        return base64.b64decode(padded)
+    except Exception:
+        return None

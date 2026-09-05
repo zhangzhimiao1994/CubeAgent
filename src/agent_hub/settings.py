@@ -58,6 +58,16 @@ class Settings(BaseSettings):
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
     )
     bootstrap_tenant_name: str = Field(default="Default", min_length=1, max_length=200)
+    robot_stt_provider: str = Field(default="none")
+    robot_stt_api_key: SecretStr | None = None
+    robot_stt_base_url: str = "https://api.openai.com/v1"
+    robot_stt_model: str = "whisper-1"
+    robot_tts_provider: str = Field(default="none")
+    robot_tts_api_key: SecretStr | None = None
+    robot_tts_base_url: str = "https://api.openai.com/v1"
+    robot_tts_model: str = "tts-1"
+    robot_tts_voice: str = "alloy"
+    robot_tts_format: str = "mp3"
 
     @field_validator("jwt_signing_key", mode="after")
     @classmethod
