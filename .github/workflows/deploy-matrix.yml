@@ -26,5 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash deploy/native/install-packages.sh --detect tests/install/fixtures/os-release-${{ matrix.distro }}
-      - run: env AGENT_HUB_TEST=1 bash install.sh --mode auto --dry-run --yes
+      - run: |
+          root="$(mktemp -d)"
+          env AGENT_HUB_TEST=1 \
+            AGENT_HUB_INSTALL_ROOT="$root/opt" \
+            AGENT_HUB_STATE_DIR="$root/state" \
+            AGENT_HUB_CONFIG_DIR="$root/etc" \
+            AGENT_HUB_PUBLIC_URL="https://agent.example.test" \
+            bash install.sh --mode auto --dry-run --yes
 
