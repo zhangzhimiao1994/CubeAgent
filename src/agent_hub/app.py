@@ -483,10 +483,10 @@ class _ConfigBackedMultimediaGenerationExecutor:
         kind: MultimediaGenerationKind,
         prompt: str,
         candidates: tuple[Deployment, ...],
-    ) -> MultimediaGenerationResult | None:
+        ) -> MultimediaGenerationResult | None:
         for candidate in candidates:
-            provider, upstream_model = _deployment_provider_and_model(candidate)
-            if is_dashscope_multimedia_deployment(provider, upstream_model, candidate.api_base):
+            provider_name, upstream_model = _deployment_provider_and_model(candidate)
+            if is_dashscope_multimedia_deployment(provider_name, upstream_model, candidate.api_base):
                 api_key = await self._secret_service.resolve(self._tenant_id, candidate.secret_ref)
                 output_dir = self._media_store_dir / str(self._tenant_id)
                 if kind is MultimediaGenerationKind.IMAGE:
@@ -529,9 +529,9 @@ class _ConfigBackedMultimediaGenerationExecutor:
             return None
         selected: tuple[Deployment, TextToVideoProvider] | None = None
         for candidate in candidates:
-            provider = self._video_provider_router.provider_for(candidate)
-            if provider is not None:
-                selected = (candidate, provider)
+            video_provider = self._video_provider_router.provider_for(candidate)
+            if video_provider is not None:
+                selected = (candidate, video_provider)
                 break
         if selected is None:
             return None

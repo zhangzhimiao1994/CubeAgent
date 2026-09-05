@@ -2468,7 +2468,7 @@ def test_multimedia_generation_job_model_failure_returns_model_diagnostics() -> 
     payload = settings_response.json()
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
-    service = cast(InMemoryAdminResourceService, api.app.state.admin_resource_service)
+    service = cast(InMemoryAdminResourceService, cast(Any, api).app.state.admin_resource_service)
     model_id = uuid4()
     service.models[model_id] = ModelDeploymentResponse(
         id=model_id,
@@ -2491,7 +2491,7 @@ def test_multimedia_generation_job_model_failure_returns_model_diagnostics() -> 
         effective_slots=1,
         saturation_policy="queue_first_then_fallback",
     )
-    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(
+    cast(Any, api).app.state.multimedia_generation_executor = MultimediaGenerationExecutor(
         FakeGenerationGateway(error=RuntimeError("model transport failed"))
     )
 

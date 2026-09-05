@@ -51,6 +51,13 @@ class FakeMultimediaExecutor:
         self.submitted: list[tuple[MultimediaGenerationKind, str, str]] = []
         self.run_requests: list[tuple[str, str]] = []
 
+    async def default_logical_model_for_multimedia(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+    ) -> str:
+        return f"{kind.value}_primary"
+
     def submit(
         self,
         *,

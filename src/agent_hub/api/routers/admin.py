@@ -9526,11 +9526,16 @@ async def generate_multimedia(
             "daily multimedia generation limit exceeded",
         ) from error
     except VideoProviderGenerationError as error:
-        failed_job = _multimedia_job_or_none(executor, submitted.id)
+        failed_job_id = submitted.id if submitted is not None else "unknown"
+        failed_job = (
+            _multimedia_job_or_none(executor, failed_job_id)
+            if submitted is not None
+            else None
+        )
         details = await _multimedia_generation_failure_details(
             service,
             job=failed_job,
-            job_id=submitted.id,
+            job_id=failed_job_id,
             executor_id="admin_multimedia_generate",
             error=error,
         )
