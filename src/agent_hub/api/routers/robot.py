@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Request, WebSocket
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent_hub.api.errors import PublicAPIError
+from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.channels.submitter import RunServiceInboundSubmitter
 from agent_hub.robot.session import RobotChannelSession, RobotRunControl
 from agent_hub.robot.tokens import DeviceTokenService
@@ -34,7 +34,11 @@ class DeviceRegisterResponse(BaseModel):
 
 
 def create_robot_router() -> APIRouter:
-    router = APIRouter(prefix="/api/robot/v1", tags=["robot"])
+    router = APIRouter(
+        prefix="/api/robot/v1",
+        tags=["robot"],
+        responses=error_responses(401, 405, 422, 500, 503),
+    )
 
     @router.post("/devices/register", response_model=DeviceRegisterResponse)
     async def register_device(

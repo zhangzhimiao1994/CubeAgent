@@ -128,9 +128,9 @@ def _register(client: TestClient, device_id: str = "pi-01") -> str:
 
 def _until(websocket: Any, message_type: str, *, limit: int = 8) -> dict[str, Any]:
     for _ in range(limit):
-        message = websocket.receive_json()
-        if message.get("type") == message_type:
-            return message
+        raw = websocket.receive_json()
+        if isinstance(raw, dict) and raw.get("type") == message_type:
+            return raw
     raise AssertionError(f"did not receive {message_type}")
 
 

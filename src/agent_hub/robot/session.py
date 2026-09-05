@@ -194,7 +194,7 @@ class RobotChannelSession:
     async def _run_finished(self, run_id: UUID) -> bool:
         try:
             record = await self._run_service.get(self._tenant_id, run_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - run lookup is best-effort for stream completion
             return False
         status = getattr(record, "status", None)
         return status in _TERMINAL_STATUSES

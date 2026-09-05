@@ -68,7 +68,6 @@ from agent_hub.channels.submitter import (
     RunServiceInboundSubmitter,
     RunSubmissionService,
 )
-from agent_hub.robot.tokens import DeviceTokenService
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
 from agent_hub.cognitive.repository import (
     PersistentCognitiveRecordRepository,
@@ -108,6 +107,7 @@ from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
 from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
+from agent_hub.robot.tokens import DeviceTokenService
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (

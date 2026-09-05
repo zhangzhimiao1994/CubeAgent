@@ -22,5 +22,9 @@ def test_different_devices_get_different_tokens() -> None:
     right = tokens.register("pi-02")
 
     assert left.device_token != right.device_token
-    assert tokens.authenticate(left.device_token).device_id == "pi-01"
-    assert tokens.authenticate(right.device_token).device_id == "pi-02"
+    left_auth = tokens.authenticate(left.device_token)
+    right_auth = tokens.authenticate(right.device_token)
+    assert left_auth is not None
+    assert right_auth is not None
+    assert left_auth.device_id == "pi-01"
+    assert right_auth.device_id == "pi-02"
