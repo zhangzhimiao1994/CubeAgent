@@ -245,6 +245,64 @@ async def test_auto_reuses_previous_mode_when_mixed_model_is_context() -> None:
     assert routing["reason"] == "conversation_mode_continuation"
 
 
+async def test_auto_submission_does_not_reuse_previous_direct_mode_for_current_media_delivery() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="满意，按刚刚方案生成图片",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-current-media-delivery",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["mode_source"] == "current_user_request"
+
+
+async def test_auto_submission_does_not_reuse_previous_discuss_mode_for_current_office_delivery() -> None:
+    repository = ConversationModeRepository(TaskMode.DISCUSS)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="确认，生成一份 PPT 作为最终文件",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-current-office-delivery",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["mode_source"] == "current_user_request"
+
+
 async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()

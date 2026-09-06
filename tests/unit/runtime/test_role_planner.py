@@ -268,6 +268,7 @@ def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -
         "生成三张可下载表情包贴纸。",
         "做一张商品 3D 渲染图。",
         "输出一张分镜图和一段口播音频。",
+        "确认，开始执行多媒体产物，最终结果要可下载。",
         "不要让我去 Midjourney，直接调用系统里的多媒体模型生成图片。",
         "不用外部工具，直接给我生成一张图片版设定板。",
     ),

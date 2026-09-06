@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.routing.rules import assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
@@ -445,6 +446,25 @@ class RunService:
                     actor_id=actor_id,
                     request=message,
                     mode=explicit_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+            artifact_delivery_mode = _current_artifact_delivery_mode(message)
+            if artifact_delivery_mode is not None:
+                routing_payload = {
+                    "reason": "current_artifact_delivery_request",
+                    "main_agent_selected_mode": artifact_delivery_mode.value,
+                    "mode_source": "current_user_request",
+                    **operator_selection,
+                }
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=artifact_delivery_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
                     routing_decision=routing_payload,
@@ -2375,6 +2395,142 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
     if has_execution:
         return TaskMode.DISPATCH
     return TaskMode.DIRECT
+
+
+def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
+    """Route explicit file/media generation requests before conversation-mode reuse."""
+    rule_result = assess_rules(message)
+    if (
+        rule_result is not None
+        and rule_result.mode is TaskMode.DISPATCH
+        and rule_result.reason == "multimedia_generation_rule"
+    ):
+        return TaskMode.DISPATCH
+
+    normalized = message.casefold()
+    if any(marker in normalized for marker in _ARTIFACT_DELIVERY_NEGATIONS):
+        return None
+    if not any(action in normalized for action in _ARTIFACT_DELIVERY_ACTIONS):
+        return None
+    if any(term in normalized for term in _ARTIFACT_DELIVERY_TERMS):
+        return TaskMode.DISPATCH
+    return None
+
+
+_ARTIFACT_DELIVERY_ACTIONS = (
+    "generate",
+    "create",
+    "make",
+    "build",
+    "produce",
+    "render",
+    "export",
+    "download",
+    "deliver",
+    "execute",
+    "生成",
+    "创建",
+    "制作",
+    "做",
+    "出",
+    "画",
+    "绘制",
+    "渲染",
+    "合成",
+    "输出",
+    "导出",
+    "交付",
+    "产出",
+    "执行",
+    "开始",
+    "确认",
+)
+_ARTIFACT_DELIVERY_TERMS = (
+    "image",
+    "picture",
+    "photo",
+    "poster",
+    "cover",
+    "video",
+    "animation",
+    "audio",
+    "speech",
+    "voiceover",
+    "music",
+    "bgm",
+    "multimedia",
+    "media artifact",
+    "word",
+    "docx",
+    "document file",
+    "ppt",
+    "pptx",
+    "powerpoint",
+    "presentation",
+    "spreadsheet",
+    "xlsx",
+    "excel",
+    "pdf",
+    "zip",
+    "archive",
+    "图片",
+    "照片",
+    "图像",
+    "海报",
+    "封面",
+    "设定板",
+    "概念图",
+    "分镜图",
+    "视频",
+    "短视频",
+    "动画",
+    "成片",
+    "音频",
+    "语音",
+    "配音",
+    "旁白",
+    "音乐",
+    "多媒体",
+    "多媒体产物",
+    "媒体产物",
+    "最终产物",
+    "最终文件",
+    "下载链接",
+    "word文档",
+    "docx文档",
+    "文档",
+    "ppt",
+    "pptx",
+    "演示稿",
+    "幻灯片",
+    "表格",
+    "excel",
+    "xlsx",
+    "pdf",
+    "压缩包",
+    "项目包",
+)
+_ARTIFACT_DELIVERY_NEGATIONS = (
+    "暂不生成",
+    "不要生成",
+    "不用生成",
+    "无需生成",
+    "不需要生成",
+    "不生成",
+    "只写提示词",
+    "只生成提示词",
+    "只给提示词",
+    "仅写提示词",
+    "仅生成提示词",
+    "只分析",
+    "仅分析",
+    "do not generate",
+    "don't generate",
+    "dont generate",
+    "without generating",
+    "prompt only",
+    "analysis only",
+)
 
 
 def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:

@@ -13,6 +13,11 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   });
 }
 
+function cssRuleBlock(css: string, selector: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+}
+
 describe("AppShell presentation", () => {
   beforeEach(() => {
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -251,5 +256,19 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/\.chat-stream\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;/);
     expect(stylesCss).toMatch(/\.chat-sticky-footer\s*{[\s\S]*bottom:\s*0;[\s\S]*position:\s*sticky;/);
     expect(stylesCss).toMatch(/\.chat-active-process-dock\s*{[\s\S]*max-height:\s*min\(32dvh, 260px\);[\s\S]*overflow-y:\s*auto;/);
+  });
+
+  it("keeps chat history text selectable while excluding process controls", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+    const streamRule = cssRuleBlock(stylesCss, ".chat-stream");
+    const messageRule = cssRuleBlock(stylesCss, ".chat-message");
+
+    expect(streamRule).toMatch(/user-select:\s*text;/);
+    expect(streamRule).not.toMatch(/user-select:\s*none;/);
+    expect(messageRule).toMatch(/user-select:\s*text;/);
+    expect(messageRule).not.toMatch(/user-select:\s*none;/);
+    expect(stylesCss).toMatch(/\.message-body\s*{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.message-body :where\(p,\s*li,\s*td,\s*th,\s*code,\s*pre\)\s*{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.run-process-summary\s*{[\s\S]*user-select:\s*none;/);
   });
 });

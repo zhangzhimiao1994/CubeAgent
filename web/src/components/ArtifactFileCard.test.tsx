@@ -72,4 +72,42 @@ describe("ArtifactFileCard", () => {
     );
     expect(URL.createObjectURL).toHaveBeenCalled();
   });
+
+  it("renders generated images as previewable artifacts with a download action", async () => {
+    window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
+    const imageArtifact = {
+      ...artifact,
+      kind: "image",
+      title: "生成图片",
+      filename: "poster.png",
+      mime_type: "image/png",
+      download_url:
+        "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/44444444-4444-4444-8444-444444444444/download",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(new Blob(["png-bytes"], { type: "image/png" }), {
+          status: 200,
+          headers: {
+            "Content-Type": "image/png",
+            "Content-Disposition": 'attachment; filename="poster.png"',
+          },
+        }),
+      ),
+    );
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, {
+        createObjectURL: vi.fn(() => "blob:image-preview"),
+        revokeObjectURL: vi.fn(),
+      }),
+    );
+
+    render(<ArtifactFileCard artifact={imageArtifact} />);
+
+    const preview = await screen.findByRole("img", { name: "poster.png" });
+    expect(preview.getAttribute("src")).toBe("blob:image-preview");
+    expect(screen.getByRole("button", { name: /下载 poster\.png/ }).textContent).toBe("下载图片");
+  });
 });

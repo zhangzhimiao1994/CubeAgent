@@ -673,14 +673,6 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
-function explainActualMode(run: { status: string; mode: string | null }) {
-  if (run.status === "waiting_user_mode") {
-    return "自动检测没有足够把握，这轮回复需要你确认运行模式。";
-  }
-  if (!run.mode) return "这轮回复尚未确定运行模式。";
-  return `这轮回复使用：${displayMode(run.mode)}。你可以继续在当前会话里追问。`;
-}
-
 function modeSelectionFromSubmittedRun(run: SubmittedRun): ModeSelection | null {
   if (run.status !== "waiting_user_mode" || !run.decision_token) return null;
   return {
@@ -2837,6 +2829,7 @@ export function RunsPage() {
     createdOperationId: string | null;
   } | null>(null);
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
+  const chatFooterRef = useRef<HTMLDivElement | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -3024,7 +3017,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setOpenClawApproval(null);
         setModeSelection(null);
-        setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
+        setSubmitNotice(null);
         const continued = await api.chooseMode(run.id, {
           mode: submittedMode as ManualRunMode,
           decision_token: selection.decisionToken,
@@ -3079,7 +3072,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setOpenClawApproval(null);
         setModeSelection(null);
-        setSubmitNotice(override?.successNotice ?? explainActualMode(run));
+        setSubmitNotice(override?.successNotice ?? null);
       }
       setMessage("");
       setAttachmentDraft(null);
@@ -3105,7 +3098,7 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setModeSelection(null);
       if (run.mode) setMode(run.mode as RunMode);
-      setSubmitNotice(explainActualMode(run));
+      setSubmitNotice(null);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
@@ -3559,11 +3552,6 @@ export function RunsPage() {
     void referenceConversation.refetch();
   }
 
-  if (runs.isLoading) {
-    return <p>正在加载对话...</p>;
-  }
-  if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
-
   const items = runListItems;
   const conversationEntries = conversationListEntries(items);
   const savedAgents = agents.data ?? [];
@@ -3665,6 +3653,32 @@ export function RunsPage() {
     if (!stream) return;
     stream.scrollTo({ top: stream.scrollHeight, behavior: "smooth" });
   }
+
+  useEffect(() => {
+    const stream = chatStreamRef.current;
+    const footer = chatFooterRef.current;
+    if (!stream || !footer) return undefined;
+    const updateFooterHeight = () => {
+      stream.style.setProperty("--chat-footer-height", `${Math.ceil(footer.getBoundingClientRect().height)}px`);
+    };
+    updateFooterHeight();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateFooterHeight);
+      return () => window.removeEventListener("resize", updateFooterHeight);
+    }
+    const observer = new ResizeObserver(updateFooterHeight);
+    observer.observe(footer);
+    window.addEventListener("resize", updateFooterHeight);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateFooterHeight);
+    };
+  }, [activeProcessDockRun, attachmentDraft, showModeEntry, submitNotice, skillInstallCandidate, skillUploadConflict]);
+
+  if (runs.isLoading) {
+    return <p>正在加载对话...</p>;
+  }
+  if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   return (
     <section className="chat-page">
@@ -3972,7 +3986,7 @@ export function RunsPage() {
             />
           ) : null}
 
-          <div className="chat-sticky-footer" aria-label="当前输入与运行状态">
+          <div ref={chatFooterRef} className="chat-sticky-footer" aria-label="当前输入与运行状态">
           {activeProcessDockRun ? (
             <div className="chat-active-process-dock" aria-label="当前轮 Agent 工作席">
               <RunProcessSummary
@@ -4181,9 +4195,24 @@ export function RunsPage() {
               required
             />
             <div className="composer-actions">
+              <div className="composer-status-line" role="status">
+                <span>
+                  {mode === "auto"
+                    ? "自动 · 主 Agent 判断"
+                    : mode === "direct"
+                      ? `直连 · 模型 ${directModelName}`
+                      : `${displayMode(mode)} · 本会话倾向`}
+                  {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
+                  {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
+                  {referenceConversationId.trim() ? " · 已引用会话" : ""}
+                </span>
+              </div>
+              {showModeEntry && !selectedRunId ? (
+                <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
+              ) : null}
               <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
-                <label className="composer-upload-button">
-                  <span>附件</span>
+                <label className="composer-upload-button" title="添加附件">
+                  <span aria-hidden="true">+</span>
                   <input
                     aria-label="上传文件或 Skill 压缩包"
                     type="file"
@@ -4216,35 +4245,21 @@ export function RunsPage() {
                     读取引用
                   </button>
                 ) : null}
-              </div>
-              <div className="composer-status-line" role="status">
-                <span>
-                  {mode === "auto"
-                    ? "自动 · 主 Agent 判断"
-                    : mode === "direct"
-                      ? `直连 · 模型 ${directModelName}`
-                      : `${displayMode(mode)} · 本会话倾向`}
-                  {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
-                  {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
-                  {referenceConversationId.trim() ? " · 已引用会话" : ""}
-                </span>
-              </div>
-              {showModeEntry && !selectedRunId ? (
-                <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
-              ) : null}
-              <div className="composer-send-row">
                 {canStopLatestRun && latestVisibleRun ? (
                   <button
                     type="button"
                     className="secondary-action composer-stop-button"
+                    aria-label="停止生成"
                     disabled={stopCurrentRun.isPending}
                     onClick={() => stopCurrentRun.mutate(latestVisibleRun.id)}
                   >
-                    {stopCurrentRun.isPending ? "停止中..." : "停止生成"}
+                    {stopCurrentRun.isPending ? "…" : "■"}
                   </button>
                 ) : null}
                 <button
                   type="submit"
+                  className="composer-send-button"
+                  aria-label={uploadAttachment.isPending ? "上传中..." : createRun.isPending ? "发送中..." : "发送"}
                   disabled={
                     createRun.isPending ||
                     uploadAttachment.isPending ||
@@ -4252,7 +4267,7 @@ export function RunsPage() {
                     Boolean(directSendBlockedReason)
                   }
                 >
-                  {createRun.isPending ? "发送中..." : uploadAttachment.isPending ? "上传中..." : "发送"}
+                  {createRun.isPending || uploadAttachment.isPending ? "…" : "↑"}
                 </button>
               </div>
             </div>

@@ -1,5 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChannelStatus, EvolutionRun, RunDetail, RunListItem } from "../api/client";
@@ -23,6 +25,13 @@ const escapedConversationHistoryTitle = conversationHistoryTitle.replace(/[.*+?^
 const conversationOpenButtonName = new RegExp(`进入会话 ${escapedConversationHistoryTitle}`);
 const conversationBranchButtonName = new RegExp(`按原思路新建分支 ${escapedConversationHistoryTitle}`);
 const conversationDeleteButtonName = new RegExp(`删除会话 ${escapedConversationHistoryTitle}`);
+const stylesCss = readFileSync(join(process.cwd(), "src", "styles.css"), "utf8");
+
+function cssRuleBlock(selector: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return stylesCss.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+}
+
 const runListItem: RunListItem = {
   id: runId,
   status: "running",
@@ -1611,7 +1620,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
     expect(screen.queryByRole("link", { name: "查看运行详情" })).toBeNull();
-    expect(screen.getByText(/这轮回复使用/)).not.toBeNull();
+    expect(screen.queryByText(/这轮回复使用/)).toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -2274,7 +2283,9 @@ describe("operational management pages", () => {
 
     expect(composer.querySelector(".composer-tool-row")).not.toBeNull();
     expect(composer.querySelector(".composer-status-line")).not.toBeNull();
-    expect(composer.querySelector(".composer-send-row")).not.toBeNull();
+    expect(composer.querySelector(".composer-send-row")).toBeNull();
+    expect(composer.querySelector(".composer-tool-row .composer-send-button")).not.toBeNull();
+    expect(composer.querySelector(".composer-tool-row .composer-upload-button")).not.toBeNull();
   });
 
   it("submits branch reference context without Vibe Coding", async () => {
@@ -3080,6 +3091,24 @@ describe("operational management pages", () => {
     expect(within(opinionDetail).getAllByText("导演意见").length).toBeGreaterThan(0);
   });
 
+  it("keeps chat text selectable without letting process controls select whole cards", () => {
+    const streamRule = cssRuleBlock(".chat-stream");
+    const messageRule = cssRuleBlock(".chat-message");
+
+    expect(streamRule).toMatch(/user-select:\s*text;/);
+    expect(streamRule).not.toMatch(/user-select:\s*none;/);
+    expect(messageRule).toMatch(/user-select:\s*text;/);
+    expect(messageRule).not.toMatch(/user-select:\s*none;/);
+    expect(stylesCss).toMatch(/\.chat-message p\s*\{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.message-body\s*\{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.message-body :where\(p,\s*li,\s*td,\s*th,\s*code,\s*pre\)\s*\{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.run-process-summary\s*\{[\s\S]*user-select:\s*none;/);
+    expect(stylesCss).toMatch(/\.agent-workforce-activity,\s*[\r\n]+\.agent-workforce-activity-card\s*\{[\s\S]*user-select:\s*none;/);
+    expect(stylesCss).toMatch(/\.activity-detail-drawer[^{]*\{[\s\S]*user-select:\s*none;/);
+    expect(stylesCss).toMatch(/\.activity-summary-cards dd\s*\{[\s\S]*user-select:\s*text;/);
+    expect(stylesCss).toMatch(/\.activity-detail-list dd\s*\{[\s\S]*user-select:\s*text;/);
+  });
+
   it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {
     const user = userEvent.setup();
     const processRunDetail = {
@@ -3860,7 +3889,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
-    expect(await screen.findByText(/不再重复确认模式/)).not.toBeNull();
+    expect(screen.queryByText(/不再重复确认模式/)).toBeNull();
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
@@ -4202,11 +4231,11 @@ describe("operational management pages", () => {
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
     const statusLine = composer.querySelector(".composer-status-line") as HTMLElement;
     const modeEntry = composer.querySelector(".mode-entry-panel") as HTMLElement;
-    const sendRow = composer.querySelector(".composer-send-row") as HTMLElement;
+    const toolRow = composer.querySelector(".composer-tool-row") as HTMLElement;
     const textarea = composer.querySelector("textarea") as HTMLTextAreaElement;
     expect(modeEntry).not.toBeNull();
     expect(statusLine.compareDocumentPosition(modeEntry) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(modeEntry.compareDocumentPosition(sendRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(modeEntry.compareDocumentPosition(toolRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(textarea.placeholder).toBe("输入消息...");
     expect(screen.queryByText("新对话")).toBeNull();
     expect(screen.queryByText(/先选一个运行方式/)).toBeNull();

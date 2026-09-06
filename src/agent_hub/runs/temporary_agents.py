@@ -14,6 +14,12 @@ from agent_hub.config.schema import PlatformConfig
 from agent_hub.db.models import AdminResourceRow, ConfigRevisionRow
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.service import TemporaryAgentProposal
+from agent_hub.runtime.role_planner import (
+    _is_document_generation_request,
+    _is_multimedia_generation_request,
+    _is_presentation_generation_request,
+    _is_project_package_generation_request,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +230,22 @@ class AdminResourceTemporaryAgentPolicy:
 
 
 def _infer_capability(message: str) -> _CapabilitySpec | None:
+    if _is_builtin_delivery_request(message):
+        return None
     normalized = message.casefold()
     for spec in _CAPABILITIES:
         if any(keyword.casefold() in normalized for keyword in spec.keywords):
             return spec
     return None
+
+
+def _is_builtin_delivery_request(message: str) -> bool:
+    return (
+        _is_document_generation_request(message)
+        or _is_presentation_generation_request(message)
+        or _is_project_package_generation_request(message)
+        or _is_multimedia_generation_request(message)
+    )
 
 
 def _agents_cover(agents: tuple[dict[str, object], ...], spec: _CapabilitySpec) -> bool:

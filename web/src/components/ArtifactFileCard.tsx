@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { api, formatApiError } from "../api/client";
 import type { RunDetail } from "../api/client";
@@ -34,6 +34,13 @@ function formatExpiry(expiresAt: string | null | undefined) {
   return `有效至 ${date.toLocaleString("zh-CN", { hour12: false })}`;
 }
 
+function downloadLabel(mimeType: string | null | undefined) {
+  if (mimeType?.startsWith("image/")) return "下载图片";
+  if (mimeType?.startsWith("video/")) return "下载视频";
+  if (mimeType?.startsWith("audio/")) return "下载音频";
+  return "下载文件";
+}
+
 export function ArtifactFileCard({
   artifact,
   compact = false,
@@ -43,12 +50,38 @@ export function ArtifactFileCard({
 }) {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
+  const [previewUrl, setPreviewUrl] = useState("");
   const filename = artifactFileName(artifact);
   const size = formatFileSize(artifact.size_bytes);
   const mimeType = artifact.mime_type?.trim();
   const checksum = artifact.sha256?.trim();
   const expiry = formatExpiry(artifact.expires_at);
   const meta = [artifact.kind, size, mimeType, expiry].filter(Boolean);
+  const isImage = mimeType?.startsWith("image/") ?? false;
+  const actionLabel = downloadLabel(mimeType);
+
+  useEffect(() => {
+    if (!isImage || compact) {
+      setPreviewUrl("");
+      return undefined;
+    }
+    let cancelled = false;
+    let objectUrl = "";
+    void api
+      .downloadGeneratedFile(artifact.download_url)
+      .then((downloaded) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(downloaded.blob);
+        setPreviewUrl(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setPreviewUrl("");
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [artifact.download_url, compact, isImage]);
 
   async function downloadFile(event: React.MouseEvent<HTMLButtonElement>) {
     event.stopPropagation();
@@ -74,9 +107,10 @@ export function ArtifactFileCard({
   }
 
   return (
-    <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}`}>
+    <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}${isImage ? " artifact-file-card-image" : ""}`}>
+      {previewUrl ? <img className="artifact-file-preview" src={previewUrl} alt={filename} /> : null}
       <span className="artifact-file-icon" aria-hidden="true">
-        FILE
+        {isImage ? "IMG" : "FILE"}
       </span>
       <div className="artifact-file-main">
         <strong>{filename}</strong>
@@ -101,7 +135,7 @@ export function ArtifactFileCard({
         disabled={downloading}
         aria-label={`下载 ${filename}`}
       >
-        {downloading ? "下载中" : "下载"}
+        {downloading ? "下载中" : actionLabel}
       </button>
     </div>
   );
