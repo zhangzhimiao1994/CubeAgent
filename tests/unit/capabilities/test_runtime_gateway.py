@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,7 +11,14 @@ import pytest
 
 import agent_hub.capabilities.runtime as runtime_module
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
-from agent_hub.files.generated import DOCX_MIME_TYPE, PPTX_MIME_TYPE, ZIP_MIME_TYPE
+from agent_hub.files.generated import (
+    DOCX_MIME_TYPE,
+    MP4_MIME_TYPE,
+    PNG_MIME_TYPE,
+    PPTX_MIME_TYPE,
+    ZIP_MIME_TYPE,
+    GeneratedFileStore,
+)
 from agent_hub.multimodal.generation import (
     MultimediaArtifact,
     MultimediaGenerationJob,
@@ -19,6 +27,7 @@ from agent_hub.multimodal.generation import (
 )
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
+from agent_hub.video.composer import VideoComposeRequest
 from tests.unit.skills.test_package import skill_zip
 
 TENANT_ID = UUID("66666666-6666-4666-8666-666666666666")
@@ -107,6 +116,32 @@ class FakeMultimediaExecutor:
         )
 
 
+class FakeVideoComposer:
+    def __init__(self) -> None:
+        self.requests: list[tuple[VideoComposeRequest, Path]] = []
+
+    def compose(self, request: VideoComposeRequest, output_dir: Path) -> Path:
+        self.requests.append((request, output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / request.output_filename
+        output.write_bytes(b"composed video")
+        return output
+
+
+class ThreadCheckingVideoComposer:
+    def __init__(self, main_thread_id: int) -> None:
+        self.main_thread_id = main_thread_id
+        self.thread_ids: list[int] = []
+
+    def compose(self, request: VideoComposeRequest, output_dir: Path) -> Path:
+        self.thread_ids.append(threading.get_ident())
+        assert threading.get_ident() != self.main_thread_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / request.output_filename
+        output.write_bytes(b"threaded composed video")
+        return output
+
+
 async def test_runtime_gateway_executes_calculator_without_external_side_effects(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path)
 
@@ -187,6 +222,186 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
         },
     )
     assert result["metadata"] == file_metadata
+
+
+async def test_runtime_gateway_composes_video_from_generated_artifacts(tmp_path: Path) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    store = GeneratedFileStore(generated_artifact_dir)
+    video_source = store.store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        artifact_id=UUID("77777777-7777-4777-8777-000000000001"),
+        filename="clip.mp4",
+        mime_type=MP4_MIME_TYPE,
+        data=b"video",
+    )
+    image_source = store.store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        artifact_id=UUID("77777777-7777-4777-8777-000000000002"),
+        filename="image.png",
+        mime_type=PNG_MIME_TYPE,
+        data=b"image",
+    )
+    composer = FakeVideoComposer()
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_artifact_dir,
+        video_composer=composer,
+    )
+
+    assert gateway.is_available(TENANT_ID, "compose_video") is True
+    assert gateway.is_replay_safe("compose_video") is True
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="video_compositor",
+        name="compose_video",
+        arguments={
+            "title": "Launch Reel",
+            "filename": "launch-reel.mp4",
+            "aspect_ratio": "9:16",
+            "image_duration_seconds": 4,
+            "clips": (
+                {
+                    "storage_key": video_source.storage_key,
+                    "filename": video_source.filename,
+                    "mime_type": video_source.mime_type,
+                },
+                {
+                    "storage_key": image_source.storage_key,
+                    "filename": image_source.filename,
+                    "mime_type": image_source.mime_type,
+                    "duration_seconds": 2,
+                },
+            ),
+        },
+        idempotency_key="compose_1",
+    )
+
+    assert len(composer.requests) == 1
+    request, output_dir = composer.requests[0]
+    assert output_dir.name.startswith("agent-hub-video-")
+    assert request.title == "Launch Reel"
+    assert request.output_filename == "launch-reel.mp4"
+    assert request.aspect_ratio == "9:16"
+    assert request.image_duration_seconds == 4
+    assert [clip.mime_type for clip in request.clips] == [MP4_MIME_TYPE, PNG_MIME_TYPE]
+    assert request.clips[0].path == generated_artifact_dir / video_source.storage_key
+    assert request.clips[1].path == generated_artifact_dir / image_source.storage_key
+
+    file_metadata = _assert_file_result(result, expected_mime_type=MP4_MIME_TYPE)
+    assert file_metadata["filename"] == "launch-reel.mp4"
+    assert file_metadata["size_bytes"] == len(b"composed video")
+    assert result["summary"] == "Composed video artifact launch-reel.mp4."
+    assert result["presentation"] == "final_attachment"
+    assert (generated_artifact_dir / str(file_metadata["storage_key"])).read_bytes() == b"composed video"
+
+
+async def test_runtime_gateway_runs_video_composition_off_event_loop(tmp_path: Path) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    store = GeneratedFileStore(generated_artifact_dir)
+    video_source = store.store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        artifact_id=UUID("77777777-7777-4777-8777-000000000003"),
+        filename="clip.mp4",
+        mime_type=MP4_MIME_TYPE,
+        data=b"video",
+    )
+    composer = ThreadCheckingVideoComposer(threading.get_ident())
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_artifact_dir,
+        video_composer=composer,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="video_compositor",
+        name="compose_video",
+        arguments={
+            "title": "Launch Reel",
+            "clips": (
+                {
+                    "storage_key": video_source.storage_key,
+                    "mime_type": video_source.mime_type,
+                },
+            ),
+        },
+        idempotency_key="compose_threaded",
+    )
+
+    assert composer.thread_ids
+    file_metadata = _assert_file_result(result, expected_mime_type=MP4_MIME_TYPE)
+    assert file_metadata["size_bytes"] == len(b"threaded composed video")
+
+
+async def test_runtime_gateway_rejects_clip_mime_type_that_conflicts_with_storage_filename(
+    tmp_path: Path,
+) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    store = GeneratedFileStore(generated_artifact_dir)
+    zip_source = store.store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        artifact_id=UUID("77777777-7777-4777-8777-000000000004"),
+        filename="archive.zip",
+        mime_type=ZIP_MIME_TYPE,
+        data=b"zip",
+    )
+    composer = FakeVideoComposer()
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_artifact_dir,
+        video_composer=composer,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="mime_type does not match clip filename"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="video_compositor",
+            name="compose_video",
+            arguments={
+                "title": "Launch Reel",
+                "clips": (
+                    {
+                        "storage_key": zip_source.storage_key,
+                        "mime_type": MP4_MIME_TYPE,
+                    },
+                ),
+            },
+            idempotency_key="compose_bad_mime",
+        )
+
+    assert composer.requests == []
+
+
+async def test_runtime_gateway_compose_video_requires_generated_artifact_store(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
+
+    with pytest.raises(RuntimeCapabilityError, match="generated artifact store is not configured"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="video_compositor",
+            name="compose_video",
+            arguments={
+                "title": "Launch Reel",
+                "clips": (
+                    {
+                        "storage_key": "tenant/run/artifact/clip.mp4",
+                        "mime_type": MP4_MIME_TYPE,
+                    },
+                ),
+            },
+            idempotency_key="compose_missing_store",
+        )
 
 
 async def test_runtime_gateway_multimedia_generation_tool_keeps_legacy_prompt_compatible(tmp_path: Path) -> None:

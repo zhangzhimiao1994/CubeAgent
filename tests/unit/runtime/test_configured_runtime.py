@@ -1636,6 +1636,54 @@ def test_dispatch_plan_keeps_available_project_zip_tool() -> None:
     assert "project.generate_zip" in plan.allowed_tools
 
 
+def test_dispatch_plan_keeps_compose_video_only_for_video_compositor_role() -> None:
+    roles = (
+        RoleAssignment(
+            id="video_editor",
+            role="Video Editor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan edit rhythm and captions.",
+            must_answer=("What edit structure was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not claim a generated video artifact.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Compose generated media artifacts into an MP4.",
+            must_answer=("What generated MP4 artifact was produced?",),
+            allowed_tools=("read_context", "compose_video"),
+            forbidden_actions=("Do not use arbitrary filesystem paths.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="把生成的视频和图片素材合成一个可下载成片。",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"compose_video"}),
+    )
+
+    editor = next(agent for agent in plan.agents if agent.id == "video_editor")
+    compositor = next(agent for agent in plan.agents if agent.id == "video_compositor")
+    compositor_step = next(step for step in plan.steps if step.agent == "video_compositor")
+    assert editor.allowed_tools == ()
+    assert "compose_video" in compositor.allowed_tools
+    assert "compose_video" in compositor_step.tools
+    assert "compose_video" in plan.allowed_tools
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(

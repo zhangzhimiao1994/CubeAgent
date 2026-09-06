@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -21,7 +22,11 @@ from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
     ALLOWED_GENERATED_FILE_MIME_TYPES,
     DOCX_MIME_TYPE,
+    JPEG_MIME_TYPE,
+    MP4_MIME_TYPE,
+    PNG_MIME_TYPE,
     PPTX_MIME_TYPE,
+    WEBP_MIME_TYPE,
     ZIP_MIME_TYPE,
     GeneratedFileStore,
     safe_generated_filename,
@@ -34,16 +39,30 @@ from agent_hub.multimodal.generation import (
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
+from agent_hub.video.composer import (
+    VideoClipInput,
+    VideoComposer,
+    VideoComposeRequest,
+    VideoCompositionError,
+)
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
 _MULTIMEDIA_TOOL = "generate_multimedia"
+_COMPOSE_VIDEO_TOOL = "compose_video"
 _MULTIMEDIA_ARTIFACT_TTL = timedelta(hours=24)
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
+_MAX_VIDEO_CLIPS = 32
+_VIDEO_CLIP_EXTENSIONS = {
+    MP4_MIME_TYPE: (".mp4",),
+    PNG_MIME_TYPE: (".png",),
+    JPEG_MIME_TYPE: (".jpg", ".jpeg"),
+    WEBP_MIME_TYPE: (".webp",),
+}
 _DOTTED_BUILT_INS = frozenset({_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL})
 _REPLAY_SAFE = frozenset({
     "calculator",
@@ -54,7 +73,9 @@ _REPLAY_SAFE = frozenset({
     _PPTX_TOOL,
     _PROJECT_ZIP_TOOL,
     _MULTIMEDIA_TOOL,
+    _COMPOSE_VIDEO_TOOL,
 })
+_VIDEO_CLIP_MIME_TYPES = frozenset({MP4_MIME_TYPE, PNG_MIME_TYPE, JPEG_MIME_TYPE, WEBP_MIME_TYPE})
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -84,6 +105,10 @@ class RuntimeMultimediaGenerationExecutor(Protocol):
     ) -> MultimediaGenerationJob: ...
 
 
+class RuntimeVideoComposer(Protocol):
+    def compose(self, request: VideoComposeRequest, output_dir: Path) -> Path: ...
+
+
 class RuntimeCapabilityGateway:
     """Production capability executor for non-dangerous built-ins and approved skills."""
 
@@ -96,6 +121,7 @@ class RuntimeCapabilityGateway:
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
         multimedia_generation_executor: RuntimeMultimediaGenerationExecutor | None = None,
+        video_composer: RuntimeVideoComposer | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -105,6 +131,7 @@ class RuntimeCapabilityGateway:
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
         self._multimedia_generation_executor = multimedia_generation_executor
+        self._video_composer = video_composer or VideoComposer()
 
     def is_replay_safe(self, name: str) -> bool:
         return name in _REPLAY_SAFE
@@ -112,6 +139,8 @@ class RuntimeCapabilityGateway:
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         if name == _MULTIMEDIA_TOOL:
             return self._multimedia_generation_executor is not None
+        if name == _COMPOSE_VIDEO_TOOL:
+            return True
         if name in _REPLAY_SAFE:
             return True
         if _SAFE_CAPABILITY_NAME.fullmatch(name) is None:
@@ -145,6 +174,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if name == _MULTIMEDIA_TOOL:
             return await self._execute_generate_multimedia(tenant_id, run_id, actor, arguments)
+        if name == _COMPOSE_VIDEO_TOOL:
+            return await self._execute_compose_video(tenant_id, run_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -380,6 +411,56 @@ class RuntimeCapabilityGateway:
             result["metadata"] = first_file_metadata
         return result
 
+    async def _execute_compose_video(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        filename = _filename(arguments, title=title, extension=".mp4")
+        clips = _video_clip_inputs(arguments, store=store, tenant_id=tenant_id, run_id=run_id)
+        request = VideoComposeRequest(
+            title=title,
+            clips=clips,
+            output_filename=filename,
+            aspect_ratio=_optional_string(arguments, "aspect_ratio") or "original",
+            image_duration_seconds=_optional_int(
+                arguments,
+                "image_duration_seconds",
+                default=3,
+            ),
+        )
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-video-") as temporary_dir:
+            output_dir = Path(temporary_dir)
+            try:
+                output = await asyncio.to_thread(self._video_composer.compose, request, output_dir)
+            except VideoCompositionError as error:
+                raise RuntimeCapabilityError(str(error)) from None
+            try:
+                data = output.read_bytes()
+            except OSError:
+                raise RuntimeCapabilityError("composed video output is unavailable") from None
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=MP4_MIME_TYPE,
+                data=data,
+            )
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Composed video artifact {metadata.filename}.",
+            )
+        )
+        result["presentation"] = _generated_file_presentation(arguments, default="final_attachment")
+        return result
+
     def _require_generated_file_store(self) -> GeneratedFileStore:
         if self._generated_file_store is None:
             raise RuntimeCapabilityError("generated artifact store is not configured")
@@ -493,6 +574,20 @@ def _optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str
     return value
 
 
+def _optional_int(
+    arguments: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    default: int,
+) -> int:
+    value = arguments.get(field_name)
+    if value is None:
+        return default
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
+
+
 def _optional_mapping_list(
     arguments: Mapping[str, JsonValue],
     field_name: str,
@@ -508,6 +603,96 @@ def _optional_mapping_list(
             raise RuntimeCapabilityError(f"{field_name} items must be objects")
         items.append(dict(item))
     return items
+
+
+def _video_clip_inputs(
+    arguments: Mapping[str, JsonValue],
+    *,
+    store: GeneratedFileStore,
+    tenant_id: UUID,
+    run_id: UUID,
+) -> tuple[VideoClipInput, ...]:
+    value = arguments.get("clips")
+    if not isinstance(value, list | tuple) or not value or len(value) > _MAX_VIDEO_CLIPS:
+        raise RuntimeCapabilityError("clips must contain 1 to 32 entries")
+    clips: list[VideoClipInput] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise RuntimeCapabilityError("clips items must be objects")
+        storage_key = _clip_required_string(item, "storage_key")
+        mime_type = _clip_required_string(item, "mime_type")
+        if mime_type not in _VIDEO_CLIP_MIME_TYPES:
+            raise RuntimeCapabilityError("unsupported clip MIME type")
+        _validate_clip_storage_filename(storage_key, mime_type)
+        path = _resolve_generated_clip_path(
+            store,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            storage_key=storage_key,
+        )
+        clips.append(
+            VideoClipInput(
+                storage_key=storage_key,
+                path=path,
+                mime_type=mime_type,
+                duration_seconds=_clip_optional_int(item, "duration_seconds"),
+                filename=_clip_optional_string(item, "filename"),
+            )
+        )
+    return tuple(clips)
+
+
+def _validate_clip_storage_filename(storage_key: str, mime_type: str) -> None:
+    filename = PurePosixPath(storage_key).name.casefold()
+    expected_extensions = _VIDEO_CLIP_EXTENSIONS.get(mime_type, ())
+    if not expected_extensions or not filename.endswith(expected_extensions):
+        raise RuntimeCapabilityError("mime_type does not match clip filename")
+
+
+def _resolve_generated_clip_path(
+    store: GeneratedFileStore,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    storage_key: str,
+) -> Path:
+    try:
+        parts = PurePosixPath(storage_key).parts
+        if len(parts) != 4:
+            raise ValueError
+        stored_tenant_id = UUID(parts[0])
+        stored_run_id = UUID(parts[1])
+        artifact_id = UUID(parts[2])
+        if stored_tenant_id != tenant_id or stored_run_id != run_id:
+            raise ValueError
+        return store.resolve_for(tenant_id, run_id, artifact_id, storage_key)
+    except (FileNotFoundError, ValueError):
+        raise RuntimeCapabilityError("clip storage_key is invalid or unavailable") from None
+
+
+def _clip_required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:
+    value = arguments.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_int(arguments: Mapping[str, JsonValue], field_name: str) -> int | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
 
 
 def _multimedia_kind(arguments: Mapping[str, JsonValue]) -> MultimediaGenerationKind:

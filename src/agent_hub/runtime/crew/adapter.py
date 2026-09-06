@@ -300,6 +300,12 @@ def _tool_description(internal_name: str, external_name: str) -> str:
             "artifact through the configured multimedia executor. Required fields "
             "are kind, logical_model, and generation_prompt."
         )
+    if internal_name == "compose_video":
+        return (
+            "Approved Agent Hub capability: compose_video. Use the model "
+            f"function name {external_name} to merge generated image/video artifacts "
+            "into a downloadable MP4. Required fields are title and clips."
+        )
     return f"Approved Agent Hub capability: {internal_name}"
 
 
@@ -430,6 +436,74 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                     "type": "string",
                     "description": "The final generation prompt for the media provider.",
                     "minLength": 1,
+                },
+            },
+        }
+    if internal_name == "compose_video":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title", "clips"),
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Human-readable title for the composed video.",
+                    "minLength": 1,
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe MP4 filename ending in .mp4.",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ("original", "16:9", "9:16"),
+                    "description": "Output aspect ratio normalization.",
+                },
+                "image_duration_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Default duration for image clips.",
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                    "description": (
+                        "Use final_attachment when the MP4 is the final downloadable file."
+                    ),
+                },
+                "clips": {
+                    "type": "array",
+                    "description": "Ordered generated image/video artifacts to compose.",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ("storage_key", "mime_type"),
+                        "properties": {
+                            "storage_key": {
+                                "type": "string",
+                                "description": "Generated artifact storage_key.",
+                                "minLength": 1,
+                            },
+                            "filename": {
+                                "type": "string",
+                                "description": "Optional source artifact filename.",
+                            },
+                            "mime_type": {
+                                "type": "string",
+                                "enum": ("video/mp4", "image/png", "image/jpeg", "image/webp"),
+                                "description": "Source artifact MIME type.",
+                            },
+                            "duration_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "description": "Duration override for image clips.",
+                            },
+                        },
+                    },
                 },
             },
         }
@@ -651,6 +725,7 @@ def _requires_final_attachment_tool(tools: tuple[str, ...]) -> bool:
         tool
         in {
             "document.generate_docx",
+            "compose_video",
             "generate_multimedia",
             "presentation.generate_pptx",
             "project.generate_zip",
@@ -666,6 +741,7 @@ def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
         if tool
         in {
             "document.generate_docx",
+            "compose_video",
             "generate_multimedia",
             "presentation.generate_pptx",
             "project.generate_zip",

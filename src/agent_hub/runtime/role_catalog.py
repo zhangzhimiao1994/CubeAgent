@@ -145,7 +145,31 @@ def _daily_work_roles() -> tuple[RoleDefinition, ...]:
         _role("product_manager", "Product Manager", "plan", "Turn research and user goals into concrete scope, priority, acceptance criteria, and handoff notes.", ("What should be built?", "What is out of scope?", "What acceptance criteria matter?"), ("product",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         _role("director", "Director", "plan", "Turn video, story, and visual-generation goals into shots, scene structure, mood, and prompt direction.", ("What scene should be generated?", "What visual direction is needed?", "What prompt constraints matter?"), ("creative-direction",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         _role("copywriter", "Copywriter", "execute", "Produce practical copy, scripts, titles, posts, and message variants.", ("What copy was produced?", "Which version is recommended?", "What needs review?"), ("copywriting",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
-        _role("video_editor", "Video Editor", "execute", "Produce video-generation prompt structure, pacing, shot order, transitions, captions, and asset notes.", ("What prompt or edit structure was produced?", "Which sequence is recommended?", "What visual asset is missing?"), ("editing",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
+        _role("video_editor", "Video Editor", "execute", "Produce edit structure, pacing, shot order, transitions, captions, and asset notes.", ("What prompt or edit structure was produced?", "Which sequence is recommended?", "What visual asset is missing?"), ("editing",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
+        RoleDefinition(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose="execute",
+            mission=(
+                "Call compose_video when existing generated image/video artifacts must be "
+                "merged into a downloadable MP4."
+            ),
+            must_answer=(
+                "Which generated source artifacts should compose_video receive?",
+                "What output aspect ratio and image durations were used?",
+                "What downloadable MP4 artifact was produced?",
+            ),
+            allowed_tools=("read_context", "compose_video"),
+            forbidden_actions=(
+                "do not claim a finished MP4 exists until compose_video returns an artifact",
+                "do not use arbitrary filesystem paths as source clips",
+                "do not call compose_video for edit-plan-only or prompt-only requests",
+            ),
+            skills=("editing",),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
         RoleDefinition(
             id="document_writer",
             role="Document Writer",

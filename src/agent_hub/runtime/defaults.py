@@ -1071,6 +1071,7 @@ def _selected_config_agent_purpose(
 _DELIVERY_TOOL_NAMES = frozenset(
     {
         "document.generate_docx",
+        "compose_video",
         "generate_multimedia",
         "presentation.generate_pptx",
         "project.generate_zip",

@@ -906,6 +906,19 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "edit",
             "caption",
         ),
+        "video_compositor": (
+            "compose_video",
+            "合成",
+            "合并",
+            "拼接",
+            "成片",
+            "mp4",
+            "merge",
+            "stitch",
+            "concatenate",
+            "combine clips",
+            "downloadable vertical reel",
+        ),
         "document_writer": (
             "word",
             "docx",
@@ -991,6 +1004,8 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     requested = set(request.requested_skills)
     if role_id == "multimedia_generator":
         return _is_multimedia_generation_request(request.task)
+    if role_id == "video_compositor":
+        return _is_video_composition_request(request.task)
     if role_id == "document_writer":
         return _is_document_generation_request(request.task)
     if role_id == "presentation_designer":
@@ -1627,6 +1642,128 @@ _PROJECT_PACKAGE_GENERATION_NEGATIONS = (
 )
 
 
+_VIDEO_COMPOSITION_ACTION_TERMS = (
+    "compose_video",
+    "compose video",
+    "merge",
+    "stitch",
+    "concatenate",
+    "combine clips",
+    "combine videos",
+    "combine generated",
+    "join clips",
+    "edit these videos",
+    "合成",
+    "合并",
+    "拼接",
+    "串成",
+    "剪辑成",
+    "剪成",
+)
+_VIDEO_COMPOSITION_DELIVERY_TERMS = (
+    "downloadable",
+    "render",
+    "export",
+    "final mp4",
+    "final video",
+    "成片",
+    "导出",
+    "输出",
+)
+_VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS = (
+    "existing clip",
+    "existing clips",
+    "existing video",
+    "existing videos",
+    "existing image",
+    "existing images",
+    "generated clip",
+    "generated clips",
+    "generated video",
+    "generated videos",
+    "generated image",
+    "generated images",
+    "source clip",
+    "source clips",
+    "source video",
+    "source videos",
+    "artifact",
+    "artifacts",
+    "storage_key",
+    "clip",
+    "clips",
+    "still",
+    "stills",
+    "素材",
+    "现有素材",
+    "现有视频",
+    "现有图片",
+    "已有素材",
+    "已有视频",
+    "已有图片",
+    "这些素材",
+    "这些视频",
+    "这些图片",
+    "生成的视频",
+    "生成的图片",
+    "生成的素材",
+    "子 agent",
+    "子agent",
+)
+_VIDEO_COMPOSITION_MEDIA_TERMS = (
+    "clip",
+    "clips",
+    "video",
+    "videos",
+    "image",
+    "images",
+    "still",
+    "stills",
+    "reel",
+    "mp4",
+    "素材",
+    "视频",
+    "图片",
+    "图像",
+    "成片",
+    "短片",
+)
+_VIDEO_COMPOSITION_NEGATIONS = (
+    "不需要生成成片",
+    "不生成成片",
+    "不需要成片",
+    "不要成片",
+    "无需成片",
+    "不需要导出",
+    "不要导出",
+    "无需导出",
+    "not generate",
+    "do not generate",
+    "don't generate",
+    "no need to generate",
+    "no downloadable",
+    "without rendering",
+    "do not render",
+)
+
+
+def _is_video_composition_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _explicit_tool_request(normalized, "compose_video", "compose video"):
+        return True
+    has_merge_intent = any(term in normalized for term in _VIDEO_COMPOSITION_ACTION_TERMS)
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS) and not has_merge_intent:
+        return False
+    has_media_context = any(term in normalized for term in _VIDEO_COMPOSITION_MEDIA_TERMS)
+    if has_merge_intent and has_media_context:
+        return True
+    has_delivery_intent = any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
+    has_existing_context = any(
+        term in normalized for term in _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS
+    )
+    return has_delivery_intent and has_media_context and has_existing_context
+
+
 def _is_multimedia_generation_request(task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", task).casefold()
     if _has_generation_negation(normalized):
@@ -1688,6 +1825,8 @@ def _looks_like_multimedia_explanation(normalized: str) -> bool:
 
 def _is_standalone_multimedia_generation_request(task: str) -> bool:
     normalized = task.casefold()
+    if _is_video_composition_request(task):
+        return False
     if not _is_multimedia_generation_request(task):
         return False
     blocked_terms = (
@@ -1717,6 +1856,19 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "文案",
         "脚本",
         "剧本",
+        "剪辑",
+        "合成",
+        "合并",
+        "拼接",
+        "素材",
+        "成片",
+        "mp4",
+        "merge",
+        "stitch",
+        "concatenate",
+        "combine clips",
+        "combine videos",
+        "edit these videos",
     )
     return not any(term in normalized for term in blocked_terms)
 

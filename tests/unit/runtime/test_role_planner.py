@@ -240,6 +240,111 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+def test_video_editing_delivery_dispatch_adds_compose_video_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="把这些子 Agent 生成的视频和图片素材合成一个30秒竖屏 MP4，最终给我可下载成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert compositor.purpose is RolePurpose.EXECUTE
+    assert "compose_video" in compositor.allowed_tools
+    assert "generate_multimedia" not in compositor.allowed_tools
+
+
+def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="帮我规划这个广告视频的剪辑节奏、转场和字幕，不需要生成成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    editor = plan.role("video_editor")
+
+    assert editor.purpose is RolePurpose.EXECUTE
+    assert "compose_video" not in editor.allowed_tools
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
+def test_english_video_merge_dispatch_adds_compose_video_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Merge the generated clips and still images into one downloadable vertical reel.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert [role.id for role in plan.roles] != ["multimedia_generator"]
+
+
+def test_downloadable_media_generation_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Generate a downloadable product video.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
+def test_merge_existing_clips_routes_to_compositor_even_when_new_generation_is_negated() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Do not generate new videos; merge the existing clips into one MP4.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
+
+
+def test_generated_brief_video_request_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Render a final video from the generated product brief and storyboard.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
+def test_existing_brief_video_request_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Render a final video from the existing product brief and storyboard.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
 def test_compound_script_and_image_request_keeps_text_and_multimedia_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
