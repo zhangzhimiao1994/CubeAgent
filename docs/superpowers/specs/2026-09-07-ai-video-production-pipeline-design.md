@@ -236,7 +236,7 @@ The implementation should introduce a pipeline planner layer separate from the e
 Recommended modules:
 
 - `agent_hub.video.production.schema`
-  - Dataclasses or Pydantic models for scripts, characters, model sheets, costume sheets, storyboard shots, shot videos, and edit decisions.
+  - Strict Pydantic models for scripts, characters, model sheets, costume sheets, storyboard shots, shot videos, and edit decisions.
 - `agent_hub.video.production.prompts`
   - Prompt builders that convert structured records into text prompts for image and video generation.
 - `agent_hub.video.production.planner`
@@ -247,6 +247,20 @@ Recommended modules:
   - New roles for producer, character designer, storyboard artist, shot generator, and compositor.
 
 The existing `agent_hub.video.composer.VideoComposer` remains the low-level media implementation. It should not learn about scripts, characters, storyboards, or provider prompts.
+
+## Dispatch Model
+
+This workflow should be scheduled as an ordered stage graph, not as a flat set of parallel creative roles.
+
+The default dispatch behavior can parallelize many producer-style roles, but video production has hard dependencies:
+
+1. Script must exist before character, scene, storyboard, or shot planning.
+2. Character bible must exist before Character Model Sheet and Costume Sheet prompts.
+3. Character Model Sheets and Costume Sheets must exist before character-visible storyboard frames.
+4. Storyboard frames must exist before shot video generation.
+5. Selected shot video artifacts must exist before final edit composition.
+
+The implementation should therefore add a video-production-specific dispatch planner or a dedicated production workflow builder that emits staged `DispatchPlan` records. Parallelism is allowed only inside a stage after dependencies are satisfied. For example, multiple character sheets can be generated in parallel after the character bible exists, and multiple shot videos can be generated in parallel after storyboard validation passes.
 
 ## Runtime Tool Model
 
@@ -261,6 +275,8 @@ Recommended built-ins:
 - `compose_video`
 
 `compose_video` already exists. The new tools can initially produce structured JSON artifacts and prompt packages without calling provider-specific image or video APIs directly. This keeps the orchestration testable and lets existing multimodal generation capabilities produce the actual images and videos.
+
+Tool outputs should validate against `agent_hub.video.production.schema` before being stored. Invalid stage outputs should fail early with a stable runtime error instead of letting downstream roles infer missing IDs from prose.
 
 Later versions can add provider-backed tools:
 
