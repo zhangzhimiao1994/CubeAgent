@@ -201,7 +201,7 @@ class DownloadableMultimediaExecutor:
         expires_at: datetime | None = None,
     ) -> None:
         self._media_path = media_path
-        self._created_at = created_at or datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+        self._created_at = created_at or datetime(2099, 9, 4, 8, 0, tzinfo=UTC)
         self._expires_at = expires_at or self._created_at + timedelta(hours=24)
         self._job: MultimediaGenerationJob | None = None
 
@@ -2346,7 +2346,7 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
     assert body["job_id"] == "media_downloadable"
     assert body["text"] == media_path.as_uri()
     assert datetime.fromisoformat(body["artifacts"][0]["expires_at"]) == datetime(
-        2026, 9, 5, 8, 0, tzinfo=UTC
+        2099, 9, 5, 8, 0, tzinfo=UTC
     )
     assert body["artifacts"] == [
         {
@@ -2358,7 +2358,7 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
             "size_bytes": len(b"video-bytes"),
             "sha256": "79fd615a866fe7f9eb4da8d9c41ab57e3bd48056df42fd2c13e4d461a87afbe3",
             "download_url": "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download",
-            "expires_at": "2026-09-05T08:00:00Z",
+            "expires_at": "2099-09-05T08:00:00Z",
         }
     ]
 
