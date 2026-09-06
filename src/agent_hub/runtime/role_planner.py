@@ -1716,6 +1716,7 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "提示词",
         "文案",
         "脚本",
+        "剧本",
     )
     return not any(term in normalized for term in blocked_terms)
 

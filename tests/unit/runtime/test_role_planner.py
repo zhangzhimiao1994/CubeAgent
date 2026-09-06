@@ -240,6 +240,24 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+def test_compound_script_and_image_request_keeps_text_and_multimedia_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="给我生成一个修仙短剧剧本，并生成一张女主角设定图。",
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert [role.id for role in plan.roles] != ["multimedia_generator"]
+
+
 def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
