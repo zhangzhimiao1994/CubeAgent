@@ -42,6 +42,13 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_deploy_matrix_native_dry_run_uses_smoke_wrapper() -> None:
+    workflow = read(".github/workflows/deploy-matrix.yml")
+
+    assert "bash tests/install/smoke.sh --mode auto --dry-run" in workflow
+    assert "env AGENT_HUB_TEST=1 bash install.sh --mode auto --dry-run --yes" not in workflow
+
+
 def test_auto_mode_prefers_native_on_supported_systemd_hosts() -> None:
     detect = read("scripts/lib/detect.sh")
     install = read("install.sh")
