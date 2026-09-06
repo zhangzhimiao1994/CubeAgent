@@ -40,6 +40,7 @@ class RecordingRunService:
         conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
+        skip_evolution_proposal: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         self.calls.append(
@@ -52,6 +53,7 @@ class RecordingRunService:
                 "conversation_id": conversation_id,
                 "channel_context": channel_context,
                 "vibe_coding": vibe_coding,
+                "skip_evolution_proposal": skip_evolution_proposal,
                 "idempotency_key": idempotency_key,
             }
         )
@@ -304,6 +306,48 @@ async def test_submitter_keeps_channel_language_directives_as_raw_text_for_main_
     assert isinstance(context, dict)
     assert context["channel_entry_policy"] == "main_agent_decides"
     assert "requested_channel_features" not in context
+
+
+def _robot_message(text: str, *, device_id: str = "pi-01") -> InboundMessage:
+    return InboundMessage(
+        channel=Channel.ROBOT,
+        tenant_external_id="00000000-0000-4000-8000-000000000001",
+        sender_external_id=device_id,
+        conversation_external_id=device_id,
+        message_id="turn_1",
+        event_id="turn_1",
+        conversation_type=ConversationType.PRIVATE,
+        text=text,
+        mentions_bot=True,
+        received_at=datetime(2026, 9, 5, tzinfo=UTC),
+    )
+
+
+async def test_robot_submitter_uses_direct_mode_and_stable_device_conversation() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(
+        run_service=run_service,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        extra_channel_context={"requested_channel_features": "voice_companion"},
+        skip_evolution_proposal=True,
+    )
+
+    await submitter.submit(_robot_message("晚上好"), idempotency_key="robot_1")
+    await submitter.submit(_robot_message("还在吗", device_id="pi-01"), idempotency_key="robot_2")
+
+    assert len(run_service.calls) == 2
+    first = run_service.calls[0]
+    second = run_service.calls[1]
+    assert first["mode"] is TaskMode.DIRECT
+    assert first["skip_evolution_proposal"] is True
+    assert first["conversation_id"] == second["conversation_id"]
+    assert str(first["conversation_id"]).startswith("ch-robot-")
+    context = first["channel_context"]
+    assert isinstance(context, dict)
+    assert context["source_channel"] == "robot"
+    assert context["requested_channel_features"] == "voice_companion"
+    assert context["channel_conversation_external_id"] == "pi-01"
 
 
 async def test_submitter_no_longer_rejects_disabled_vibe_channel_keyword() -> None:

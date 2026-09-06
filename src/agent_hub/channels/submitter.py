@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -43,6 +44,7 @@ class RunSubmissionService(Protocol):
         conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
+        skip_evolution_proposal: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRunLike: ...
 
@@ -69,6 +71,9 @@ class RunServiceInboundSubmitter:
     tenant_id: UUID
     settings_service: ChannelSettingsService | None = None
     identity_resolver: ChannelIdentityResolver | None = None
+    mode: TaskMode = TaskMode.AUTO
+    extra_channel_context: Mapping[str, str] = field(default_factory=dict)
+    skip_evolution_proposal: bool = False
 
     async def submit(self, message: InboundMessage, *, idempotency_key: str) -> UUID:
         task_text = message.text.strip()
@@ -106,15 +111,17 @@ class RunServiceInboundSubmitter:
             tenant_id=self.tenant_id,
             actor_id=actor_id,
             message=task_text,
-            mode=TaskMode.AUTO,
+            mode=self.mode,
             attachment_ids=attachment_ids,
             conversation_id=conversation_id,
             channel_context=_channel_context(
                 message,
                 hints=hints,
                 identity_resolution=identity_resolution,
+                extra=self.extra_channel_context,
             ),
             vibe_coding=False,
+            skip_evolution_proposal=self.skip_evolution_proposal,
             idempotency_key=idempotency_key,
         )
         return submitted.id
@@ -183,6 +190,7 @@ def _channel_context(
     *,
     hints: ChannelResourceHints,
     identity_resolution: str,
+    extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     context = {
         "source_channel": message.channel.value,
@@ -195,6 +203,10 @@ def _channel_context(
         "channel_entry_policy": "main_agent_decides",
         "channel_identity_resolution": identity_resolution,
     }
+    if extra:
+        for key, value in extra.items():
+            if value:
+                context[key] = value
     if hints.skills:
         context["requested_skills"] = ",".join(hints.skills)
     if hints.mcp_servers:

@@ -1,0 +1,18 @@
+[Unit]
+Description=Cube Companion Robot Runtime (Raspberry Pi)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/robot_runtime
+Environment=ROBOT_DEVICE_ID=pi-prototype-01
+Environment=ROBOT_CLOUD_WS_URL=wss://CHANGE_ME/api/robot/v1/ws
+Environment=ROBOT_DEVICE_TOKEN=
+ExecStart=/opt/robot_runtime/.venv/bin/robot-runtime
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

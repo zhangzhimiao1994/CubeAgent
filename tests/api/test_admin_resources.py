@@ -201,7 +201,7 @@ class DownloadableMultimediaExecutor:
         expires_at: datetime | None = None,
     ) -> None:
         self._media_path = media_path
-        self._created_at = created_at or datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+        self._created_at = created_at or datetime.now(UTC)
         self._expires_at = expires_at or self._created_at + timedelta(hours=24)
         self._job: MultimediaGenerationJob | None = None
 
@@ -2327,8 +2327,10 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     media_path = tmp_path / "generated-video.mp4"
     media_path.write_bytes(b"video-bytes")
+    expires_at = datetime(2099, 1, 1, 8, 0, tzinfo=UTC)
     cast(Any, api.app).state.multimedia_generation_executor = DownloadableMultimediaExecutor(
-        media_path
+        media_path,
+        expires_at=expires_at,
     )
 
     response = api.post(
@@ -2345,9 +2347,7 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
     body = response.json()
     assert body["job_id"] == "media_downloadable"
     assert body["text"] == media_path.as_uri()
-    assert datetime.fromisoformat(body["artifacts"][0]["expires_at"]) == datetime(
-        2026, 9, 5, 8, 0, tzinfo=UTC
-    )
+    assert datetime.fromisoformat(body["artifacts"][0]["expires_at"]) == expires_at
     assert body["artifacts"] == [
         {
             "kind": "video",
@@ -2358,7 +2358,7 @@ def test_multimedia_generate_exposes_downloadable_generated_file(tmp_path: Path)
             "size_bytes": len(b"video-bytes"),
             "sha256": "79fd615a866fe7f9eb4da8d9c41ab57e3bd48056df42fd2c13e4d461a87afbe3",
             "download_url": "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download",
-            "expires_at": "2026-09-05T08:00:00Z",
+            "expires_at": "2099-01-01T08:00:00Z",
         }
     ]
 

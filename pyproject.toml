@@ -50,6 +50,7 @@ markers = [
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["device"]
 
 [tool.mypy]
 strict = true

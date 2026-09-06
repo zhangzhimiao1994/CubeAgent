@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-runtime"
+version = "0.0.1"
+description = "Raspberry Pi on-device runtime for voice companion"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.10,<3",
+    "websockets>=14,<16",
+]
+
+[project.scripts]
+robot-runtime = "robot_runtime.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robot_runtime"]

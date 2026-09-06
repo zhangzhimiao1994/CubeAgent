@@ -648,6 +648,16 @@ CHANNEL_DEFINITIONS: tuple[ChannelDefinition, ...] = (
         webhook_path="/channels/custom/events",
         notes=("用于兼容其他支持 HTTP Webhook 的聊天软件；配置共享令牌后可接收 JSON 文本消息。",),
     ),
+    ChannelDefinition(
+        id="robot",
+        name="语音陪伴机器人",
+        transports=("websocket",),
+        required_env=(),
+        webhook_path="/api/robot/v1/ws",
+        notes=(
+            "树莓派只做麦/喇叭/回合；云端经 RunService DIRECT 提交，复用记忆注入与模型池。",
+        ),
+    ),
 )
 
 

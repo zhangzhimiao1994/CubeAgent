@@ -204,6 +204,17 @@ def test_compose_env_example_uses_prefixed_application_environment() -> None:
     assert "${POSTGRES_PASSWORD}" not in example
 
 
+def test_deploy_matrix_native_detect_uses_writable_installer_dirs() -> None:
+    workflow = read(".github/workflows/deploy-matrix.yml")
+
+    assert "AGENT_HUB_TEST=1" in workflow
+    assert "AGENT_HUB_CONFIG_DIR=" in workflow
+    assert "AGENT_HUB_STATE_DIR=" in workflow
+    assert "AGENT_HUB_INSTALL_ROOT=" in workflow
+    assert "AGENT_HUB_PUBLIC_URL=" in workflow
+    assert "bash install.sh --mode auto --dry-run --yes" in workflow
+
+
 def test_readme_uses_repository_checkout_instead_of_placeholder_install_url() -> None:
     readme = read("README.md")
 
