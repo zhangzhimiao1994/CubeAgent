@@ -56,4 +56,4 @@ CubeAgent 是云端大脑。树莓派只做前端，不跑模型。
 
 中国区陪伴可用 DashScope compatible-mode 的 Whisper 兼容 ASR + CosyVoice，或任意 OpenAI 兼容网关。不要把密钥写进树莓派镜像。
 
-细节见 `docs/cloud-robot-api.md` 与 `device/README.md`。
+部署、升级、环境变量落点与从云到派的分层调试见 [voice-companion-deploy-debug.md](voice-companion-deploy-debug.md)。协议字段见 `docs/cloud-robot-api.md`，派上操作见 `device/README.md`。

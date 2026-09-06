@@ -10,13 +10,14 @@
 | `device/image/firstboot.sh` | 一键安装并注册 systemd 服务 |
 | `docs/architecture.md` | 整体架构（后端 vs 前端） |
 | `docs/cloud-robot-api.md` | 后端 `/api/robot/v1` 接口 |
+| `docs/voice-companion-deploy-debug.md` | **服务器部署 + 从云到派的分层调试**（先看这篇再 firstboot） |
 
 ---
 
 ## 开箱路径
 
-1. **部署 CubeAgent**（服务器上 `install.sh` 或现有生产指针 `/opt/agent-hub/current`）
-2. **配置云端 STT/TTS 凭证**（`AGENT_HUB_ROBOT_STT_*` / `AGENT_HUB_ROBOT_TTS_*`，见 `docs/architecture.md`）。未配置时仍可用文本调试回合。
+1. **部署 CubeAgent**（服务器上 `install.sh` 或现有生产指针 `/opt/agent-hub/current`）。完整步骤与分层调试见 [docs/voice-companion-deploy-debug.md](../docs/voice-companion-deploy-debug.md)。
+2. **配置云端 STT/TTS 凭证**（`AGENT_HUB_ROBOT_STT_*` / `AGENT_HUB_ROBOT_TTS_*`，见该文档与 `docs/architecture.md`）。未配置时仍可用文本调试回合。
 3. **注册设备**，拿到 `device_token`
 4. **树莓派 firstboot**，指向 `wss://YOUR_HOST/api/robot/v1/ws`
 5. **对着麦克风说话**（接好真实声卡后）；云端 STT → 主 Agent + 记忆 → TTS 播报

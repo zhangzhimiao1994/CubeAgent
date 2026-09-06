@@ -2,6 +2,8 @@
 
 树莓派前端与 CubeAgent 云端大脑的协议。鉴权用设备 Token，不走控制台 JWT。
 
+部署与整链路调试（注册、文本/音频 WS 示例、故障表）见 [voice-companion-deploy-debug.md](voice-companion-deploy-debug.md)。
+
 音频帧使用 **JSON + base64**（与 Starlette `receive_json` / 派上 `websockets` 文本帧一致），不使用二进制 WebSocket 帧。
 
 ## 注册设备
