@@ -738,6 +738,8 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     ("task_text", "expected_kind"),
     [
         ("给我做一张图片版设定板。", "image"),
+        ("根据剧情以Character Model Sheet的形式生成角色参考设定表。", "image"),
+        ("生成角色设定表。", "image"),
         ("出一张赛博朋克产品概念图。", "image"),
         ("生成三张可下载表情包贴纸。", "image"),
         ("做一张商品 3D 渲染图。", "image"),

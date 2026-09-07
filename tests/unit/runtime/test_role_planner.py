@@ -363,6 +363,30 @@ def test_compound_script_and_image_request_keeps_text_and_multimedia_roles() -> 
     assert [role.id for role in plan.roles] != ["multimedia_generator"]
 
 
+def test_character_model_sheet_request_keeps_text_and_multimedia_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "给我生成一个剧本，大概的背景是中西方融合的修仙神话体系下，"
+                "男主角是一个异类，无法进行修仙也无法获得神位的认可，其实男主角是仙神魔的混合，"
+                "所以一开始完全无法修炼，后续因为一些机缘，成功踏上修行一途，但是又差点入魔，"
+                "女主角是东西方融合的结晶，既能修仙也能继承神位，为了男主角回归，苦苦追寻男主角。"
+                "然后根据剧情以Character Model Sheet的形式生成角色参考设定表"
+            ),
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "director" in role_ids
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert [role.id for role in plan.roles] != ["multimedia_generator"]
+
+
 def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
