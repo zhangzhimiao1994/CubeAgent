@@ -2594,7 +2594,6 @@ _MEDIA_PIPELINE_SCRIPT_TERMS = (
     "剧本",
     "脚本",
     "故事大纲",
-    "剧情",
 )
 _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
     "character model sheet",

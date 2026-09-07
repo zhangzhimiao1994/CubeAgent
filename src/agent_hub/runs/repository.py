@@ -450,12 +450,21 @@ class RunRepository:
             artifact_id = routing_decision.get("approval_artifact_id")
             if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
                 raise RunConflict("artifact review payload is invalid")
-            raw_approved_artifacts = routing_decision.get("approved_artifacts")
+            media_pipeline_plan = routing_decision.get("media_pipeline_plan")
+            plan = dict(media_pipeline_plan) if isinstance(media_pipeline_plan, dict) else None
+            raw_plan_approved = (
+                plan.get("approved_artifacts") if plan is not None else None
+            )
+            raw_approved_artifacts = (
+                raw_plan_approved
+                if isinstance(raw_plan_approved, list)
+                else routing_decision.get("approved_artifacts")
+            )
             approved_artifacts = (
                 list(raw_approved_artifacts) if isinstance(raw_approved_artifacts, list) else []
             )
             approved_artifacts.append({"stage_id": stage_id, "artifact_id": artifact_id})
-            row.routing_decision = {
+            updated_routing = {
                 **{
                     key: value
                     for key, value in routing_decision.items()
@@ -467,10 +476,18 @@ class RunRepository:
                         "approval_action",
                         "approval_stage_id",
                         "approval_artifact_id",
+                        "approved_artifacts",
                     }
                 },
-                "approved_artifacts": approved_artifacts,
             }
+            if plan is None:
+                updated_routing["approved_artifacts"] = approved_artifacts
+            else:
+                updated_routing["media_pipeline_plan"] = {
+                    **plan,
+                    "approved_artifacts": approved_artifacts,
+                }
+            row.routing_decision = updated_routing
             row.status = RunStatus.QUEUED.value
             row.version += 1
             await session.flush()

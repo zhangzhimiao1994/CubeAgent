@@ -230,6 +230,30 @@ async def test_script_request_records_long_lived_media_pipeline_plan_without_slo
     assert all(stage["status"] == "planned" for stage in plan["stages"][1:])
 
 
+async def test_character_sheet_from_story_context_does_not_create_media_pipeline_plan() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="根据这个剧情生成 Character Model Sheet 形式的角色参考设定表。",
+        mode=TaskMode.DISPATCH,
+        conversation_id="conv-character-sheet-only",
+        idempotency_key="idem-character-sheet-only",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert "media_pipeline_plan" not in routing
+
+
 async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()

@@ -192,7 +192,14 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         stage_id = decision.get("approval_stage_id")
         artifact_id = decision.get("approval_artifact_id")
-        raw_approved = decision.get("approved_artifacts")
+        raw_plan = decision.get("media_pipeline_plan")
+        plan = dict(raw_plan) if isinstance(raw_plan, dict) else None
+        raw_plan_approved = plan.get("approved_artifacts") if plan is not None else None
+        raw_approved = (
+            raw_plan_approved
+            if isinstance(raw_plan_approved, list)
+            else decision.get("approved_artifacts")
+        )
         approved = list(raw_approved) if isinstance(raw_approved, list) else []
         approved.append({"stage_id": stage_id, "artifact_id": artifact_id})
         updated_decision = {
@@ -206,8 +213,16 @@ class FakeRepository:
                 "approval_action",
                 "approval_stage_id",
                 "approval_artifact_id",
+                "approved_artifacts",
             }
         }
+        if plan is None:
+            updated_decision["approved_artifacts"] = approved
+        else:
+            updated_decision["media_pipeline_plan"] = {
+                **plan,
+                "approved_artifacts": approved,
+            }
         updated = RunRecord(
             id=record.id,
             tenant_id=record.tenant_id,
@@ -217,7 +232,7 @@ class FakeRepository:
             status=RunStatus.QUEUED,
             version=record.version + 1,
             created_at=record.created_at,
-            routing_decision={**updated_decision, "approved_artifacts": approved},
+            routing_decision=updated_decision,
         )
         self.records[run_id] = updated
         self.outbox.append((run_id, f"{tenant_id}:{run_id}:artifact-review:{version}"))
@@ -1036,6 +1051,11 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
         created_at=datetime.now(UTC),
         routing_decision={
             "source": "video_pipeline",
+            "media_pipeline_plan": {
+                "plan_id": "media-plan-001",
+                "status": "planned",
+                "approved_artifacts": [],
+            },
             "reason": "runtime_artifact_review_required",
             "approval_kind": "runtime_artifact_review",
             "approval_id": "artifact-review-test",
@@ -1063,9 +1083,12 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
     assert repository.outbox == [(run_id, f"{tenant_id}:{run_id}:artifact-review:7")]
     routing = repository.records[run_id].routing_decision
     assert routing is not None
-    assert routing["approved_artifacts"] == [
+    plan = routing["media_pipeline_plan"]
+    assert isinstance(plan, dict)
+    assert plan["approved_artifacts"] == [
         {"stage_id": "character_model_sheet", "artifact_id": "artifact-001"}
     ]
+    assert "approved_artifacts" not in routing
     assert "approval_id" not in routing
     assert "approval_kind" not in routing
 
