@@ -192,7 +192,8 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         stage_id = decision.get("approval_stage_id")
         artifact_id = decision.get("approval_artifact_id")
-        approved = list(decision.get("approved_artifacts", []))
+        raw_approved = decision.get("approved_artifacts")
+        approved = list(raw_approved) if isinstance(raw_approved, list) else []
         approved.append({"stage_id": stage_id, "artifact_id": artifact_id})
         updated_decision = {
             key: value
