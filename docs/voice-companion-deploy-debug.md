@@ -445,6 +445,28 @@ aplay /tmp/test.wav
 
 ---
 
+## 从可达机器跑 live smoke
+
+Cursor 云端 VM 访问 `http://103.236.93.62:32020/` 会 TCP 超时（安全组未放行该出口 IP）。请在**能打开该 URL 的电脑**上跑：
+
+```bash
+python3 scripts/robot-live-smoke.py --base-url http://103.236.93.62:32020
+```
+
+标准库即可（无需 `pip install websockets`）。脚本会打 L0 `/health` `/health/live` `/health/ready`、L2 `register`（`device_id=debug-pi-smoke`）、L3 文本 WS。可选：
+
+```bash
+python3 scripts/robot-live-smoke.py --base-url http://103.236.93.62:32020 --audio
+python3 scripts/robot-live-smoke.py --base-url http://103.236.93.62:32020 --barge-in
+python3 scripts/robot-live-smoke.py --base-url http://103.236.93.62:32020 --audio --barge-in
+```
+
+`--audio` 会发一小段 pcm16 和 `audio.end`；`audio.end` 带调试 `text`，以便 STT 未配置时仍能走 DIRECT。`--barge-in` 在第一条 `text_delta` 后发 `barge_in`（若同时 `--audio`，打断的是音频那一轮）。
+
+每层打印 `PASS` / `FAIL`；硬失败退出码非 0。把完整终端输出贴回来即可继续排。不要把输出里的 `device_token` 提交到 Git。
+
+---
+
 ## 建议验收顺序
 
 1. L0 → L1 → L2 → L3（文本陪伴已成立）。  
