@@ -1155,6 +1155,8 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "做成动画",
     "做成成片",
     "做成短片",
+    "剪辑成片",
+    "剪成片",
     "出一张图",
     "出一张图片",
     "出一张海报",
@@ -1760,12 +1762,12 @@ def _is_video_composition_request(task: str) -> bool:
     if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS) and not has_merge_intent:
         return False
     has_media_context = any(term in normalized for term in _VIDEO_COMPOSITION_MEDIA_TERMS)
-    if has_merge_intent and has_media_context:
-        return True
-    has_delivery_intent = any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
     has_existing_context = any(
         term in normalized for term in _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS
     )
+    if has_merge_intent and has_media_context:
+        return has_existing_context
+    has_delivery_intent = any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
     return has_delivery_intent and has_media_context and has_existing_context
 
 

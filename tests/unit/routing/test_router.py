@@ -246,6 +246,7 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
         "给我做一张图片版设定板。",
         "出一张赛博朋克产品概念图。",
         "生成一段 8 秒动画短片。",
+        "根据分镜剪辑成片。",
         "为开场白合成一段旁白配音。",
         "给发布会做一段 BGM 背景音乐。",
         (

@@ -257,6 +257,30 @@ def test_video_editing_delivery_dispatch_adds_compose_video_tool_role() -> None:
     assert "generate_multimedia" not in compositor.allowed_tools
 
 
+@pytest.mark.parametrize(
+    "task",
+    (
+        "根据分镜剪辑成片。",
+        "生成视频并剪辑成片。",
+        "先生成角色参考设定表、服装设定板和分镜图，最终剪辑成片。",
+    ),
+)
+def test_final_video_requests_generate_video_without_composing_missing_assets(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" not in role_ids
+
+
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

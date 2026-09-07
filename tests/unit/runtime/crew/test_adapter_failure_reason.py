@@ -744,6 +744,7 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
         ("生成三张可下载表情包贴纸。", "image"),
         ("做一张商品 3D 渲染图。", "image"),
         ("把这个故事做成 8 秒动画短片成片。", "video"),
+        ("根据分镜剪辑成片。", "video"),
         ("为这段开场白合成一段旁白配音。", "audio"),
         ("给品牌发布会做一段 BGM 背景音乐。", "audio"),
     ],
