@@ -9,9 +9,17 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.crew.adapter import (
     CrewAgentDefinition,
     CrewDispatchRuntime,
@@ -92,6 +100,28 @@ class EmptyThenSuccessGateway:
             logical_model=request.logical_model,
             provider_id="deepseek",
             provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class EmptyErrorThenSuccessGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelGatewayError(
+                "model response text is empty",
+                logical_models=("qwen",),
+                deployments=("qwen_1",),
+            )
+        return GatewayCompletion(
+            response=ModelResponse(text="recovered answer", usage=TokenUsage(1, 1, 2)),
+            deployment_id="qwen_1",
+            logical_model=request.logical_model,
+            provider_id="qwen",
+            provider_model="qwen/qwen-max",
             cost_usd=Decimal(0),
         )
 
@@ -595,6 +625,7 @@ def _optional_reviewer_step_plan() -> DispatchPlan:
 def _context(
     *,
     artifacts: tuple[Artifact, ...] = (),
+    checkpoint: RuntimeCheckpoint | None = None,
     timeout_seconds: float = 60.0,
     request: str = "Write a short answer",
 ) -> TaskContext:
@@ -604,6 +635,7 @@ def _context(
         mode=TaskMode.DISPATCH,
         request=request,
         artifacts=artifacts,
+        checkpoint=checkpoint,
         timeout_seconds=timeout_seconds,
         token_budget=1000,
     )
@@ -1018,6 +1050,64 @@ async def test_dispatch_step_empty_model_response_retries_before_failing() -> No
     assert retry.reason == "model returned empty response; retrying with explicit output request"
     assert retry.payload["strategy"] == "empty_response_retry"
     assert retry.payload["error_code"] == "model.empty_response"
+
+
+async def test_dispatch_step_gateway_empty_response_error_retries_before_failing() -> None:
+    gateway = EmptyErrorThenSuccessGateway()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "model returned empty response; retrying with explicit output request"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    assert retry.payload["error_code"] == "model.empty_response"
+    assert retry.payload["logical_models"] == "qwen"
+    assert retry.payload["deployments"] == "qwen_1"
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    model_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert len(model_states) == 1
+    assert next(iter(model_states.values()))["status"] == "succeeded"
+    restored_gateway = EmptyErrorThenSuccessGateway()
+    restored = CrewDispatchRuntime(
+        restored_gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(checkpoint=checkpoint, artifacts=stored_artifacts)
+        )
+    ]
+    assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
+    assert restored_gateway.calls == 0
+    await CrewDispatchRuntime(
+        EmptyErrorThenSuccessGateway(),
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+    ).restore_checkpoint(checkpoint)
 
 
 async def test_optional_reviewer_agent_step_model_failure_is_skipped_with_model_context() -> None:

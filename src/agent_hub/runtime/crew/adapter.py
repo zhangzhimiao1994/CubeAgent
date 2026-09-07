@@ -1069,6 +1069,10 @@ class ModelStateBoundary(Protocol):
     async def __call__(self, key: str, model_state: Mapping[str, JsonValue]) -> None: ...
 
 
+class ModelStateDropBoundary(Protocol):
+    async def __call__(self, key: str) -> None: ...
+
+
 class UsageBoundary(Protocol):
     async def __call__(
         self,
@@ -1753,6 +1757,30 @@ class CrewDispatchRuntime:
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
+            async def model_state_drop_boundary(key: str) -> None:
+                async with checkpoint_lock:
+                    if not run_open or not self._is_current_run(state):
+                        return
+                    if usage_ledger.terminal_phase is not None:
+                        return
+                    model_ledger.states.pop(key, None)
+                    model_ledger.artifacts.pop(key, None)
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        tool_ledger,
+                        model_ledger,
+                        usage_ledger,
+                        review_ledger,
+                        next_sequence=sequence.value + 2,
+                        terminal=False,
+                        phase="running",
+                    )
+                    self._publish_checkpoint(state, checkpoint)
+                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+
             async def usage_boundary(
                 completion: GatewayCompletion,
                 actor: str,
@@ -1994,6 +2022,7 @@ class CrewDispatchRuntime:
                             boundary,
                             tool_boundary,
                             model_state_boundary,
+                            model_state_drop_boundary,
                             usage_boundary,
                             tool_ledger,
                             model_ledger,
@@ -2258,6 +2287,7 @@ class CrewDispatchRuntime:
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
         model_state_boundary: ModelStateBoundary,
+        model_state_drop_boundary: ModelStateDropBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
@@ -2307,6 +2337,7 @@ class CrewDispatchRuntime:
                     checkpoint_boundary,
                     tool_boundary,
                     model_state_boundary,
+                    model_state_drop_boundary,
                     usage_boundary,
                     tool_ledger,
                     model_ledger,
@@ -2664,6 +2695,7 @@ class CrewDispatchRuntime:
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
         model_state_boundary: ModelStateBoundary,
+        model_state_drop_boundary: ModelStateDropBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
@@ -2764,6 +2796,7 @@ class CrewDispatchRuntime:
                         checkpoint_boundary,
                         tool_boundary,
                         model_state_boundary,
+                        model_state_drop_boundary,
                         usage_boundary,
                         tool_ledger,
                         model_ledger,
@@ -3143,6 +3176,7 @@ class CrewDispatchRuntime:
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
         model_state_boundary: ModelStateBoundary,
+        model_state_drop_boundary: ModelStateDropBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
@@ -3242,7 +3276,9 @@ class CrewDispatchRuntime:
                 await model_state_boundary(key, prepared)
                 existing = prepared
             if completion is None:
-                running = dict(existing)
+                prepared = dict(existing)
+                prepared["status"] = "prepared"
+                running = dict(prepared)
                 running["status"] = "running"
                 await model_state_boundary(key, running)
                 try:
@@ -3318,6 +3354,43 @@ class CrewDispatchRuntime:
                     failure_reason = safe_runtime_failure_reason(
                         error, fallback="model gateway failed"
                     )
+                    if (
+                        empty_response_retries < _EMPTY_RESPONSE_RECOVERY_RETRIES
+                        and self._is_empty_response_failure_reason(failure_reason)
+                    ):
+                        await model_state_drop_boundary(key)
+                        call_cursor.value = call_index
+                        empty_response_retries += 1
+                        diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
+                        await emit(
+                            kind=EventKind.STEP_RETRYING,
+                            step_id=step.id,
+                            actor=agent.id,
+                            reason="model returned empty response; retrying with explicit output request",
+                            payload={
+                                "attempt": retries + 1,
+                                "model_attempt": call_index + 2,
+                                "strategy": "empty_response_retry",
+                                "fallback_policy": "retry_once_then_fail",
+                                "warning": "model response text is empty",
+                                **diagnostic,
+                            },
+                        )
+                        messages.append(
+                            ModelMessage(
+                                role="user",
+                                content=(
+                                    "The previous model response was empty. Return a non-empty, "
+                                    "directly usable answer for the task. If the task cannot be "
+                                    "completed, state the concrete blocker in one short paragraph."
+                                ),
+                            )
+                        )
+                        error.__traceback__ = None
+                        error.__context__ = None
+                        error.__cause__ = None
+                        del error
+                        continue
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -4029,6 +4102,11 @@ class CrewDispatchRuntime:
         if not isinstance(response, ModelResponse):
             return False
         return response.text is not None and not response.text.strip() and not response.tool_calls
+
+    @staticmethod
+    def _is_empty_response_failure_reason(reason: str) -> bool:
+        lowered = reason.lower()
+        return "model response text is empty" in lowered or "model response is empty" in lowered
 
     @staticmethod
     def _valid_response(completion: GatewayCompletion) -> ModelResponse:
