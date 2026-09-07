@@ -255,6 +255,7 @@ def test_video_editing_delivery_dispatch_adds_compose_video_tool_role() -> None:
     assert compositor.purpose is RolePurpose.EXECUTE
     assert "compose_video" in compositor.allowed_tools
     assert "generate_multimedia" not in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
 
 
 @pytest.mark.parametrize(

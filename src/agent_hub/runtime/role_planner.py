@@ -1003,7 +1003,9 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
     requested = set(request.requested_skills)
     if role_id == "multimedia_generator":
-        return _is_multimedia_generation_request(request.task)
+        return _is_multimedia_generation_request(request.task) and not _is_video_composition_request(
+            request.task
+        )
     if role_id == "video_compositor":
         return _is_video_composition_request(request.task)
     if role_id == "document_writer":
