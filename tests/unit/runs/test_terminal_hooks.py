@@ -228,6 +228,32 @@ class RuntimeRequestsArtifactReview(RuntimeCompletes):
         )
 
 
+class RuntimeCompletesAfterCapabilityApproval(RuntimeCompletes):
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.APPROVAL_REQUESTED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="operator",
+            approval_id="approval_1",
+            action="tool_execute",
+            reason="requires_user_approval",
+        )
+        yield RunEvent(
+            kind=EventKind.APPROVAL_RESOLVED,
+            sequence=2,
+            run_id=context.run_id,
+            actor="operator",
+            approval_id="approval_1",
+            decision="approved",
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=3,
+            run_id=context.run_id,
+        )
+
+
 class RecordingHermesAdvisor:
     def __init__(self) -> None:
         self.outcomes: list[HermesRunOutcome] = []
@@ -334,6 +360,39 @@ async def test_execute_waits_for_user_approval_after_runtime_artifact_review_req
     assert submitted.status is RunStatus.WAITING_APPROVAL
     assert repository.row.status == RunStatus.WAITING_APPROVAL.value
     assert hook.calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_continues_after_non_artifact_approval_events() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    hook = RecordingHook()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletesAfterCapabilityApproval(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        terminal_run_hooks=(hook,),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert repository.row.status == RunStatus.COMPLETED.value
+    assert [event.kind for event in repository.events] == [
+        EventKind.APPROVAL_REQUESTED,
+        EventKind.APPROVAL_RESOLVED,
+        EventKind.RUNTIME_COMPLETED,
+    ]
+    assert hook.calls == [
+        {
+            "tenant_id": TENANT_ID,
+            "actor_id": ACTOR_ID,
+            "run_id": repository.run_id,
+            "status": RunStatus.COMPLETED,
+            "mode": TaskMode.DISPATCH,
+            "routing_decision": {"source": "manual"},
+        }
+    ]
 
 
 @pytest.mark.asyncio

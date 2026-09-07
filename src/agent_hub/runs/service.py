@@ -20,7 +20,7 @@ from agent_hub.routing.rules import assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
@@ -1138,7 +1138,7 @@ class RunService:
                         terminal = RunStatus.CANCELLED
                     elif event.kind is EventKind.RUNTIME_FAILED:
                         terminal = RunStatus.FAILED
-                    elif event.kind is EventKind.APPROVAL_REQUESTED:
+                    elif _is_runtime_artifact_review_request(event):
                         terminal = RunStatus.WAITING_APPROVAL
                     if terminal is not RunStatus.RUNNING:
                         locked.status = terminal.value
@@ -1150,10 +1150,7 @@ class RunService:
                             locked.routing_decision = {
                                 **routing_decision,
                                 "reason": "runtime_artifact_review_required",
-                                "approval_kind": event.payload.get(
-                                    "approval_kind",
-                                    "runtime_artifact_review",
-                                ),
+                                "approval_kind": "runtime_artifact_review",
                                 "approval_id": event.approval_id,
                                 "approval_action": event.action,
                                 "approval_stage_id": event.payload.get("stage_id"),
@@ -2216,6 +2213,14 @@ def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
     if type(configured_tokens) is not int or configured_tokens <= 0:
         return 1_000_000
     return max(1, min(configured_tokens, 10_000_000))
+
+
+def _is_runtime_artifact_review_request(event: RunEvent) -> bool:
+    return (
+        event.kind is EventKind.APPROVAL_REQUESTED
+        and event.action == "artifact_review"
+        and event.payload.get("approval_kind") == "runtime_artifact_review"
+    )
 
 
 def _conversation_history_token_budget(
