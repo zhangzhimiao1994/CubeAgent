@@ -53,6 +53,7 @@ class ConversationContextItem:
     run_id: UUID
     request: str
     artifacts: tuple[dict[str, object], ...]
+    routing_decision: dict[str, object] | None = None
 
 
 class RunNotFound(RuntimeError):
@@ -424,6 +425,68 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def approve_artifact_review_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for artifact review")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "runtime_artifact_review":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("approval_id") != approval_id:
+                raise RunConflict("artifact review approval id is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            stage_id = routing_decision.get("approval_stage_id")
+            artifact_id = routing_decision.get("approval_artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                raise RunConflict("artifact review payload is invalid")
+            raw_approved_artifacts = routing_decision.get("approved_artifacts")
+            approved_artifacts = (
+                list(raw_approved_artifacts) if isinstance(raw_approved_artifacts, list) else []
+            )
+            approved_artifacts.append({"stage_id": stage_id, "artifact_id": artifact_id})
+            row.routing_decision = {
+                **{
+                    key: value
+                    for key, value in routing_decision.items()
+                    if key
+                    not in {
+                        "reason",
+                        "approval_kind",
+                        "approval_id",
+                        "approval_action",
+                        "approval_stage_id",
+                        "approval_artifact_id",
+                    }
+                },
+                "approved_artifacts": approved_artifacts,
+            }
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:artifact-review:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
     async def enqueue_existing_run(
         self,
         *,
@@ -785,6 +848,9 @@ class RunRepository:
                     run_id=row.id,
                     request=row.request,
                     artifacts=tuple(artifacts_by_run.get(row.id, ())),
+                    routing_decision=None
+                    if row.routing_decision is None
+                    else dict(row.routing_decision),
                 )
                 for row in ordered_rows
             )

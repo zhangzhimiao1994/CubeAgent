@@ -734,6 +734,61 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     assert completed.payload["logical_model"] == "media_primary"
 
 
+async def test_user_review_gate_requests_approval_before_downstream_step() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="character_designer",
+                role="Character Designer",
+                goal="Generate character references",
+                logical_model="general",
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Finish after approval",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="character_designer",
+                task="Generate Character Model Sheet.",
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Continue only after the model sheet is approved.",
+                depends_on=("character_model_sheet",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色设定后再剪辑成片"))]
+
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    assert approval.action == "artifact_review"
+    assert approval.actor == "character_designer"
+    assert approval.payload["stage_id"] == "character_model_sheet"
+    assert approval.payload["artifact_id"]
+    assert not any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in events
+    )
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
 @pytest.mark.parametrize(
     ("task_text", "expected_kind"),
     [

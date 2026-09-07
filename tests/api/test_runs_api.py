@@ -284,6 +284,26 @@ class StubRunService:
             temporary_agent_proposal=None,
         )
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         return RunSummary(
             id=run_id,
@@ -932,6 +952,21 @@ def test_revise_temporary_agent_accepts_user_feedback_and_queues_run() -> None:
             "version": 1,
             "feedback": "不要加工程师，先让产品经理重新拆任务。",
         },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_approve_artifact_review_queues_waiting_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/approve",
+        headers=bearer(),
+        json={"version": 3},
     )
 
     assert response.status_code == 202

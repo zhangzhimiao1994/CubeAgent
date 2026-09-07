@@ -593,6 +593,65 @@ async def test_selected_dispatch_agents_do_not_hide_required_multimedia_generati
     )
 
 
+@pytest.mark.asyncio
+async def test_media_pipeline_generation_step_requires_user_review_when_intermediate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="先生成角色参考设定表、服装设定板和分镜图，最终剪辑成片。",
+                routing_decision={
+                    "main_agent_model": "main",
+                    "media_pipeline_plan": {
+                        "plan_id": "media-plan-001",
+                        "status": "planned",
+                    },
+                },
+            )
+        )
+    ]
+
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    media_step = next(step for step in steps if step["agent"] == "multimedia_generator")
+    assert media_step["requires_user_review"] is True
+
+
 @pytest.mark.parametrize(
     "task_text",
     [

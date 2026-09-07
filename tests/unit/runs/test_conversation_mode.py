@@ -191,6 +191,45 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
     }
 
 
+async def test_script_request_records_long_lived_media_pipeline_plan_without_slots() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="先生成一个短剧剧本，后续我可能要生成角色参考设定表、分镜图并剪辑成片。",
+        mode=TaskMode.HYBRID,
+        conversation_id="conv-video-plan",
+        idempotency_key="idem-video-plan",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    plan = routing.get("media_pipeline_plan")
+    assert isinstance(plan, dict)
+    assert plan["status"] == "planned"
+    assert plan["execution_slots"] == []
+    assert [stage["id"] for stage in plan["stages"]] == [
+        "script",
+        "character_model_sheet",
+        "costume_sheet",
+        "scene_prop_assets",
+        "storyboard",
+        "shot_videos",
+        "edit_decision_list",
+        "compose_video",
+    ]
+    assert plan["stages"][0]["status"] == "completed"
+    assert all(stage["status"] == "planned" for stage in plan["stages"][1:])
+
+
 async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()

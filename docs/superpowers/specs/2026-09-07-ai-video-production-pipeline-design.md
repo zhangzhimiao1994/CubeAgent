@@ -37,6 +37,12 @@ This design does not require a timeline editor UI, manual trim UI, non-linear mu
 
 The pipeline has seven ordered stages.
 
+The script stage can also create a long-lived `media_pipeline_plan`. This plan is
+not an execution slot and has no automatic expiry. It records the downstream
+stages that can be started later, but it does not create child agents, reserve
+model capacity, or call image/video/composition tools until the user explicitly
+asks to run a stage.
+
 ### 1. Script
 
 The script stage converts the user brief into a structured production script.
@@ -372,6 +378,28 @@ Failures should be localized to a stage.
 
 Each retry creates a new attempt record and never overwrites the previous asset. The selected attempt is explicit.
 
+## User Review Gates
+
+Every downstream artifact that affects later generation must be reviewed by the
+user before dependent stages continue. Script text is the exception: it may
+complete normally while storing a reusable `media_pipeline_plan`.
+
+Review-gated intermediate stages include:
+
+- Character Model Sheet.
+- Costume Sheet.
+- Scene and prop assets.
+- Storyboard images.
+- Shot video attempts.
+- Edit decision lists before final composition.
+
+When a gated stage completes, runtime saves a checkpoint, emits
+`approval.requested` with `approval_kind=runtime_artifact_review`, and leaves the
+run in `waiting_approval`. Approving the review requeues the same run and
+continues from the saved checkpoint. Standalone final media requests are not
+gated only because they produce media; the gate applies when the produced media
+is an intermediate dependency for later generation or composition.
+
 ## Data And Storage
 
 For the first implementation, generated media assets should continue using `GeneratedFileStore`.
@@ -387,6 +415,11 @@ Structured pipeline records can be stored as generated JSON artifacts initially:
 - `edit-decision-list.json`
 
 This avoids a database migration in the first implementation. If the workflow becomes interactive or long-running across sessions, promote these records to database tables later.
+
+The first implementation may store `media_pipeline_plan` in run
+`routing_decision` and expose it through conversation history so future turns in
+the same conversation can continue the plan. The plan is durable context, not a
+reserved worker slot.
 
 ## First Implementation Boundary
 

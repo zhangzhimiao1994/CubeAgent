@@ -167,6 +167,7 @@ class DispatchStep(_PlanModel):
     tools: tuple[str, ...] = ()
     reviewer: str | None = None
     reviewer_retries: int = Field(default=0, ge=0, le=8)
+    requires_user_review: bool = False
     final_synthesizer: bool = False
     token_budget: int = Field(default=4096, ge=1, le=1_000_000)
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
@@ -204,11 +205,11 @@ class DispatchStep(_PlanModel):
             raise TypeError("step budget and retry values must be integers")
         return value
 
-    @field_validator("final_synthesizer")
+    @field_validator("requires_user_review", "final_synthesizer")
     @classmethod
     def strict_boolean(cls, value: bool) -> bool:
         if type(value) is not bool:
-            raise TypeError("final_synthesizer must be a boolean")
+            raise TypeError("step boolean fields must be booleans")
         return value
 
     @field_validator("timeout_seconds")

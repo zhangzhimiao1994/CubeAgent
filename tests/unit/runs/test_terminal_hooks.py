@@ -209,6 +209,25 @@ class RuntimeReportsCapacityPressure:
         raise AssertionError("not used")
 
 
+class RuntimeRequestsArtifactReview(RuntimeCompletes):
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.APPROVAL_REQUESTED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="character_designer",
+            approval_id="artifact-review-test",
+            action="artifact_review",
+            reason="user review required for intermediate artifact",
+            payload={
+                "approval_kind": "runtime_artifact_review",
+                "stage_id": "character_model_sheet",
+                "artifact_id": str(uuid4()),
+                "next_action": "approve_or_revise_artifact",
+            },
+        )
+
+
 class RecordingHermesAdvisor:
     def __init__(self) -> None:
         self.outcomes: list[HermesRunOutcome] = []
@@ -296,6 +315,25 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "routing_decision": {"source": "evolution", "evolution_run_id": "evolution_1"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_waits_for_user_approval_after_runtime_artifact_review_request() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "video_pipeline"})
+    hook = RecordingHook()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeRequestsArtifactReview(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        terminal_run_hooks=(hook,),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert repository.row.status == RunStatus.WAITING_APPROVAL.value
+    assert hook.calls == []
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,51 @@ def test_conversation_history_stays_full_when_inside_budget() -> None:
     assert "first answer" in text
 
 
+def test_conversation_history_includes_media_pipeline_plan() -> None:
+    artifact = _conversation_history_artifact(
+        conversation_id="conv-video-plan",
+        current_request="继续生成分镜图",
+        context_items=(
+            ConversationContextItem(
+                run_id=uuid4(),
+                request="先生成一个短剧剧本，后续可能要生成角色设定和剪辑成片。",
+                artifacts=(),
+                routing_decision={
+                    "media_pipeline_plan": {
+                        "plan_id": "media-plan-001",
+                        "status": "planned",
+                        "source": "script_request",
+                        "summary": "短剧生产计划：先定角色，再做分镜，最后剪辑成片。",
+                        "stages": [
+                            {"id": "script", "status": "completed"},
+                            {"id": "character_model_sheet", "status": "planned"},
+                            {"id": "storyboard", "status": "planned"},
+                            {"id": "compose_video", "status": "planned"},
+                        ],
+                        "approved_artifacts": [
+                            {
+                                "stage_id": "character_model_sheet",
+                                "artifact_id": "asset-character-001",
+                            }
+                        ],
+                        "storage_key": "secret/path/must/not/leak",
+                    }
+                },
+            ),
+        ),
+        history_token_budget=4096,
+    )
+
+    assert artifact is not None
+    text = artifact.content["text"]
+    assert isinstance(text, str)
+    assert "MEDIA_PIPELINE_PLAN" in text
+    assert "media-plan-001" in text
+    assert "character_model_sheet:planned" in text
+    assert "asset-character-001" in text
+    assert "secret/path/must/not/leak" not in text
+
+
 def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None:
     old_noise = "old implementation detail " * 2000
     latest_decision = "latest important conclusion: use framework-level context compression"

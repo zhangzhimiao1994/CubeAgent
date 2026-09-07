@@ -113,6 +113,16 @@ class RunServiceProtocol(Protocol):
         feedback: str,
     ) -> SubmittedRun: ...
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
@@ -175,6 +185,10 @@ class ReviseTemporaryAgentRequest(BaseModel):
     decision_token: str = Field(min_length=32, max_length=160)
     version: int = Field(ge=1)
     feedback: str = Field(min_length=1, max_length=2000)
+
+
+class ApproveArtifactReviewRequest(BaseModel):
+    version: int = Field(ge=1)
 
 
 class SubmittedRunResponse(BaseModel):
@@ -866,6 +880,40 @@ async def revise_temporary_agent(
             decision_token=body.decision_token,
             version=body.version,
             feedback=body.feedback,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/artifact-reviews/{approval_id}/approve",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def approve_artifact_review(
+    run_id: UUID,
+    approval_id: str,
+    body: ApproveArtifactReviewRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:resume"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.approve_artifact_review(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            version=body.version,
         )
     except RunNotFound as error:
         raise _run_not_found() from error

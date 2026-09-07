@@ -787,6 +787,11 @@ def _dispatch_plan(
                 context,
                 capability_gateway=capability_gateway,
             ),
+            requires_user_review=_role_requires_user_review(
+                role,
+                context,
+                single_delivery_role_is_final=single_delivery_role_is_final,
+            ),
             token_budget=role_token_budget,
             timeout_seconds=(
                 post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
@@ -840,6 +845,25 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.RECORD_DECISION,
         RolePurpose.VERIFY,
         RolePurpose.RELEASE,
+    }
+
+
+def _role_requires_user_review(
+    role: RoleAssignment,
+    context: TaskContext,
+    *,
+    single_delivery_role_is_final: bool,
+) -> bool:
+    if single_delivery_role_is_final:
+        return False
+    if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
+        return False
+    if "generate_multimedia" in role.allowed_tools:
+        return True
+    return role.id in {
+        "character_designer",
+        "storyboard_artist",
+        "shot_video_generator",
     }
 
 
@@ -909,15 +933,22 @@ def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue],
 
 def _dispatch_step_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     return tuple(
-        {
-            "id": step.id,
-            "agent": step.agent,
-            "depends_on": step.depends_on,
-            "final_synthesizer": step.final_synthesizer,
-            "tools": step.tools,
-        }
+        _dispatch_step_summary(step)
         for step in plan.steps
     )
+
+
+def _dispatch_step_summary(step: DispatchStep) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "id": step.id,
+        "agent": step.agent,
+        "depends_on": step.depends_on,
+        "final_synthesizer": step.final_synthesizer,
+        "tools": step.tools,
+    }
+    if step.requires_user_review:
+        payload["requires_user_review"] = True
+    return payload
 
 
 def _discussion_role_payload(plan: DiscussionPlan) -> tuple[Mapping[str, JsonValue], ...]:

@@ -2029,6 +2029,31 @@ class CrewDispatchRuntime:
                                     kind=EventKind.CHECKPOINT_SAVED,
                                     checkpoint=checkpoint,
                                 )
+                                if (
+                                    result.step.requires_user_review
+                                    and not result.step.final_synthesizer
+                                ):
+                                    await emit(
+                                        kind=EventKind.APPROVAL_REQUESTED,
+                                        actor=result.step.agent,
+                                        approval_id=(
+                                            f"artifact-review-{context.run_id.hex[:16]}-"
+                                            f"{result.step.id[:48]}"
+                                        ),
+                                        action="artifact_review",
+                                        reason="user review required for intermediate artifact",
+                                        payload={
+                                            "approval_kind": "runtime_artifact_review",
+                                            "stage_id": result.step.id,
+                                            "artifact_id": str(result.artifact.id),
+                                            "artifact_sha256": result.artifact.content_sha256,
+                                            "producer": result.step.agent,
+                                            "requires_user_review": True,
+                                            "next_action": "approve_or_revise_artifact",
+                                        },
+                                    )
+                                    terminal_item = _Terminal()
+                                    return
                 except asyncio.CancelledError:
                     await self._cancel_tasks_bounded(tuple(tasks))
                     raise

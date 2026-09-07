@@ -385,6 +385,9 @@ class RunService:
             operator_selection["skip_evolution_proposal"] = True
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
+        media_pipeline_plan = _media_pipeline_plan_for_request(message)
+        if media_pipeline_plan is not None:
+            operator_selection["media_pipeline_plan"] = media_pipeline_plan
         evolution_proposal = None
         if not skip_evolution_proposal:
             evolution_proposal = _local_evolution_proposal(
@@ -881,6 +884,27 @@ class RunService:
         )
         return _submitted(record)
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        cleaned_approval_id = approval_id.strip()
+        if not cleaned_approval_id:
+            raise ValueError("artifact review approval id must not be blank")
+        record = await self._repository.approve_artifact_review_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=cleaned_approval_id[:128],
+            version=version,
+        )
+        return _submitted(record)
+
     async def choose_mode(
         self,
         *,
@@ -1114,11 +1138,31 @@ class RunService:
                         terminal = RunStatus.CANCELLED
                     elif event.kind is EventKind.RUNTIME_FAILED:
                         terminal = RunStatus.FAILED
+                    elif event.kind is EventKind.APPROVAL_REQUESTED:
+                        terminal = RunStatus.WAITING_APPROVAL
                     if terminal is not RunStatus.RUNNING:
                         locked.status = terminal.value
                         locked.version += 1
+                        if terminal is RunStatus.WAITING_APPROVAL:
+                            routing_decision = (
+                                {} if locked.routing_decision is None else dict(locked.routing_decision)
+                            )
+                            locked.routing_decision = {
+                                **routing_decision,
+                                "reason": "runtime_artifact_review_required",
+                                "approval_kind": event.payload.get(
+                                    "approval_kind",
+                                    "runtime_artifact_review",
+                                ),
+                                "approval_id": event.approval_id,
+                                "approval_action": event.action,
+                                "approval_stage_id": event.payload.get("stage_id"),
+                                "approval_artifact_id": event.payload.get("artifact_id"),
+                            }
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
+                if terminal is RunStatus.WAITING_APPROVAL:
+                    break
         except Exception as error:
             _LOGGER.exception(
                 "run_execute_failed run_id=%s error_type=%s",
@@ -2538,6 +2582,71 @@ _ARTIFACT_DELIVERY_NEGATIONS = (
 )
 
 
+_MEDIA_PIPELINE_SCRIPT_TERMS = (
+    "script",
+    "screenplay",
+    "story script",
+    "剧本",
+    "脚本",
+    "故事大纲",
+    "剧情",
+)
+_MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "storyboard",
+    "shot",
+    "compose video",
+    "edit",
+    "final video",
+    "角色参考设定表",
+    "角色设定表",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜",
+    "分镜图",
+    "视频",
+    "剪辑",
+    "成片",
+)
+
+
+def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
+    text = message.casefold()
+    if not any(term in text for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+        return None
+    if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+        return None
+    plan_id = f"media-plan-{uuid4().hex}"
+    return {
+        "plan_id": plan_id,
+        "status": "planned",
+        "source": "script_request",
+        "summary": (
+            "长期多媒体生产计划：剧本完成后，可按需继续生成角色参考设定表、服装设定板、"
+            "场景道具资产、分镜、单镜头视频、剪辑决策表和最终成片。"
+        ),
+        "execution_slots": [],
+        "stages": [
+            {"id": "script", "status": "completed", "requires_user_review": False},
+            {
+                "id": "character_model_sheet",
+                "status": "planned",
+                "requires_user_review": True,
+            },
+            {"id": "costume_sheet", "status": "planned", "requires_user_review": True},
+            {"id": "scene_prop_assets", "status": "planned", "requires_user_review": True},
+            {"id": "storyboard", "status": "planned", "requires_user_review": True},
+            {"id": "shot_videos", "status": "planned", "requires_user_review": True},
+            {"id": "edit_decision_list", "status": "planned", "requires_user_review": True},
+            {"id": "compose_video", "status": "planned", "requires_user_review": False},
+        ],
+        "approved_artifacts": [],
+    }
+
+
 def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
     return {
         "recommended_mode": advice.recommended_mode.value,
@@ -2636,6 +2745,11 @@ def _conversation_history_text(items: tuple[object, ...]) -> str:
                     current_lines.append(
                         f"第 {index} 轮 {str(producer)[:80]}：{_bounded_history_text(text)}"
                     )
+        media_plan_line = _conversation_media_pipeline_plan_line(
+            getattr(item, "routing_decision", None)
+        )
+        if media_plan_line is not None:
+            current_lines.append(f"第 {index} 轮 {media_plan_line}")
         if current_lines:
             item_lines.append(current_lines)
     if not item_lines:
@@ -2655,6 +2769,69 @@ def _conversation_history_text(items: tuple[object, ...]) -> str:
 
 def _conversation_history_lines(items: tuple[object, ...]) -> tuple[str, ...]:
     return tuple(_conversation_history_text(items).splitlines())
+
+
+def _conversation_media_pipeline_plan_line(routing_decision: object) -> str | None:
+    if not isinstance(routing_decision, Mapping):
+        return None
+    plan = routing_decision.get("media_pipeline_plan")
+    if not isinstance(plan, Mapping):
+        return None
+    plan_id = _safe_public_plan_text(plan.get("plan_id"), max_chars=96)
+    status = _safe_public_plan_text(plan.get("status"), max_chars=48)
+    summary = _safe_public_plan_text(plan.get("summary"), max_chars=320)
+    stages = _media_pipeline_stage_summaries(plan.get("stages"))
+    approved = _media_pipeline_approved_artifact_summaries(plan.get("approved_artifacts"))
+    parts = ["MEDIA_PIPELINE_PLAN"]
+    if plan_id:
+        parts.append(f"plan_id={plan_id}")
+    if status:
+        parts.append(f"status={status}")
+    if summary:
+        parts.append(f"summary={summary}")
+    if stages:
+        parts.append(f"stages={','.join(stages)}")
+    if approved:
+        parts.append(f"approved_artifacts={','.join(approved)}")
+    return " ".join(parts) if len(parts) > 1 else None
+
+
+def _media_pipeline_stage_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:12]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("id"), max_chars=64)
+        status = _safe_public_plan_text(item.get("status"), max_chars=32)
+        if stage_id and status:
+            summaries.append(f"{stage_id}:{status}")
+    return tuple(summaries)
+
+
+def _media_pipeline_approved_artifact_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:24]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("stage_id"), max_chars=64)
+        artifact_id = _safe_public_plan_text(item.get("artifact_id"), max_chars=96)
+        if stage_id and artifact_id:
+            summaries.append(f"{stage_id}:{artifact_id}")
+    return tuple(summaries)
+
+
+def _safe_public_plan_text(value: object, *, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = re.sub(r"[\r\n\t]+", " ", value).strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[^0-9A-Za-z_\-:. \u4e00-\u9fff，。！？、；：]+", "", cleaned)
+    return cleaned[:max_chars].strip()
 
 
 def _bounded_history_text(value: str, *, max_chars: int = 1800) -> str:
