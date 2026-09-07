@@ -863,6 +863,30 @@ _IMAGE_GENERATION_HINTS = frozenset(
         "rendering",
     )
 )
+_IMAGE_DELIVERABLE_PRIORITY_HINTS = frozenset(
+    (
+        "character model sheet",
+        "model sheet",
+        "角色参考设定表",
+        "角色设定表",
+        "设定表",
+        "设定板",
+        "图片版",
+        "分镜图",
+    )
+)
+_VIDEO_DELIVERABLE_PRIORITY_HINTS = frozenset(
+    (
+        "final video",
+        "final mp4",
+        "剪辑成片",
+        "剪成片",
+        "做成成片",
+        "最终成片",
+        "最终剪辑成片",
+        "可下载成片",
+    )
+)
 _AUDIO_GENERATION_HINTS = frozenset(
     (
         "音频",
@@ -906,6 +930,10 @@ def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> s
 
 
 def _infer_direct_multimedia_kind_from_text(text: str) -> str | None:
+    if any(hint in text for hint in _VIDEO_DELIVERABLE_PRIORITY_HINTS):
+        return "video"
+    if any(hint in text for hint in _IMAGE_DELIVERABLE_PRIORITY_HINTS):
+        return "image"
     if any(hint in text for hint in _VIDEO_GENERATION_HINTS):
         return "video"
     if any(hint in text for hint in _AUDIO_GENERATION_HINTS):

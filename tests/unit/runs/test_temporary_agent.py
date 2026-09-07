@@ -192,16 +192,17 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         stage_id = decision.get("approval_stage_id")
         artifact_id = decision.get("approval_artifact_id")
+        if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+            raise RunConflict("artifact review payload is invalid")
         raw_plan = decision.get("media_pipeline_plan")
         plan = dict(raw_plan) if isinstance(raw_plan, dict) else None
         raw_plan_approved = plan.get("approved_artifacts") if plan is not None else None
-        raw_approved = (
-            raw_plan_approved
-            if isinstance(raw_plan_approved, list)
-            else decision.get("approved_artifacts")
+        approved = _merged_artifact_review_entries(
+            raw_plan_approved,
+            decision.get("approved_artifacts"),
         )
-        approved = list(raw_approved) if isinstance(raw_approved, list) else []
         approved.append({"stage_id": stage_id, "artifact_id": artifact_id})
+        approved = _merged_artifact_review_entries(approved)
         updated_decision = {
             key: value
             for key, value in decision.items()
@@ -237,6 +238,27 @@ class FakeRepository:
         self.records[run_id] = updated
         self.outbox.append((run_id, f"{tenant_id}:{run_id}:artifact-review:{version}"))
         return updated
+
+
+def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                continue
+            key = (stage_id, artifact_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"stage_id": stage_id, "artifact_id": artifact_id})
+    return entries
 
 
 class FakeTemporaryAgentPolicy:
@@ -1056,6 +1078,9 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
                 "status": "planned",
                 "approved_artifacts": [],
             },
+            "approved_artifacts": [
+                {"stage_id": "storyboard", "artifact_id": "artifact-000"}
+            ],
             "reason": "runtime_artifact_review_required",
             "approval_kind": "runtime_artifact_review",
             "approval_id": "artifact-review-test",
@@ -1086,6 +1111,7 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
     plan = routing["media_pipeline_plan"]
     assert isinstance(plan, dict)
     assert plan["approved_artifacts"] == [
+        {"stage_id": "storyboard", "artifact_id": "artifact-000"},
         {"stage_id": "character_model_sheet", "artifact_id": "artifact-001"}
     ]
     assert "approved_artifacts" not in routing

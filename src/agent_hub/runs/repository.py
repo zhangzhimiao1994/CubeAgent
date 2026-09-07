@@ -452,18 +452,13 @@ class RunRepository:
                 raise RunConflict("artifact review payload is invalid")
             media_pipeline_plan = routing_decision.get("media_pipeline_plan")
             plan = dict(media_pipeline_plan) if isinstance(media_pipeline_plan, dict) else None
-            raw_plan_approved = (
-                plan.get("approved_artifacts") if plan is not None else None
-            )
-            raw_approved_artifacts = (
-                raw_plan_approved
-                if isinstance(raw_plan_approved, list)
-                else routing_decision.get("approved_artifacts")
-            )
-            approved_artifacts = (
-                list(raw_approved_artifacts) if isinstance(raw_approved_artifacts, list) else []
+            raw_plan_approved = plan.get("approved_artifacts") if plan is not None else None
+            approved_artifacts = _merged_artifact_review_entries(
+                raw_plan_approved,
+                routing_decision.get("approved_artifacts"),
             )
             approved_artifacts.append({"stage_id": stage_id, "artifact_id": artifact_id})
+            approved_artifacts = _merged_artifact_review_entries(approved_artifacts)
             updated_routing = {
                 **{
                     key: value
@@ -1098,6 +1093,27 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     return {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }
+
+
+def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                continue
+            key = (stage_id, artifact_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"stage_id": stage_id, "artifact_id": artifact_id})
+    return entries
 
 
 def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:

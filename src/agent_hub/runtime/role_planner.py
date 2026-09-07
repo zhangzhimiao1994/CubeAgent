@@ -882,6 +882,7 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "copywriter": (
             "文案",
             "脚本",
+            "剧本",
             "短剧",
             "标题",
             "口播",
@@ -1002,6 +1003,12 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
     requested = set(request.requested_skills)
+    if role_id in {
+        "multimedia_generator",
+        "video_compositor",
+        "video_editor",
+    } and _is_deferred_media_pipeline_request(request.task):
+        return False
     if role_id == "multimedia_generator":
         return _is_multimedia_generation_request(request.task) and not _is_video_composition_request(
             request.task
@@ -1064,6 +1071,7 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
         for keyword in (
             "文案",
             "脚本",
+            "剧本",
             "标题",
             "口播",
             "短剧",
@@ -1686,6 +1694,8 @@ _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS = (
     "existing videos",
     "existing image",
     "existing images",
+    "approved artifact",
+    "approved artifacts",
     "generated clip",
     "generated clips",
     "generated video",
@@ -1704,6 +1714,7 @@ _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS = (
     "still",
     "stills",
     "素材",
+    "资产",
     "现有素材",
     "现有视频",
     "现有图片",
@@ -1713,6 +1724,10 @@ _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS = (
     "这些素材",
     "这些视频",
     "这些图片",
+    "已审核资产",
+    "已审核素材",
+    "审核资产",
+    "审核素材",
     "生成的视频",
     "生成的图片",
     "生成的素材",
@@ -1731,6 +1746,7 @@ _VIDEO_COMPOSITION_MEDIA_TERMS = (
     "reel",
     "mp4",
     "素材",
+    "资产",
     "视频",
     "图片",
     "图像",
@@ -1754,6 +1770,64 @@ _VIDEO_COMPOSITION_NEGATIONS = (
     "without rendering",
     "do not render",
 )
+
+
+_DEFERRED_MEDIA_PIPELINE_MARKERS = (
+    "后续我",
+    "后续再",
+    "后续要",
+    "后续可以",
+    "后续可能",
+    "以后再",
+    "之后再",
+    "后面再",
+    "未来再",
+    "可能要",
+    "可能会",
+    "随时",
+    "暂时不用",
+    "暂不",
+    "later",
+    "afterward",
+    "afterwards",
+    "maybe later",
+    "in future",
+)
+_DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS = (
+    "script",
+    "screenplay",
+    "story script",
+    "剧本",
+    "脚本",
+    "故事大纲",
+)
+_DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "storyboard",
+    "compose video",
+    "final video",
+    "角色参考设定表",
+    "角色设定表",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜",
+    "分镜图",
+    "视频",
+    "剪辑",
+    "成片",
+)
+
+
+def _is_deferred_media_pipeline_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    return (
+        any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS)
+        and any(marker in normalized for marker in _DEFERRED_MEDIA_PIPELINE_MARKERS)
+        and any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS)
+    )
 
 
 def _is_video_composition_request(task: str) -> bool:

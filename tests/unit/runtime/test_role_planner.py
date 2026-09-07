@@ -282,6 +282,24 @@ def test_final_video_requests_generate_video_without_composing_missing_assets(ta
     assert "video_compositor" not in role_ids
 
 
+def test_deferred_script_media_plan_does_not_start_media_generation_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="先生成一个短剧剧本，后续我可能要生成角色参考设定表、分镜图并剪辑成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "video_editor" not in role_ids
+    assert "multimedia_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
@@ -332,6 +350,22 @@ def test_merge_existing_clips_routes_to_compositor_even_when_new_generation_is_n
     plan = RolePlanner().plan(
         RolePlanningRequest(
             task="Do not generate new videos; merge the existing clips into one MP4.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
+
+
+def test_approved_media_pipeline_assets_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="根据长期计划里的已审核资产最终剪辑成片。",
             mode=TaskMode.DISPATCH,
             profile=TaskProfile.GENERAL,
             default_model="general-model",
@@ -407,6 +441,7 @@ def test_character_model_sheet_request_keeps_text_and_multimedia_roles() -> None
     role_ids = {role.id for role in plan.roles}
 
     assert "director" in role_ids
+    assert "copywriter" in role_ids
     assert "multimedia_generator" in role_ids
     assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
     assert [role.id for role in plan.roles] != ["multimedia_generator"]
