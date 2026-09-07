@@ -173,6 +173,6 @@ Run `ruff check` on modified Python files.
 
 Record changes, verification, risks, and next steps.
 
-- [ ] **Step 4: Commit and push**
+- [x] **Step 4: Commit and push**
 
 Commit the branch, push to GitHub, and check PR checks.
