@@ -648,6 +648,7 @@ const RoutingDecisionSchema = z
   .passthrough();
 
 const RunDetailSchema = RunListItemSchema.extend({
+  version: z.number(),
   request: z.string(),
   events: z.array(RunEventSchema),
   artifacts: z.array(RunArtifactSchema),

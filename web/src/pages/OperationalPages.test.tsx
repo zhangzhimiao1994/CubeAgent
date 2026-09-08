@@ -63,6 +63,7 @@ const runListItem: RunListItem = {
 
 const runDetail: RunDetail = {
   ...runListItem,
+  version: 1,
   request: "给我做一个短视频脚本方案。",
   events: [
     {
@@ -4188,6 +4189,7 @@ describe("operational management pages", () => {
     visibleRunListItems = [visibleRunListItem];
     visibleRunDetail = {
       ...runDetail,
+      version: 6,
       status: "waiting_approval",
       explicit_details: { ...runDetail.explicit_details, version: "6" },
       events: [
@@ -4245,6 +4247,7 @@ describe("operational management pages", () => {
     visibleRunListItems = [visibleRunListItem];
     visibleRunDetail = {
       ...runDetail,
+      version: 6,
       status: "waiting_approval",
       explicit_details: { ...runDetail.explicit_details, version: "6" },
       events: [

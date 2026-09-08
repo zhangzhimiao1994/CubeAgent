@@ -337,6 +337,7 @@ class RunEventResponse(BaseModel):
 
 
 class RunDetailResponse(RunListItem):
+    version: int = Field(default=1, ge=1)
     request: str
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
@@ -4442,6 +4443,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         artifacts = await self._admin_run_artifacts(record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
+            version=record.version,
             events=[_admin_run_event(event, run_id=record.id) for event in events],
             artifacts=[_admin_run_artifact(artifact, run_id=record.id) for artifact in artifacts],
             explicit_details={

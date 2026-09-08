@@ -3094,7 +3094,7 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
                 request="审查脚本",
                 mode=TaskMode.DISPATCH,
                 status=RunStatus.COMPLETED,
-                version=1,
+                version=7,
                 created_at=datetime.now(UTC),
                 routing_decision=routing_decision,
             )
@@ -3143,6 +3143,7 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
     conversation = api.get("/api/v1/admin/conversations/conv-hermes-runtime", headers=headers())
 
     assert detail.status_code == 200
+    assert detail.json()["version"] == 7
     assert "decision_token" not in detail.json()["routing_decision"]
     assert "temporary_agent_proposal" not in detail.json()["routing_decision"]
     assert "api_key" not in detail.json()["routing_decision"]
