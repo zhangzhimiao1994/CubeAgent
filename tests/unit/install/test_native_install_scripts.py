@@ -81,6 +81,24 @@ def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:
     assert link_current < prune
 
 
+def test_native_release_pruning_keeps_current_and_current_venv_dependencies() -> None:
+    script = read("scripts/lib/install_native.sh")
+    prune = script.split("prune_native_releases() {", maxsplit=1)[1].split(
+        "\n}\n\ninstall_native_tls_assets",
+        maxsplit=1,
+    )[0]
+
+    assert 'keep="${AGENT_HUB_RELEASES_TO_KEEP:-1}"' in prune
+    assert 'current_venv_release="$(_native_release_dir_for_child "$current_release/.venv")"' in prune
+    assert (
+        'current_litellm_release="$(_native_release_dir_for_child "$current_release/.litellm-venv")"'
+        in prune
+    )
+    assert '[[ "$resolved_release" == "$current_venv_release" ]]' in prune
+    assert '[[ "$resolved_release" == "$current_litellm_release" ]]' in prune
+    assert 'rm -rf -- "$resolved_release"' in prune
+
+
 def test_installer_failure_output_includes_context_and_hints() -> None:
     common = read("scripts/lib/common.sh")
     install = read("install.sh")

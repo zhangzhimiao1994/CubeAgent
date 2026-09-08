@@ -528,14 +528,33 @@ fix_native_web_permissions() {
   fi
 }
 
+_native_release_dir_for_child() {
+  local child target releases_prefix rest release_name
+  child="${1:-}"
+  [[ -n "$child" ]] || return 0
+  target="$(readlink -f "$child" 2>/dev/null || true)"
+  [[ -n "$target" ]] || return 0
+  releases_prefix="$INSTALL_ROOT/releases/"
+  case "$target" in
+    "$releases_prefix"*) ;;
+    *) return 0 ;;
+  esac
+  rest="${target#"$releases_prefix"}"
+  release_name="${rest%%/*}"
+  [[ -n "$release_name" ]] || return 0
+  printf '%s\n' "$releases_prefix$release_name"
+}
+
 prune_native_releases() {
-  local keep current_release release resolved_release kept
-  keep="${AGENT_HUB_RELEASES_TO_KEEP:-2}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  local keep current_release current_venv_release current_litellm_release release resolved_release kept
+  keep="${AGENT_HUB_RELEASES_TO_KEEP:-1}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=1
   (( keep >= 1 )) || keep=1
   [[ -d "$INSTALL_ROOT/releases" ]] || return 0
 
   current_release="$(readlink -f "$INSTALL_ROOT/current" 2>/dev/null || true)"
+  current_venv_release="$(_native_release_dir_for_child "$current_release/.venv")"
+  current_litellm_release="$(_native_release_dir_for_child "$current_release/.litellm-venv")"
   kept=0
   while IFS= read -r release; do
     [[ -n "$release" ]] || continue
@@ -547,6 +566,11 @@ prune_native_releases() {
     esac
     if [[ "$resolved_release" == "$current_release" ]]; then
       (( kept += 1 ))
+      continue
+    fi
+    if [[ "$resolved_release" == "$current_venv_release" ]] \
+      || [[ "$resolved_release" == "$current_litellm_release" ]]; then
+      log "keeping native release used by current virtualenv $resolved_release"
       continue
     fi
     if (( kept < keep )); then
