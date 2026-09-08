@@ -974,13 +974,32 @@ _MULTIMEDIA_KIND_NEGATIONS = frozenset(
         "no need",
     )
 )
+_CHARACTER_MODEL_SHEET_PROMPT_TERMS = frozenset(
+    (
+        "character model sheet",
+        "角色参考设定表",
+        "角色设定表",
+        "角色定妆照",
+        "定妆照",
+    )
+)
+_CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT = (
+    "角色参考设定表格式约束：这是一张角色定妆照/角色参考设定表，"
+    "一张图只包含一个角色；不要把多个角色放在同一张设定表。"
+    "画面以主定妆照为核心，可包含简化三视图、少量表情和服装要点；"
+    "不要过度堆叠小物件、文字说明或复杂资产格。"
+)
 
 
 def _should_direct_execute_multimedia(step: DispatchStep, agent: AgentSpec) -> bool:
-    if "generate_multimedia" not in step.tools:
+    if not _is_direct_multimedia_step(step):
         return False
     text = f"{step.agent} {agent.role} {agent.goal} {step.task}".casefold()
     return any(hint in text for hint in _DIRECT_MULTIMEDIA_AGENT_HINTS)
+
+
+def _is_direct_multimedia_step(step: DispatchStep) -> bool:
+    return "generate_multimedia" in step.tools
 
 
 def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
@@ -1043,6 +1062,8 @@ def _direct_multimedia_generation_prompt(
         parts.append("参考上游产物：\n" + "\n".join(source_previews))
     if feedback is not None:
         parts.append(f"用户审核退回意见：{feedback}")
+    if _is_character_model_sheet_prompt(context.request, step.task):
+        parts.append(_CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT)
     prompt = "\n\n".join(part for part in parts if part)
     prompt = unicodedata.normalize("NFC", prompt)
     prompt = "".join(
@@ -1051,6 +1072,11 @@ def _direct_multimedia_generation_prompt(
     )
     prompt = _CONTROL_CHARS.sub(" ", prompt)
     return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+
+
+def _is_character_model_sheet_prompt(request: str, task: str) -> bool:
+    text = f"{request} {task}".casefold()
+    return any(term in text for term in _CHARACTER_MODEL_SHEET_PROMPT_TERMS)
 
 
 def _direct_runtime_completion(
@@ -1209,6 +1235,10 @@ class ModelStateBoundary(Protocol):
 
 class ModelStateDropBoundary(Protocol):
     async def __call__(self, key: str) -> None: ...
+
+
+class AttemptStateDropBoundary(Protocol):
+    async def __call__(self, step_id: str, attempt: int) -> None: ...
 
 
 class UsageBoundary(Protocol):
@@ -1987,6 +2017,43 @@ class CrewDispatchRuntime:
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
+            async def attempt_state_drop_boundary(step_id: str, attempt: int) -> None:
+                async with checkpoint_lock:
+                    if not run_open or not self._is_current_run(state):
+                        return
+                    if usage_ledger.terminal_phase is not None:
+                        return
+                    dropped_artifact_ids: set[str] = set()
+                    for key, item in tuple(model_ledger.states.items()):
+                        if item.get("step_id") == step_id and item.get("attempt") == attempt:
+                            model_ledger.states.pop(key, None)
+                            artifact = model_ledger.artifacts.pop(key, None)
+                            if artifact is not None:
+                                dropped_artifact_ids.add(str(artifact.id))
+                    for key, item in tuple(tool_ledger.states.items()):
+                        if item.get("step_id") == step_id and item.get("attempt") == attempt:
+                            tool_ledger.states.pop(key, None)
+                            artifact = tool_ledger.artifacts.pop(key, None)
+                            if artifact is not None:
+                                dropped_artifact_ids.add(str(artifact.id))
+                    for artifact_id in dropped_artifact_ids:
+                        artifact_registry.pop(artifact_id, None)
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        tool_ledger,
+                        model_ledger,
+                        usage_ledger,
+                        review_ledger,
+                        next_sequence=sequence.value + 2,
+                        terminal=False,
+                        phase="running",
+                    )
+                    self._publish_checkpoint(state, checkpoint)
+                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+
             async def usage_boundary(
                 completion: GatewayCompletion,
                 actor: str,
@@ -2229,6 +2296,7 @@ class CrewDispatchRuntime:
                             tool_boundary,
                             model_state_boundary,
                             model_state_drop_boundary,
+                            attempt_state_drop_boundary,
                             usage_boundary,
                             tool_ledger,
                             model_ledger,
@@ -2492,6 +2560,7 @@ class CrewDispatchRuntime:
         tool_boundary: ToolBoundary,
         model_state_boundary: ModelStateBoundary,
         model_state_drop_boundary: ModelStateDropBoundary,
+        attempt_state_drop_boundary: AttemptStateDropBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
@@ -2545,6 +2614,7 @@ class CrewDispatchRuntime:
                     tool_boundary,
                     model_state_boundary,
                     model_state_drop_boundary,
+                    attempt_state_drop_boundary,
                     usage_boundary,
                     tool_ledger,
                     model_ledger,
@@ -2903,6 +2973,7 @@ class CrewDispatchRuntime:
         tool_boundary: ToolBoundary,
         model_state_boundary: ModelStateBoundary,
         model_state_drop_boundary: ModelStateDropBoundary,
+        attempt_state_drop_boundary: AttemptStateDropBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
@@ -3054,7 +3125,9 @@ class CrewDispatchRuntime:
                 if (
                     framework_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
                     and remaining > retry_threshold
+                    and not step.tools
                 ):
+                    await attempt_state_drop_boundary(step.id, retries)
                     framework_attempt += 1
                     diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
                     await emit(
@@ -5266,8 +5339,11 @@ class CrewDispatchRuntime:
                         model_artifact.source_ids != expected_model_sources
                         or model_artifact.producer != step.agent
                         or model_artifact.provenance is None
-                        or model_artifact.provenance.logical_model
-                        != agents[step.agent].logical_model
+                        or (
+                            model_artifact.provenance.logical_model
+                            != agents[step.agent].logical_model
+                            and not _is_direct_multimedia_step(step)
+                        )
                     ):
                         _fail("runtime checkpoint model artifact lineage is invalid")
                     completion = self._completion_from_model_artifact(model_artifact)
@@ -5276,25 +5352,35 @@ class CrewDispatchRuntime:
                     evidence_ids.append(str(model_artifact.id))
                     round_tools = tools.get((step.id, attempt, call_index), {})
                     calls = completion.response.tool_calls
-                    if len(round_tools) > len(calls):
+                    direct_multimedia_tool = _is_direct_multimedia_step(step) and not calls
+                    if len(round_tools) > len(calls) and not direct_multimedia_tool:
                         _fail("runtime checkpoint capability artifact lineage is invalid")
                     for tool_index in range(len(round_tools)):
                         tool_state, tool_artifact = round_tools[tool_index]
-                        tool_call = calls[tool_index]
-                        canonical_arguments = json.dumps(
-                            _mutable_json(tool_call.arguments),
-                            ensure_ascii=False,
-                            allow_nan=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        if (
-                            tool_state["name"] != tool_call.name
-                            or tool_state["arguments_sha256"]
-                            != hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
-                            or tool_state["trigger_model_artifact_id"] != str(model_artifact.id)
-                        ):
-                            _fail("runtime checkpoint capability artifact lineage is invalid")
+                        if direct_multimedia_tool:
+                            if (
+                                len(round_tools) != 1
+                                or tool_state["name"] != "generate_multimedia"
+                                or tool_state["trigger_model_artifact_id"] != str(model_artifact.id)
+                            ):
+                                _fail("runtime checkpoint capability artifact lineage is invalid")
+                        else:
+                            tool_call = calls[tool_index]
+                            canonical_arguments = json.dumps(
+                                _mutable_json(tool_call.arguments),
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            if (
+                                tool_state["name"] != tool_call.name
+                                or tool_state["arguments_sha256"]
+                                != hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                                or tool_state["trigger_model_artifact_id"]
+                                != str(model_artifact.id)
+                            ):
+                                _fail("runtime checkpoint capability artifact lineage is invalid")
                         if tool_artifact is None:
                             if tool_index != len(round_tools) - 1:
                                 _fail("runtime checkpoint artifact graph is invalid")
@@ -5306,7 +5392,11 @@ class CrewDispatchRuntime:
                         evidence_ids.append(str(tool_artifact.id))
                     if incomplete:
                         break
-                    if call_index < len(step_calls) - 1 and len(round_tools) != len(calls):
+                    if (
+                        call_index < len(step_calls) - 1
+                        and len(round_tools) != len(calls)
+                        and not direct_multimedia_tool
+                    ):
                         _fail("runtime checkpoint artifact graph is invalid")
                 output_sources = (*input_ids, *evidence_ids)
                 review_calls = models.get((step.id, attempt, "review"), {})

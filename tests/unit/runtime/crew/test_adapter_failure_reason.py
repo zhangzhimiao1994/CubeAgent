@@ -243,6 +243,45 @@ class StepTimeoutOnceFactory(CrewObjectFactory):
         return self.generation
 
 
+class StepTimeoutAfterModelCallGeneration:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, agent_id, storage_scope
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls == 1:
+            await bridge.complete([{"role": "user", "content": prompt}])
+            raise TimeoutError
+        return await bridge.complete([{"role": "user", "content": prompt}])
+
+
+class StepTimeoutAfterModelCallFactory(CrewObjectFactory):
+    def __init__(self) -> None:
+        self.generation = StepTimeoutAfterModelCallGeneration()
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> StepTimeoutAfterModelCallGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
+
+
 class SlowStepGeneration:
     async def execute(
         self,
@@ -866,6 +905,93 @@ async def test_user_review_gate_requests_approval_for_single_media_delivery() ->
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
 
 
+async def test_rejected_single_media_delivery_reruns_stage_before_completion() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+                allowed_tools=("generate_multimedia",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="multimedia_generator_step",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                tools=("generate_multimedia",),
+                requires_user_review=True,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("generate_multimedia",),
+        total_token_budget=100,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色参考设定表图片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    rejected_artifact_id = cast(str, approval.payload["artifact_id"])
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    feedback = "角色脸型和服装不一致，退回重新生成角色参考设定表。"
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="生成角色参考设定表图片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "multimedia_generator_step",
+                        "artifact_id": rejected_artifact_id,
+                        "feedback": feedback,
+                    }
+                },
+            )
+        )
+    ]
+
+    retry = next(event for event in restored_events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.step_id == "multimedia_generator_step"
+    assert retry.reason == "user rejected artifact review; regenerating stage"
+    refreshed_approval = next(
+        event for event in restored_events if event.kind is EventKind.APPROVAL_REQUESTED
+    )
+    assert refreshed_approval.payload["stage_id"] == "multimedia_generator_step"
+    assert refreshed_approval.payload["artifact_id"] != rejected_artifact_id
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in restored_events)
+
+
 async def test_rejected_user_review_checkpoint_reruns_stage_before_downstream_step() -> None:
     plan = DispatchPlan(
         agents=(
@@ -1160,6 +1286,26 @@ def test_direct_multimedia_generation_prompt_includes_user_review_feedback() -> 
     assert "服装和脸型不一致" in prompt
 
 
+def test_direct_multimedia_generation_prompt_constrains_character_model_sheet() -> None:
+    step = DispatchStep(
+        id="character_model_sheet",
+        agent="multimedia_generator",
+        task="生成 Character Model Sheet 形式的角色参考设定表图片。",
+        token_budget=100,
+    )
+
+    prompt = _direct_multimedia_generation_prompt(
+        _context(request="生成女主角角色参考设定表，风格参考定妆照，不要太细节"),
+        step,
+        (),
+    )
+
+    assert "角色定妆照" in prompt
+    assert "一张图只包含一个角色" in prompt
+    assert "不要把多个角色放在同一张设定表" in prompt
+    assert "不要过度堆叠小物件" in prompt
+
+
 @pytest.mark.parametrize(
     ("task_text", "expected_kind"),
     [
@@ -1360,6 +1506,35 @@ async def test_dispatch_step_timeout_retries_with_compact_recovery_prompt() -> N
     assert "compact_retry" in factory.generation.prompts[1]
     assert len(factory.generation.prompts[1].encode("utf-8")) < len(
         factory.generation.prompts[0].encode("utf-8")
+    )
+
+
+async def test_dispatch_step_timeout_after_model_call_drops_stale_attempt_ledger() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="researcher",
+        content={"text": "large source context " * 500},
+    )
+    factory = StepTimeoutAfterModelCallFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        _one_step_plan(),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context(artifacts=(artifact,)))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    assert any(
+        event.kind is EventKind.STEP_RETRYING
+        and event.reason == "step execution timed out; retrying with compact recovery"
+        for event in events
+    )
+    assert not any(
+        event.reason is not None and "model request changed after checkpoint" in event.reason
+        for event in events
     )
 
 
