@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import keyword
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
@@ -118,6 +119,45 @@ _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
     "questions_for_user": "string[]",
     "verification_needed": "string[]",
 }
+_INTERMEDIATE_MEDIA_REVIEW_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "costume sheet",
+    "storyboard",
+    "角色参考设定表",
+    "角色设定表",
+    "角色设定",
+    "设定表",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜图",
+    "分镜",
+)
+_FINAL_MEDIA_DELIVERY_TERMS = (
+    "final video",
+    "final mp4",
+    "final deliverable",
+    "最终结果",
+    "最终产物",
+    "最终成片",
+    "剪辑成片",
+    "成片",
+    "mp4",
+)
+_MEDIA_REVIEW_NEGATIONS = (
+    "不需要",
+    "无需",
+    "不要",
+    "不用",
+    "暂不",
+    "not need",
+    "do not",
+    "don't",
+    "without",
+    "no need",
+)
 
 
 class UnavailableRuntime:
@@ -854,9 +894,12 @@ def _role_requires_user_review(
     *,
     single_delivery_role_is_final: bool,
 ) -> bool:
-    if single_delivery_role_is_final:
+    requires_intermediate_review = isinstance(
+        context.routing_decision.get("media_pipeline_plan"), Mapping
+    ) or _request_requires_intermediate_media_review(context.request)
+    if single_delivery_role_is_final and not requires_intermediate_review:
         return False
-    if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
+    if not requires_intermediate_review:
         return False
     if "generate_multimedia" in role.allowed_tools:
         return True
@@ -865,6 +908,29 @@ def _role_requires_user_review(
         "storyboard_artist",
         "shot_video_generator",
     }
+
+
+def _request_requires_intermediate_media_review(request: str) -> bool:
+    text = request.casefold()
+    return _has_unnegated_media_review_term(
+        text, _INTERMEDIATE_MEDIA_REVIEW_TERMS
+    ) and not _has_unnegated_media_review_term(text, _FINAL_MEDIA_DELIVERY_TERMS)
+
+
+def _has_unnegated_media_review_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(
+        any(term in clause for term in terms)
+        for clause in _split_media_review_clauses(text)
+        if not any(negation in clause for negation in _MEDIA_REVIEW_NEGATIONS)
+    )
+
+
+def _split_media_review_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
+        if clause.strip()
+    )
 
 
 def _producer_step_timeout(

@@ -1124,6 +1124,13 @@ def test_direct_multimedia_generation_prompt_includes_user_review_feedback() -> 
         ("给我做一张图片版设定板。", "image"),
         ("根据剧情以Character Model Sheet的形式生成角色参考设定表。", "image"),
         ("根据这段视频剧情生成 Character Model Sheet 形式的角色参考设定表。", "image"),
+        (
+            (
+                "基于刚才剧本，只生成 Character Model Sheet 形式的角色参考设定表和角色服装设定板图片，"
+                "不要生成视频，不要剪辑成片。"
+            ),
+            "image",
+        ),
         ("生成角色设定表。", "image"),
         ("出一张赛博朋克产品概念图。", "image"),
         ("生成三张可下载表情包贴纸。", "image"),

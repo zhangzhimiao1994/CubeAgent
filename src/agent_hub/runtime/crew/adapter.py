@@ -960,6 +960,20 @@ _AUDIO_GENERATION_HINTS = frozenset(
         "music",
     )
 )
+_MULTIMEDIA_KIND_NEGATIONS = frozenset(
+    (
+        "不需要",
+        "无需",
+        "不要",
+        "不用",
+        "暂不",
+        "not need",
+        "do not",
+        "don't",
+        "without",
+        "no need",
+    )
+)
 
 
 def _should_direct_execute_multimedia(step: DispatchStep, agent: AgentSpec) -> bool:
@@ -983,17 +997,34 @@ def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> s
 
 
 def _infer_direct_multimedia_kind_from_text(text: str) -> str | None:
-    if any(hint in text for hint in _VIDEO_DELIVERABLE_PRIORITY_HINTS):
+    if _has_unnegated_multimedia_kind_hint(text, _VIDEO_DELIVERABLE_PRIORITY_HINTS):
         return "video"
-    if any(hint in text for hint in _IMAGE_DELIVERABLE_PRIORITY_HINTS):
+    if _has_unnegated_multimedia_kind_hint(text, _IMAGE_DELIVERABLE_PRIORITY_HINTS):
         return "image"
-    if any(hint in text for hint in _VIDEO_GENERATION_HINTS):
+    if _has_unnegated_multimedia_kind_hint(text, _VIDEO_GENERATION_HINTS):
         return "video"
-    if any(hint in text for hint in _AUDIO_GENERATION_HINTS):
+    if _has_unnegated_multimedia_kind_hint(text, _AUDIO_GENERATION_HINTS):
         return "audio"
-    if any(hint in text for hint in _IMAGE_GENERATION_HINTS):
+    if _has_unnegated_multimedia_kind_hint(text, _IMAGE_GENERATION_HINTS):
         return "image"
     return None
+
+
+def _has_unnegated_multimedia_kind_hint(text: str, hints: frozenset[str]) -> bool:
+    for clause in _split_multimedia_kind_clauses(text):
+        if any(negation in clause for negation in _MULTIMEDIA_KIND_NEGATIONS):
+            continue
+        if any(hint in clause for hint in hints):
+            return True
+    return False
+
+
+def _split_multimedia_kind_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
+        if clause.strip()
+    )
 
 
 def _direct_multimedia_generation_prompt(
