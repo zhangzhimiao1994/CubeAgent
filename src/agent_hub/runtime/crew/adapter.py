@@ -2293,10 +2293,7 @@ class CrewDispatchRuntime:
                                     kind=EventKind.CHECKPOINT_SAVED,
                                     checkpoint=checkpoint,
                                 )
-                                if (
-                                    result.step.requires_user_review
-                                    and not result.step.final_synthesizer
-                                ):
+                                if result.step.requires_user_review:
                                     await emit(
                                         kind=EventKind.APPROVAL_REQUESTED,
                                         actor=result.step.agent,

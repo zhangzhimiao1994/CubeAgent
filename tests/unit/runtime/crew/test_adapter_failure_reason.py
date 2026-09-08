@@ -824,6 +824,48 @@ async def test_user_review_gate_requests_approval_before_downstream_step() -> No
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
 
 
+async def test_user_review_gate_requests_approval_for_single_media_delivery() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+                allowed_tools=("generate_multimedia",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="multimedia_generator_step",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                tools=("generate_multimedia",),
+                requires_user_review=True,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("generate_multimedia",),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色参考设定表图片"))]
+
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    assert approval.action == "artifact_review"
+    assert approval.actor == "multimedia_generator"
+    assert approval.payload["stage_id"] == "multimedia_generator_step"
+    assert approval.payload["artifact_id"]
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
 async def test_rejected_user_review_checkpoint_reruns_stage_before_downstream_step() -> None:
     plan = DispatchPlan(
         agents=(
