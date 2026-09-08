@@ -35,6 +35,7 @@ from agent_hub.runtime.defaults import (
     _dispatch_plan,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
+    _should_use_standalone_multimedia_roles,
     configured_runtime_registry,
 )
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
@@ -53,6 +54,14 @@ def test_python_project_zip_request_is_profiled_as_software() -> None:
 
 def test_plain_zip_delivery_request_is_not_profiled_as_software_engineering() -> None:
     profiles = defaults_module._task_profiles("把这份材料整理成一个可下载 zip 压缩包。")
+
+    assert TaskProfile.SOFTWARE not in profiles
+
+
+def test_media_test_cut_request_is_not_profiled_as_software_engineering() -> None:
+    profiles = defaults_module._task_profiles(
+        "生成一个 5 秒以内的最终 MP4 测试成片；缺少镜头素材就先生成镜头视频再剪辑。"
+    )
 
     assert TaskProfile.SOFTWARE not in profiles
 
@@ -1799,6 +1808,53 @@ def test_dispatch_plan_keeps_compose_video_only_for_video_compositor_role() -> N
     assert "compose_video" in plan.allowed_tools
 
 
+def test_dispatch_plan_composes_after_generated_media_step() -> None:
+    roles = (
+        RoleAssignment(
+            id="multimedia_generator",
+            role="Multimedia Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate the minimum necessary shot video assets.",
+            must_answer=("What media asset was produced?",),
+            allowed_tools=("read_context", "generate_multimedia"),
+            forbidden_actions=("Do not claim a composed MP4.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Merge generated image/video artifacts into a downloadable MP4.",
+            must_answer=("What downloadable MP4 artifact was produced?",),
+            allowed_tools=("read_context", "compose_video"),
+            forbidden_actions=("Do not generate new source videos.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成最小必要镜头视频，再剪辑成片。",
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
+    )
+
+    generator_step = next(step for step in plan.steps if step.agent == "multimedia_generator")
+    compositor_step = next(step for step in plan.steps if step.agent == "video_compositor")
+
+    assert generator_step.id in compositor_step.depends_on
+    assert "compose_video" in compositor_step.tools
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
@@ -1882,6 +1938,32 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
                         }
                     ]
                 },
+                "media": {
+                    "deployments": [
+                        {
+                            "provider": "minimax",
+                            "model": "MiniMax-M3",
+                            "api_base": "https://api.minimax.io/v1",
+                            "credential_ref": "secret://media",
+                            "quota_scope_id": "minimax",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "structured_output"],
+                        },
+                        {
+                            "provider": "minimax",
+                            "model": "MiniMax Hailuo 03",
+                            "api_base": "https://api.minimax.io/v1",
+                            "credential_ref": "secret://media",
+                            "quota_scope_id": "minimax-video",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["video_generation"],
+                        },
+                    ]
+                },
                 "analyst": {
                     "deployments": [
                         {
@@ -1945,6 +2027,26 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
     assert (
         _select_logical_model_for_role(
             RoleAssignment(
+                id="video_editor",
+                role="视频剪辑师",
+                purpose=RolePurpose.EXECUTE,
+                mission="根据分镜和角色设定剪辑最终成片。",
+                must_answer=("成片剪辑方案是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={},
+                model="main",
+            ),
+            config,
+            default_model="main",
+            task="根据已审核角色设定表和分镜生成视频并剪辑成片。",
+        )
+        == "media"
+    )
+    assert (
+        _select_logical_model_for_role(
+            RoleAssignment(
                 id="economic_analyst",
                 role="经济分析师",
                 purpose=RolePurpose.EXPERTISE,
@@ -1962,6 +2064,78 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
         )
         == "analyst"
     )
+
+
+def test_media_planner_roles_replace_default_generic_selected_roles() -> None:
+    generic_roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan implementation.",
+            must_answer=("What architecture is needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="qwen",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Implement the task.",
+            must_answer=("What was implemented?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="qwen",
+        ),
+    )
+    media_roles = (
+        RoleAssignment(
+            id="director",
+            role="Director",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan shots.",
+            must_answer=("What shots are needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="minimax",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Compose the final clip.",
+            must_answer=("What clip was composed?",),
+            allowed_tools=("compose_video",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="minimax",
+        ),
+    )
+    custom_roles = (
+        RoleAssignment(
+            id="brand_director",
+            role="Brand Director",
+            purpose=RolePurpose.EXECUTE,
+            mission="Preserve brand consistency.",
+            must_answer=("What brand choices matter?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="main",
+        ),
+    )
+
+    assert _should_use_standalone_multimedia_roles(generic_roles, media_roles)
+    assert not _should_use_standalone_multimedia_roles(custom_roles, media_roles)
 
 
 def test_role_model_assignment_balances_repeated_roles_across_available_capacity() -> None:

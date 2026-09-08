@@ -18,6 +18,7 @@ from agent_hub.runs.repository import (
     RunConflict,
     RunNotFound,
     RunRecord,
+    _checkpoint_state_completes_artifact_review,
     _safe_temporary_agent_model,
 )
 from agent_hub.runs.service import RunService, TemporaryAgentProposal
@@ -1223,6 +1224,54 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
     assert "artifact_review_feedback" not in routing
     assert "approval_id" not in routing
     assert "approval_kind" not in routing
+
+
+def test_terminal_artifact_review_checkpoint_completes_on_approval() -> None:
+    assert _checkpoint_state_completes_artifact_review(
+        {
+            "phase": "completed",
+            "terminal": True,
+            "frontier": [],
+            "artifact_refs": {
+                "character_model_sheet": {
+                    "id": "artifact-001",
+                    "sha256": "0" * 64,
+                }
+            },
+        },
+        "character_model_sheet",
+        "artifact-001",
+    )
+    assert not _checkpoint_state_completes_artifact_review(
+        {
+            "phase": "running",
+            "terminal": False,
+            "frontier": ["storyboard"],
+            "artifact_refs": {
+                "character_model_sheet": {
+                    "id": "artifact-001",
+                    "sha256": "0" * 64,
+                }
+            },
+        },
+        "character_model_sheet",
+        "artifact-001",
+    )
+    assert not _checkpoint_state_completes_artifact_review(
+        {
+            "phase": "completed",
+            "terminal": True,
+            "frontier": [],
+            "artifact_refs": {
+                "character_model_sheet": {
+                    "id": "artifact-previous",
+                    "sha256": "0" * 64,
+                }
+            },
+        },
+        "character_model_sheet",
+        "artifact-001",
+    )
 
 
 @pytest.mark.asyncio

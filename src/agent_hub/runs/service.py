@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
@@ -20,7 +21,14 @@ from agent_hub.routing.rules import assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
@@ -34,6 +42,7 @@ _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
+_CONVERSATION_HISTORY_ARTIFACT_NAMESPACE = UUID("8ef85f85-3d8f-42e6-8e90-6a7c57f8d4a2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1119,18 +1128,36 @@ class RunService:
             if checkpoint is not None:
                 await runtime.restore_checkpoint(checkpoint)
             token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
+            conversation_artifacts = await self._conversation_artifacts(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                current_request=request,
+                routing_decision=routing_decision,
+                runtime_token_budget=token_budget,
+            )
+            if checkpoint is None:
+                artifacts = conversation_artifacts
+            else:
+                current_run_artifacts = await self._current_run_artifacts(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                )
+                artifacts = _dedupe_artifacts(
+                    current_run_artifacts,
+                    conversation_artifacts,
+                    _checkpoint_lineage_input_artifacts(
+                        checkpoint,
+                        current_request=request,
+                        current_run_artifacts=current_run_artifacts,
+                        conversation_artifacts=conversation_artifacts,
+                    ),
+                )
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
                 mode=mode,
                 request=request,
-                artifacts=await self._conversation_artifacts(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    current_request=request,
-                    routing_decision=routing_decision,
-                    runtime_token_budget=token_budget,
-                ),
+                artifacts=artifacts,
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
                 timeout_seconds=_runtime_timeout_seconds(
@@ -1300,7 +1327,38 @@ class RunService:
                     run_id,
                     status.value,
                     type(error).__name__,
+        )
+
+    async def _current_run_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> tuple[Artifact, ...]:
+        raw_artifacts_loader = getattr(self._repository, "raw_artifacts", None)
+        if not callable(raw_artifacts_loader):
+            return ()
+        try:
+            raw_artifacts = await raw_artifacts_loader(tenant_id, run_id)
+        except Exception:
+            _LOGGER.exception(
+                "run_artifact_context_load_failed tenant_id=%s run_id=%s",
+                tenant_id,
+                run_id,
+            )
+            return ()
+        artifacts: list[Artifact] = []
+        for raw_artifact in raw_artifacts:
+            try:
+                artifacts.append(Artifact.from_payload(raw_artifact))
+            except Exception as error:  # noqa: BLE001 - corrupted artifacts must not leak payload.
+                _LOGGER.warning(
+                    "run_artifact_context_parse_failed tenant_id=%s run_id=%s error_type=%s",
+                    tenant_id,
+                    run_id,
+                    type(error).__name__,
                 )
+        return tuple(artifacts)
 
     async def _conversation_artifacts(
         self,
@@ -1340,6 +1398,7 @@ class RunService:
             main_agent_context_window_tokens=main_agent_context_window_tokens,
         )
         artifact = _conversation_history_artifact(
+            run_id=run_id,
             conversation_id=conversation_id,
             current_request=current_request,
             context_items=context_items,
@@ -1640,6 +1699,19 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         if isinstance(openclaw_proposal, dict)
         else None,
     )
+
+
+def _dedupe_artifacts(*groups: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    artifacts: list[Artifact] = []
+    seen: set[str] = set()
+    for group in groups:
+        for artifact in group:
+            artifact_id = str(artifact.id)
+            if artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            artifacts.append(artifact)
+    return tuple(artifacts)
 
 
 _EVOLUTION_EXPLICIT_ACTION_RE = re.compile(
@@ -2277,6 +2349,7 @@ def _conversation_history_token_budget(
 
 def _conversation_history_artifact(
     *,
+    run_id: UUID,
     conversation_id: str,
     current_request: str,
     context_items: tuple[object, ...],
@@ -2288,18 +2361,23 @@ def _conversation_history_artifact(
     bounded_budget = max(1, min(history_token_budget, _MAX_CONVERSATION_HISTORY_TOKENS))
     estimated_tokens = estimate_tokens(history_text)
     if estimated_tokens <= bounded_budget:
+        content: Mapping[str, JsonValue] = {
+            "text": history_text,
+            "conversation_id": conversation_id,
+            "trust": "internal_conversation_summary",
+            "context_policy": "full_history",
+            "estimated_tokens": estimated_tokens,
+            "history_token_budget": bounded_budget,
+        }
         return Artifact(
-            id=uuid4(),
+            id=_stable_conversation_history_artifact_id(
+                run_id=run_id,
+                producer="conversation_history",
+                content=content,
+            ),
             type="text",
             producer="conversation_history",
-            content={
-                "text": history_text,
-                "conversation_id": conversation_id,
-                "trust": "internal_conversation_summary",
-                "context_policy": "full_history",
-                "estimated_tokens": estimated_tokens,
-                "history_token_budget": bounded_budget,
-            },
+            content=content,
         )
 
     compacted = ContextCompactor().compact(
@@ -2311,20 +2389,95 @@ def _conversation_history_artifact(
         ),
         max_summary_tokens=bounded_budget,
     )
+    compacted_content: Mapping[str, JsonValue] = {
+        **dict(compacted.content),
+        "conversation_id": conversation_id,
+        "trust": "internal_conversation_summary",
+        "context_policy": "auto_compacted",
+        "original_estimated_tokens": estimated_tokens,
+        "history_token_budget": bounded_budget,
+    }
     return Artifact(
-        id=compacted.id,
+        id=_stable_conversation_history_artifact_id(
+            run_id=run_id,
+            producer="conversation_history_compacted",
+            content=compacted_content,
+        ),
         version=compacted.version,
         type="text",
         producer="conversation_history_compacted",
-        content={
-            **dict(compacted.content),
-            "conversation_id": conversation_id,
-            "trust": "internal_conversation_summary",
-            "context_policy": "auto_compacted",
-            "original_estimated_tokens": estimated_tokens,
-            "history_token_budget": bounded_budget,
-        },
+        content=compacted_content,
     )
+
+
+def _stable_conversation_history_artifact_id(
+    *, run_id: UUID, producer: str, content: Mapping[str, JsonValue]
+) -> UUID:
+    encoded = json.dumps(
+        {
+            "run_id": str(run_id),
+            "producer": producer,
+            "content": content,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(_CONVERSATION_HISTORY_ARTIFACT_NAMESPACE, encoded)
+
+
+def _checkpoint_lineage_input_artifacts(
+    checkpoint: RuntimeCheckpoint,
+    *,
+    current_request: str,
+    current_run_artifacts: tuple[Artifact, ...],
+    conversation_artifacts: tuple[Artifact, ...],
+) -> tuple[Artifact, ...]:
+    registry = checkpoint.state.get("artifact_registry")
+    registry_ids = set(registry) if isinstance(registry, Mapping) else set()
+    known_ids = {str(artifact.id) for artifact in (*current_run_artifacts, *conversation_artifacts)}
+    missing_input_ids: list[str] = []
+    for artifact in current_run_artifacts:
+        for source_id in artifact.source_ids:
+            if source_id in known_ids or source_id in registry_ids or source_id in missing_input_ids:
+                continue
+            missing_input_ids.append(source_id)
+    if not missing_input_ids:
+        return ()
+    template = next(iter(conversation_artifacts), None)
+    artifacts: list[Artifact] = []
+    for source_id in missing_input_ids:
+        try:
+            artifact_id = UUID(source_id)
+        except ValueError:
+            continue
+        if template is None:
+            artifacts.append(
+                Artifact(
+                    id=artifact_id,
+                    type="text",
+                    producer="runtime_input",
+                    content={
+                        "text": current_request,
+                        "trust": "current_user_request",
+                        "context_policy": "recovered_checkpoint_lineage_input",
+                    },
+                )
+            )
+            continue
+        artifacts.append(
+            Artifact(
+                id=artifact_id,
+                version=template.version,
+                type=template.type,
+                producer=template.producer,
+                content=template.content,
+                source_ids=template.source_ids,
+                provenance=template.provenance,
+            )
+        )
+    return tuple(artifacts)
 
 
 def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:

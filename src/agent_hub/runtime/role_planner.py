@@ -228,6 +228,17 @@ class RolePlanner:
                 roles=roles,
             )
         role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
+        if request.mode is not TaskMode.DISCUSS and _is_final_media_delivery_request(request.task):
+            role_specs = tuple(
+                spec
+                for spec in role_specs
+                if spec[0]
+                in {
+                    "director",
+                    "video_compositor",
+                    "multimedia_generator",
+                }
+            )
         roles = tuple(_assignment(spec, request) for spec in role_specs)
         return RolePlan(
             mode=request.mode,
@@ -1010,11 +1021,15 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     } and _is_deferred_media_pipeline_request(request.task):
         return False
     if role_id == "multimedia_generator":
+        if _requires_media_generation_before_composition(request.task):
+            return True
         return _is_multimedia_generation_request(request.task) and not _is_video_composition_request(
             request.task
         )
     if role_id == "video_compositor":
-        return _is_video_composition_request(request.task)
+        return _is_video_composition_request(
+            request.task
+        ) or _requires_media_generation_before_composition(request.task)
     if role_id == "document_writer":
         return _is_document_generation_request(request.task)
     if role_id == "presentation_designer":
@@ -1267,11 +1282,25 @@ _MULTIMEDIA_MEDIA_TERMS = (
 )
 
 _MULTIMEDIA_GENERATION_NEGATIONS = (
+    "只规划",
+    "仅规划",
+    "规划流程",
+    "只出方案",
+    "仅出方案",
     "不需要",
     "无需",
     "不要",
     "不用",
     "暂不",
+    "不成片",
+    "不输出成片",
+    "不生成成片",
+    "不生成最终成片",
+    "不剪辑成片",
+    "plan only",
+    "planning only",
+    "only plan",
+    "do not compose",
     "not need",
     "do not",
     "don't",
@@ -1754,14 +1783,30 @@ _VIDEO_COMPOSITION_MEDIA_TERMS = (
     "短片",
 )
 _VIDEO_COMPOSITION_NEGATIONS = (
+    "只规划",
+    "仅规划",
+    "规划流程",
+    "规划一下",
+    "只出方案",
+    "仅出方案",
+    "不成片",
     "不需要生成成片",
     "不生成成片",
     "不需要成片",
     "不要成片",
     "无需成片",
+    "不输出成片",
+    "不导出成片",
+    "不生成最终成片",
+    "不剪辑成片",
     "不需要导出",
     "不要导出",
     "无需导出",
+    "plan only",
+    "planning only",
+    "only plan",
+    "do not compose",
+    "do not edit into final",
     "not generate",
     "do not generate",
     "don't generate",
@@ -1850,6 +1895,60 @@ def _is_video_composition_request(task: str) -> bool:
         return has_existing_context
     has_delivery_intent = any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
     return has_delivery_intent and has_media_context and has_existing_context
+
+
+_MEDIA_GENERATION_BEFORE_COMPOSITION_TERMS = (
+    "先生成",
+    "先制作",
+    "缺少",
+    "素材缺失",
+    "镜头素材",
+    "镜头视频",
+    "生成视频并",
+    "生成视频后",
+    "生成最小必要",
+    "根据分镜剪辑成片",
+    "分镜剪辑成片",
+    "后再剪辑成片",
+    "后再合并剪辑",
+    "后合并剪辑",
+    "后剪辑成片",
+    "first generate",
+    "generate clips first",
+    "generate videos first",
+    "missing clips",
+    "missing shot",
+    "missing footage",
+    "generate video and edit",
+    "generate videos and edit",
+)
+
+
+def _requires_media_generation_before_composition(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_deferred_media_pipeline_request(task):
+        return False
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS):
+        return False
+    has_generation_before_composition = any(
+        term in normalized for term in _MEDIA_GENERATION_BEFORE_COMPOSITION_TERMS
+    )
+    if not has_generation_before_composition:
+        return False
+    has_composition_intent = any(term in normalized for term in _VIDEO_COMPOSITION_ACTION_TERMS) or (
+        any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
+        and any(term in normalized for term in _VIDEO_COMPOSITION_MEDIA_TERMS)
+    )
+    return has_composition_intent and _is_multimedia_generation_request(task)
+
+
+def _is_final_media_delivery_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_deferred_media_pipeline_request(task):
+        return False
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS):
+        return False
+    return _is_video_composition_request(task) or _requires_media_generation_before_composition(task)
 
 
 def _is_multimedia_generation_request(task: str) -> bool:
@@ -2137,10 +2236,20 @@ def _has_generation_negation(normalized: str) -> bool:
         "只写提示词",
         "只生成提示词",
         "只给提示词",
+        "只规划",
+        "仅规划",
+        "规划流程",
+        "只出方案",
+        "仅出方案",
         "仅写提示词",
         "仅生成提示词",
         "仅分析",
         "只分析",
+        "不成片",
+        "不输出成片",
+        "不生成成片",
+        "不生成最终成片",
+        "不剪辑成片",
         "do not generate",
         "don't generate",
         "dont generate",
@@ -2158,6 +2267,9 @@ def _has_generation_negation(normalized: str) -> bool:
         "no need to make",
         "without generating",
         "prompt only",
+        "plan only",
+        "planning only",
+        "only plan",
         "analysis only",
     )
     return any(negation in normalized for negation in scoped_negations) and not (

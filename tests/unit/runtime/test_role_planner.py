@@ -279,6 +279,65 @@ def test_final_video_requests_generate_video_without_composing_missing_assets(ta
     role_ids = {role.id for role in plan.roles}
 
     assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+
+
+def test_final_video_request_with_missing_shots_generates_then_composes() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "现在明确要剪辑成片：请使用本会话已经生成或审核通过的角色参考设定表/资产，"
+                "生成一个 5 秒以内的最终 MP4 测试成片；如果缺少镜头素材，"
+                "请先生成最小必要镜头视频，再按分镜合并剪辑。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "planner" not in role_ids
+    assert "reviewer" not in role_ids
+    assert "quality_reviewer" not in role_ids
+    assert "video_editor" not in role_ids
+
+
+def test_generate_assets_then_edit_final_video_routes_to_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成角色参考设定表后再剪辑成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
+    assert "video_editor" not in role_ids
+
+
+def test_video_workflow_planning_request_does_not_generate_or_compose() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="只规划先生成镜头视频再剪辑成片的流程，不成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "video_editor" in role_ids
+    assert "multimedia_generator" not in role_ids
     assert "video_compositor" not in role_ids
 
 

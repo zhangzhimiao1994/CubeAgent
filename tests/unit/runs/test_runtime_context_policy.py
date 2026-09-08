@@ -39,7 +39,9 @@ def test_conversation_history_budget_uses_main_agent_context_window() -> None:
 
 
 def test_conversation_history_stays_full_when_inside_budget() -> None:
+    run_id = uuid4()
     artifact = _conversation_history_artifact(
+        run_id=run_id,
         conversation_id="conv-short",
         current_request="continue",
         context_items=(
@@ -65,9 +67,31 @@ def test_conversation_history_stays_full_when_inside_budget() -> None:
     assert "first request" in text
     assert "first answer" in text
 
+    repeated = _conversation_history_artifact(
+        run_id=run_id,
+        conversation_id="conv-short",
+        current_request="continue",
+        context_items=(
+            ConversationContextItem(
+                run_id=uuid4(),
+                request="first request",
+                artifacts=(
+                    {
+                        "producer": "main_agent",
+                        "content": {"text": "first answer"},
+                    },
+                ),
+            ),
+        ),
+        history_token_budget=4096,
+    )
+    assert repeated is not None
+    assert repeated.id == artifact.id
+
 
 def test_conversation_history_includes_media_pipeline_plan() -> None:
     artifact = _conversation_history_artifact(
+        run_id=uuid4(),
         conversation_id="conv-video-plan",
         current_request="继续生成分镜图",
         context_items=(
@@ -113,6 +137,7 @@ def test_conversation_history_includes_media_pipeline_plan() -> None:
 
 def test_conversation_history_includes_media_pipeline_rejected_artifact_feedback() -> None:
     artifact = _conversation_history_artifact(
+        run_id=uuid4(),
         conversation_id="conv-video-plan",
         current_request="重新生成角色参考设定表",
         context_items=(
@@ -156,6 +181,7 @@ def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None
     latest_decision = "latest important conclusion: use framework-level context compression"
 
     artifact = _conversation_history_artifact(
+        run_id=uuid4(),
         conversation_id="conv-long",
         current_request="continue the work",
         context_items=(
@@ -238,6 +264,7 @@ def test_conversation_history_compaction_preserves_origin_goal_anchor() -> None:
     )
 
     artifact = _conversation_history_artifact(
+        run_id=uuid4(),
         conversation_id="conv-framework-memory",
         current_request="继续当前任务",
         context_items=tuple(items),
@@ -271,6 +298,7 @@ def test_conversation_history_compaction_preserves_latest_request_without_artifa
     )
 
     artifact = _conversation_history_artifact(
+        run_id=uuid4(),
         conversation_id="conv-framework-memory-requests-only",
         current_request="继续当前任务",
         context_items=tuple(items),

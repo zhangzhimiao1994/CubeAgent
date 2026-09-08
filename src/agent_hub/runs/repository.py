@@ -91,6 +91,25 @@ def _safe_temporary_agent_model(proposal: dict[object, object]) -> str:
     raise RunConflict("temporary agent proposal has no safe model")
 
 
+def _checkpoint_state_completes_artifact_review(
+    state: object, stage_id: str, artifact_id: str
+) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    if state.get("phase") != "completed" or state.get("terminal") is not True:
+        return False
+    frontier = state.get("frontier")
+    if isinstance(frontier, (list, tuple)) and frontier:
+        return False
+    artifact_refs = state.get("artifact_refs")
+    if not isinstance(artifact_refs, Mapping):
+        return False
+    reference = artifact_refs.get(stage_id)
+    if not isinstance(reference, Mapping):
+        return False
+    return reference.get("id") == artifact_id
+
+
 class RunRepository:
     """Persist runs and normalized runtime events behind tenant boundaries."""
 
@@ -484,20 +503,30 @@ class RunRepository:
                     "approved_artifacts": approved_artifacts,
                 }
             row.routing_decision = updated_routing
-            row.status = RunStatus.QUEUED.value
+            terminal_review = await self._latest_checkpoint_completes_artifact_review(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                stage_id=stage_id,
+                artifact_id=artifact_id,
+            )
+            row.status = (
+                RunStatus.COMPLETED.value if terminal_review else RunStatus.QUEUED.value
+            )
             row.version += 1
             await session.flush()
-            session.add(
-                RunOutboxRow(
-                    id=uuid4(),
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    task_name="agent_hub.runs.execute",
-                    idempotency_key=f"{tenant_id}:{run_id}:artifact-review:{version}",
-                    payload={"run_id": str(run_id)},
+            if not terminal_review:
+                session.add(
+                    RunOutboxRow(
+                        id=uuid4(),
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        task_name="agent_hub.runs.execute",
+                        idempotency_key=f"{tenant_id}:{run_id}:artifact-review:{version}",
+                        payload={"run_id": str(run_id)},
+                    )
                 )
-            )
-            await session.flush()
+                await session.flush()
             return self._record(row)
 
     async def reject_artifact_review_and_enqueue(
@@ -883,6 +912,25 @@ class RunRepository:
                 )
             ).all()
             return tuple(dict(row.payload) for row in rows)
+
+    @staticmethod
+    async def _latest_checkpoint_completes_artifact_review(
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        stage_id: str,
+        artifact_id: str,
+    ) -> bool:
+        row = await session.scalar(
+            select(RunCheckpointRow)
+            .where(RunCheckpointRow.tenant_id == tenant_id, RunCheckpointRow.run_id == run_id)
+            .order_by(RunCheckpointRow.sequence.desc())
+            .limit(1)
+        )
+        if row is None:
+            return False
+        return _checkpoint_state_completes_artifact_review(row.state, stage_id, artifact_id)
 
     async def conversation_context(
         self,

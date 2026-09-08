@@ -647,6 +647,117 @@ def _artifact_review_packet_payload(
     return {"artifact_review_packet": packet}
 
 
+def _usable_file_artifacts_payload(artifacts: tuple[Artifact, ...]) -> tuple[Mapping[str, JsonValue], ...]:
+    usable: list[Mapping[str, JsonValue]] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        for file_metadata in _file_metadata_values(artifact.content):
+            storage_key = file_metadata.get("storage_key")
+            mime_type = file_metadata.get("mime_type")
+            if type(storage_key) is not str or type(mime_type) is not str:
+                continue
+            key = f"{storage_key}\0{mime_type}"
+            if key in seen:
+                continue
+            seen.add(key)
+            item: dict[str, JsonValue] = {
+                "source_artifact_id": str(artifact.id),
+                "source_producer": artifact.producer,
+                "storage_key": storage_key,
+                "mime_type": mime_type,
+            }
+            for metadata_field in ("filename", "artifact_id", "download_url"):
+                value = file_metadata.get(metadata_field)
+                if type(value) is str and value:
+                    item[metadata_field] = value
+            usable.append(item)
+    return tuple(usable)
+
+
+def _normalize_compose_video_arguments_with_sources(
+    arguments: Mapping[str, JsonValue],
+    source_artifacts: tuple[Artifact, ...],
+) -> Mapping[str, JsonValue]:
+    usable_files = tuple(
+        file
+        for file in _usable_file_artifacts_payload(source_artifacts)
+        if _is_composable_media_mime(file.get("mime_type"))
+    )
+    if not usable_files:
+        return arguments
+    raw_clips = arguments.get("clips")
+    if _clips_use_known_file_handles(raw_clips, usable_files):
+        return arguments
+    fallback_durations = _clip_duration_overrides(raw_clips)
+    normalized_clips: list[Mapping[str, JsonValue]] = []
+    for index, file in enumerate(usable_files):
+        clip = {
+            key: value
+            for key, value in file.items()
+            if key in {"storage_key", "mime_type", "filename", "artifact_id", "download_url"}
+        }
+        if index < len(fallback_durations):
+            clip["duration_seconds"] = fallback_durations[index]
+        normalized_clips.append(clip)
+    return {**arguments, "clips": tuple(normalized_clips)}
+
+
+def _is_composable_media_mime(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(("video/", "image/"))
+
+
+def _clips_use_known_file_handles(
+    raw_clips: object,
+    usable_files: tuple[Mapping[str, JsonValue], ...],
+) -> bool:
+    if not isinstance(raw_clips, (list, tuple)) or not raw_clips:
+        return False
+    known = {
+        (file.get("storage_key"), file.get("mime_type"))
+        for file in usable_files
+        if isinstance(file.get("storage_key"), str) and isinstance(file.get("mime_type"), str)
+    }
+    for raw_clip in raw_clips:
+        if not isinstance(raw_clip, Mapping):
+            return False
+        if (raw_clip.get("storage_key"), raw_clip.get("mime_type")) not in known:
+            return False
+    return True
+
+
+def _clip_duration_overrides(raw_clips: object) -> tuple[JsonValue, ...]:
+    if not isinstance(raw_clips, (list, tuple)):
+        return ()
+    durations: list[JsonValue] = []
+    for raw_clip in raw_clips:
+        if not isinstance(raw_clip, Mapping):
+            continue
+        value = raw_clip.get("duration_seconds")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            durations.append(value)
+    return tuple(durations)
+
+
+def _file_metadata_values(value: JsonValue) -> tuple[Mapping[str, JsonValue], ...]:
+    found: list[Mapping[str, JsonValue]] = []
+
+    def visit(candidate: JsonValue) -> None:
+        if isinstance(candidate, Mapping):
+            storage_key = candidate.get("storage_key")
+            mime_type = candidate.get("mime_type")
+            if type(storage_key) is str and type(mime_type) is str:
+                found.append(candidate)
+            for nested in candidate.values():
+                visit(nested)
+            return
+        if isinstance(candidate, tuple):
+            for nested in candidate:
+                visit(nested)
+
+    visit(value)
+    return tuple(found)
+
+
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
     text = artifact.content.get("text")
     if type(text) is not str:
@@ -1109,6 +1220,28 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _sanitize_artifact_text(text: str) -> str:
+    normalized_lines = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = unicodedata.normalize("NFC", normalized_lines)
+    return "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) != "Cf"
+        and (unicodedata.category(character) != "Cc" or character in "\n\t")
+    )
+
+
+def _safe_artifact_text(text: str) -> str:
+    sanitized = _sanitize_artifact_text(text)
+    if not sanitized.strip():
+        _fail("model response text is empty")
+    return sanitized
+
+
+def _safe_response_text_is_empty(text: str) -> bool:
+    return not _sanitize_artifact_text(text).strip()
 
 
 def _artifact_review_feedback_from_routing(
@@ -2342,7 +2475,8 @@ class CrewDispatchRuntime:
                                     model_ledger,
                                     usage_ledger,
                                     review_ledger,
-                                    next_sequence=sequence.value + 2,
+                                    next_sequence=sequence.value
+                                    + (3 if result.step.requires_user_review else 2),
                                     terminal=(
                                         usage_ledger.terminal_phase is not None
                                         or len(completed) == len(steps)
@@ -3024,6 +3158,9 @@ class CrewDispatchRuntime:
                 "task": step.task,
                 "untrusted_source_artifacts": source_payload,
             }
+            usable_files = _usable_file_artifacts_payload(sources)
+            if usable_files:
+                user["usable_file_artifacts"] = usable_files
             hermes_context = hermes_memory_context_text(context.routing_decision)
             if hermes_context:
                 user["hermes_memory_context"] = hermes_context
@@ -3735,9 +3872,17 @@ class CrewDispatchRuntime:
             for tool_index, tool_call in enumerate(response.tool_calls):
                 if tool_call.name not in step.tools:
                     _fail("step requested a forbidden capability")
+                tool_arguments = (
+                    _normalize_compose_video_arguments_with_sources(
+                        tool_call.arguments,
+                        input_sources,
+                    )
+                    if tool_call.name == "compose_video"
+                    else tool_call.arguments
+                )
                 try:
                     canonical_arguments = json.dumps(
-                        _mutable_json(tool_call.arguments),
+                        _mutable_json(tool_arguments),
                         ensure_ascii=False,
                         allow_nan=False,
                         sort_keys=True,
@@ -3818,7 +3963,7 @@ class CrewDispatchRuntime:
                             run_id=context.run_id,
                             actor=step.agent,
                             name=tool_call.name,
-                            arguments=tool_call.arguments,
+                            arguments=tool_arguments,
                             idempotency_key=idempotency_key,
                         )
                     encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
@@ -3983,8 +4128,9 @@ class CrewDispatchRuntime:
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+        text = None if response.text is None else _sanitize_artifact_text(response.text)
         content: Mapping[str, JsonValue] = {
-            "text": response.text,
+            "text": text,
             "tool_calls": tuple(
                 {
                     "id": tool_call.id,
@@ -4390,7 +4536,11 @@ class CrewDispatchRuntime:
         response = completion.response
         if not isinstance(response, ModelResponse):
             return False
-        return response.text is not None and not response.text.strip() and not response.tool_calls
+        return (
+            response.text is not None
+            and _safe_response_text_is_empty(response.text)
+            and not response.tool_calls
+        )
 
     @staticmethod
     def _is_empty_response_failure_reason(reason: str) -> bool:
@@ -4406,9 +4556,16 @@ class CrewDispatchRuntime:
             _fail("model gateway returned invalid response object")
         if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             _fail("model response exceeds tool call limit")
-        if response.text is not None and not response.text.strip() and not response.tool_calls:
+        if (
+            response.text is not None
+            and _safe_response_text_is_empty(response.text)
+            and not response.tool_calls
+        ):
             _fail("model response text is empty")
-        if response.text is not None and len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+        if (
+            response.text is not None
+            and len(_sanitize_artifact_text(response.text).encode("utf-8")) > _MAX_OUTPUT_BYTES
+        ):
             _fail("model response exceeds output limit")
         if response.text is None and not response.tool_calls:
             _fail("model response is empty")
@@ -4562,6 +4719,7 @@ class CrewDispatchRuntime:
         text = completion.response.text
         if text is None or completion.response.tool_calls:
             _fail("model response is unsupported")
+        text = _safe_artifact_text(text)
         return Artifact(
             id=uuid4(),
             version=version,

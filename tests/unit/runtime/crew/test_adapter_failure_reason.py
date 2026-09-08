@@ -31,7 +31,9 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
     _direct_multimedia_generation_prompt,
+    _normalize_compose_video_arguments_with_sources,
     _normalize_tool_call_arguments,
+    _usable_file_artifacts_payload,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -95,6 +97,23 @@ class EmptyThenSuccessGateway:
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.calls += 1
         text = "" if self.calls == 1 else "recovered answer"
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class ControlCharsThenSuccessGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls += 1
+        text = "\x00\u200b\r" if self.calls == 1 else "recovered answer"
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -716,6 +735,43 @@ def test_text_only_empty_model_response_still_fails() -> None:
         CrewDispatchRuntime._valid_response(completion)
 
 
+def test_text_artifact_sanitizes_unsafe_control_characters() -> None:
+    step = DispatchStep(id="director_step", agent="director", task="compose final video plan")
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text="first\x00line\n\tzero\u200bwidth",
+            usage=TokenUsage(10, 1, 11),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    artifact = CrewDispatchRuntime._artifact(step, completion, (), version=1)
+
+    assert dict(artifact.content) == {"text": "firstline\n\tzerowidth"}
+
+
+def test_model_response_artifact_sanitizes_text_before_evidence_storage() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text="first\x00line\r\n\tzero\u200bwidth",
+            usage=TokenUsage(10, 1, 11),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    artifact = CrewDispatchRuntime._model_artifact(completion, "director", ())
+
+    assert dict(artifact.content)["text"] == "firstline\n\tzerowidth"
+
+
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
 
@@ -984,6 +1040,7 @@ async def test_rejected_single_media_delivery_reruns_stage_before_completion() -
     retry = next(event for event in restored_events if event.kind is EventKind.STEP_RETRYING)
     assert retry.step_id == "multimedia_generator_step"
     assert retry.reason == "user rejected artifact review; regenerating stage"
+    assert retry.sequence > approval.sequence
     refreshed_approval = next(
         event for event in restored_events if event.kind is EventKind.APPROVAL_REQUESTED
     )
@@ -1573,6 +1630,25 @@ async def test_dispatch_step_empty_model_response_retries_before_failing() -> No
     assert retry.payload["error_code"] == "model.empty_response"
 
 
+async def test_dispatch_step_sanitized_empty_model_response_retries_before_failing() -> None:
+    gateway = ControlCharsThenSuccessGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "model returned empty response; retrying with explicit output request"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    assert retry.payload["error_code"] == "model.empty_response"
+
+
 async def test_dispatch_step_gateway_empty_response_error_retries_before_failing() -> None:
     gateway = EmptyErrorThenSuccessGateway()
     repository = InMemoryArtifactRepository()
@@ -1906,3 +1982,102 @@ def test_artifact_review_packet_payload_uses_bounded_preview_without_full_text()
     assert packet["preview"] != original_text
     assert "[truncated:" in packet["preview"]
     assert artifact.content["text"] == original_text
+
+
+def test_usable_file_artifacts_payload_exposes_generated_file_handles() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "file": {
+                    "storage_key": "tenant/run/artifact/shot.mp4",
+                    "mime_type": "video/mp4",
+                    "filename": "shot.mp4",
+                    "download_url": "/api/v1/admin/runs/run/artifacts/artifact/download",
+                    "artifact_id": "artifact-001",
+                },
+                "metadata": {
+                    "storage_key": "tenant/run/artifact/shot.mp4",
+                    "mime_type": "video/mp4",
+                    "filename": "shot.mp4",
+                },
+                "artifacts": (
+                    {
+                        "file": {
+                            "storage_key": "tenant/run/artifact/storyboard.png",
+                            "mime_type": "image/png",
+                            "filename": "storyboard.png",
+                        },
+                    },
+                ),
+            },
+        },
+    )
+
+    payload = _usable_file_artifacts_payload((artifact,))
+
+    assert payload == (
+        {
+            "source_artifact_id": str(artifact.id),
+            "source_producer": "multimedia_generator",
+            "storage_key": "tenant/run/artifact/shot.mp4",
+            "mime_type": "video/mp4",
+            "filename": "shot.mp4",
+            "artifact_id": "artifact-001",
+            "download_url": "/api/v1/admin/runs/run/artifacts/artifact/download",
+        },
+        {
+            "source_artifact_id": str(artifact.id),
+            "source_producer": "multimedia_generator",
+            "storage_key": "tenant/run/artifact/storyboard.png",
+            "mime_type": "image/png",
+            "filename": "storyboard.png",
+        },
+    )
+
+
+def test_compose_video_arguments_use_upstream_file_handles() -> None:
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "file": {
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/run/artifact/"
+                        "kling_kling-v3-omni-video-generation.mp4"
+                    ),
+                    "mime_type": "video/mp4",
+                    "filename": "kling_kling-v3-omni-video-generation.mp4",
+                    "artifact_id": "video-artifact",
+                    "download_url": "/api/v1/admin/runs/run/artifacts/video-artifact/download",
+                }
+            }
+        },
+    )
+    arguments: Mapping[str, JsonValue] = {
+        "title": "test cut",
+        "filename": "test-cut.mp4",
+        "clips": (
+            {
+                "storage_key": str(source.id),
+                "mime_type": "video/mp4",
+                "filename": "guessed.mp4",
+                "duration_seconds": 5,
+            },
+        ),
+    }
+
+    normalized = _normalize_compose_video_arguments_with_sources(arguments, (source,))
+    clips = cast(tuple[Mapping[str, JsonValue], ...], normalized["clips"])
+
+    assert clips[0]["storage_key"] == (
+        "00000000-0000-4000-8000-000000000001/run/artifact/"
+        "kling_kling-v3-omni-video-generation.mp4"
+    )
+    assert clips[0]["mime_type"] == "video/mp4"
+    assert clips[0]["filename"] == "kling_kling-v3-omni-video-generation.mp4"
+    assert clips[0]["duration_seconds"] == 5

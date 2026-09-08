@@ -11,8 +11,12 @@ import pytest
 
 from agent_hub.cognitive.pipeline import CognitiveLearningTerminalHook
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import HermesRunOutcome, RunService
+from agent_hub.runs.repository import ConversationContextItem, RunRecord
+from agent_hub.runs.service import (
+    HermesRunOutcome,
+    RunService,
+    _conversation_history_artifact,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -52,7 +56,14 @@ class FakeTransaction:
 
 
 class ExecutableFakeRepository:
-    def __init__(self, *, routing_decision: dict[str, object]) -> None:
+    def __init__(
+        self,
+        *,
+        routing_decision: dict[str, object],
+        checkpoint: RuntimeCheckpoint | None = None,
+        raw_artifacts: tuple[dict[str, object], ...] = (),
+        conversation_context: tuple[ConversationContextItem, ...] = (),
+    ) -> None:
         self.run_id = uuid4()
         self.row = FakeRunRow(
             id=self.run_id,
@@ -66,6 +77,9 @@ class ExecutableFakeRepository:
             routing_decision=routing_decision,
         )
         self.events: list[RunEvent] = []
+        self.checkpoint = checkpoint
+        self.raw_artifact_payloads = raw_artifacts
+        self.conversation_context_items = conversation_context
 
     async def run_transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -81,7 +95,7 @@ class ExecutableFakeRepository:
         assert run_id == self.run_id
         self.row.status = RunStatus.RUNNING.value
         self.row.version += 1
-        return self.row, None
+        return self.row, self.checkpoint
 
     async def get_for_update(self, session: FakeTransaction, run_id: UUID) -> FakeRunRow:
         del session
@@ -100,6 +114,29 @@ class ExecutableFakeRepository:
         assert tenant_id == TENANT_ID
         assert run_id == self.run_id
         self.events.append(event)
+        if event.checkpoint is not None:
+            self.checkpoint = event.checkpoint
+
+    async def raw_artifacts(
+        self, tenant_id: UUID, run_id: UUID
+    ) -> tuple[dict[str, object], ...]:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        return self.raw_artifact_payloads
+
+    async def conversation_context(
+        self,
+        tenant_id: UUID,
+        conversation_id: str,
+        *,
+        before_run_id: UUID,
+        limit: int = 6,
+    ) -> tuple[ConversationContextItem, ...]:
+        del limit
+        assert tenant_id == TENANT_ID
+        assert before_run_id == self.run_id
+        assert conversation_id
+        return self.conversation_context_items
 
     async def next_event_sequence(self, session: FakeTransaction, run_id: UUID) -> int:
         del session
@@ -207,6 +244,30 @@ class RuntimeReportsCapacityPressure:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RuntimeRequiresHydratedArtifactOnRestore(RuntimeCompletes):
+    def __init__(self, *required_artifact_ids: UUID) -> None:
+        self.required_artifact_ids = tuple(str(item) for item in required_artifact_ids)
+        self.context_artifact_ids: tuple[str, ...] = ()
+        self.restored: RuntimeCheckpoint | None = None
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.context_artifact_ids = tuple(str(artifact.id) for artifact in context.artifacts)
+        if any(item not in self.context_artifact_ids for item in self.required_artifact_ids):
+            raise RuntimeError("checkpoint artifacts were not hydrated")
+        yield RunEvent(
+            kind=EventKind.STEP_RETRYING,
+            sequence=1,
+            run_id=context.run_id,
+            actor="multimedia_generator",
+            step_id="multimedia_generator_step",
+            reason="user rejected artifact review; regenerating stage",
+        )
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=2, run_id=context.run_id)
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored = checkpoint
 
 
 class RuntimeRequestsArtifactReview(RuntimeCompletes):
@@ -393,6 +454,140 @@ async def test_execute_continues_after_non_artifact_approval_events() -> None:
             "routing_decision": {"source": "manual"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_hydrates_persisted_run_artifacts_when_restoring_checkpoint() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="multimedia_generator",
+        content={"text": "Generated image artifact with kilin-ima."},
+    )
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "video_pipeline",
+            "artifact_review_feedback": {
+                "stage_id": "multimedia_generator_step",
+                "artifact_id": str(artifact.id),
+                "feedback": "角色脸型和服装不一致，退回重新生成角色参考设定表。",
+            },
+        },
+        raw_artifacts=(artifact.to_payload(),),
+    )
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="crew",
+        runtime_version="7",
+        run_id=repository.run_id,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        state={
+            "phase": "completed",
+            "artifact_registry": {str(artifact.id): artifact.content_sha256},
+        },
+    )
+    repository.checkpoint = checkpoint
+    runtime = RuntimeRequiresHydratedArtifactOnRestore(artifact.id)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert runtime.restored == checkpoint
+    assert str(artifact.id) in runtime.context_artifact_ids
+    event_kinds = [event.kind for event in repository.events]
+    assert event_kinds[:2] == [
+        EventKind.STEP_RETRYING,
+        EventKind.RUNTIME_COMPLETED,
+    ]
+    assert EventKind.RUNTIME_FAILED not in event_kinds
+
+
+@pytest.mark.asyncio
+async def test_execute_recovers_missing_external_lineage_source_on_checkpoint_restore() -> (
+    None
+):
+    conversation_id = "conv-review-retry"
+    prior_run_id = uuid4()
+    context_items = (
+        ConversationContextItem(
+            run_id=prior_run_id,
+            request="先生成一个短剧剧本。",
+            artifacts=(
+                {
+                    "producer": "main_agent",
+                    "content": {"text": "已完成剧本：角色是年轻医生。"},
+                },
+            ),
+        ),
+    )
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "video_pipeline",
+            "conversation_id": conversation_id,
+        },
+        conversation_context=context_items,
+    )
+    source_artifact = _conversation_history_artifact(
+        run_id=repository.run_id,
+        conversation_id=conversation_id,
+        current_request=repository.row.request,
+        context_items=context_items,
+        history_token_budget=4096,
+    )
+    assert source_artifact is not None
+    stale_source_id = uuid4()
+    assert stale_source_id != source_artifact.id
+    generated = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="multimedia_generator",
+        content={"text": "Generated character sheet artifact with kilin-ima."},
+        source_ids=(str(stale_source_id),),
+    )
+    repository.raw_artifact_payloads = (generated.to_payload(),)
+    repository.row.routing_decision = {
+        "source": "video_pipeline",
+        "conversation_id": conversation_id,
+        "artifact_review_feedback": {
+            "stage_id": "multimedia_generator_step",
+            "artifact_id": str(generated.id),
+            "feedback": "角色脸型和服装不一致，退回重新生成角色参考设定表。",
+        },
+    }
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="crew",
+        runtime_version="7",
+        run_id=repository.run_id,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        state={
+            "phase": "completed",
+            "artifact_registry": {str(generated.id): generated.content_sha256},
+        },
+    )
+    repository.checkpoint = checkpoint
+    runtime = RuntimeRequiresHydratedArtifactOnRestore(generated.id, stale_source_id)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert runtime.restored == checkpoint
+    assert str(generated.id) in runtime.context_artifact_ids
+    assert str(stale_source_id) in runtime.context_artifact_ids
 
 
 @pytest.mark.asyncio

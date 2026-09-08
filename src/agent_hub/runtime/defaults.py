@@ -146,6 +146,18 @@ _FINAL_MEDIA_DELIVERY_TERMS = (
     "成片",
     "mp4",
 )
+_VIDEO_PRODUCTION_ROLE_TERMS = (
+    "video",
+    "视频",
+    "剪辑",
+    "分镜",
+    "导演",
+    "compositor",
+    "editor",
+    "director",
+    "multimedia",
+    "media",
+)
 _MEDIA_REVIEW_NEGATIONS = (
     "不需要",
     "无需",
@@ -821,7 +833,7 @@ def _dispatch_plan(
                 f"{memory_guidance}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
-            depends_on=producer_step_ids if _is_post_product_role(role) else (),
+            depends_on=_dispatch_role_dependencies(role, selected_roles, producer_step_ids),
             tools=_role_allowed_tools(
                 role,
                 context,
@@ -876,6 +888,22 @@ def _dispatch_plan(
         total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
         total_cost_usd=Decimal(0),
     )
+
+
+def _dispatch_role_dependencies(
+    role: RoleAssignment,
+    selected_roles: tuple[RoleAssignment, ...],
+    producer_step_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    if _is_post_product_role(role):
+        return producer_step_ids
+    if role.id == "video_compositor" and "compose_video" in role.allowed_tools:
+        return tuple(
+            f"{candidate.id}_step"
+            for candidate in selected_roles
+            if candidate.id != role.id and not _is_post_product_role(candidate)
+        )
+    return ()
 
 
 def _is_post_product_role(role: RoleAssignment) -> bool:
@@ -1203,8 +1231,6 @@ def _should_use_standalone_multimedia_roles(
     selected_roles: tuple[RoleAssignment, ...],
     planner_roles: tuple[RoleAssignment, ...],
 ) -> bool:
-    if not _is_standalone_multimedia_role_plan(planner_roles):
-        return False
     generic_role_ids = {
         "architect",
         "implementer",
@@ -1214,7 +1240,21 @@ def _should_use_standalone_multimedia_roles(
         "reviewer",
         "quality_reviewer",
     }
-    return bool(selected_roles) and all(role.id in generic_role_ids for role in selected_roles)
+    if not bool(selected_roles) or any(role.id not in generic_role_ids for role in selected_roles):
+        return False
+    if _is_standalone_multimedia_role_plan(planner_roles):
+        return True
+    media_role_ids = {
+        "director",
+        "multimedia_generator",
+        "video_compositor",
+        "video_editor",
+    }
+    return any(
+        role.id in media_role_ids
+        or bool({"compose_video", "generate_multimedia"}.intersection(role.allowed_tools))
+        for role in planner_roles
+    )
 
 
 def _temporary_role_assignments(
@@ -1378,6 +1418,7 @@ def _rank_logical_models_for_role(
             " ".join(role.must_answer),
         )
     ).lower()
+    role_text = f"{role.id} {role.role}".lower()
     preferred = role.model if role.model in config.models and role.model != default_model else ""
     scored: list[tuple[int, int, str]] = []
     for logical_model, definition in config.models.items():
@@ -1428,6 +1469,13 @@ def _rank_logical_models_for_role(
                 "story",
             )
         ):
+            capabilities = _logical_model_capabilities(definition)
+            if (
+                "text" in capabilities
+                and "video_generation" in capabilities
+                and any(keyword in role_text for keyword in _VIDEO_PRODUCTION_ROLE_TERMS)
+            ):
+                score += 36
             if any(
                 keyword in haystack
                 for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")
@@ -1483,6 +1531,14 @@ def _rank_logical_models_for_role(
         scored.append((score, -len(logical_model), logical_model))
     scored.sort(reverse=True)
     return scored
+
+
+def _logical_model_capabilities(definition: LogicalModelDefinition) -> frozenset[str]:
+    return frozenset(
+        str(capability).lower()
+        for deployment in definition.deployments
+        for capability in deployment.capabilities
+    )
 
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
@@ -1691,7 +1747,7 @@ def _task_profile(task: object) -> TaskProfile:
     text = str(task).lower()
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         return TaskProfile.DEPLOYMENT
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _is_software_task_text(text):
         return TaskProfile.SOFTWARE
     if any(keyword in text for keyword in ("research", "调研", "分析", "报告", "市场")):
         return TaskProfile.RESEARCH
@@ -1705,7 +1761,7 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _is_software_task_text(text):
         profiles.append(TaskProfile.SOFTWARE)
     if any(
         keyword in text for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
@@ -1716,6 +1772,45 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     if not profiles or TaskProfile.GENERAL not in profiles:
         profiles.append(TaskProfile.GENERAL)
     return tuple(profiles)
+
+
+def _is_software_task_text(text: str) -> bool:
+    if _looks_like_media_test_delivery_text(text):
+        return any(
+            keyword in text
+            for keyword in (
+                "code",
+                "代码",
+                "源码",
+                "python",
+                "javascript",
+                "typescript",
+                "api",
+                "github",
+                ".py",
+                ".js",
+                ".ts",
+            )
+        )
+    return any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS)
+
+
+def _looks_like_media_test_delivery_text(text: str) -> bool:
+    has_test_word = "test" in text or "测试" in text
+    if not has_test_word:
+        return False
+    media_terms = (
+        "mp4",
+        "video",
+        "clip",
+        "reel",
+        "视频",
+        "短片",
+        "成片",
+        "镜头",
+        "剪辑",
+    )
+    return any(term in text for term in media_terms)
 
 
 def _dispatch_parallelism(
