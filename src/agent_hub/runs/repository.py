@@ -472,6 +472,7 @@ class RunRepository:
                         "approval_stage_id",
                         "approval_artifact_id",
                         "approved_artifacts",
+                        "artifact_review_feedback",
                     }
                 },
             }
@@ -563,7 +564,6 @@ class RunRepository:
                     **plan,
                     "rejected_artifacts": rejected_artifacts,
                 }
-            row.request = f"{row.request}\n\nUser feedback for artifact review: {feedback}"
             row.routing_decision = updated_routing
             row.status = RunStatus.QUEUED.value
             row.version += 1

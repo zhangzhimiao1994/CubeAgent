@@ -1000,6 +1000,7 @@ def _direct_multimedia_generation_prompt(
     context: TaskContext,
     step: DispatchStep,
     sources: tuple[Artifact, ...],
+    feedback: str | None = None,
 ) -> str:
     source_previews: list[str] = []
     for artifact in sources[:6]:
@@ -1009,6 +1010,8 @@ def _direct_multimedia_generation_prompt(
     parts = [context.request.strip(), f"执行任务：{step.task.strip()}"]
     if source_previews:
         parts.append("参考上游产物：\n" + "\n".join(source_previews))
+    if feedback is not None:
+        parts.append(f"用户审核退回意见：{feedback}")
     prompt = "\n\n".join(part for part in parts if part)
     prompt = unicodedata.normalize("NFC", prompt)
     prompt = "".join(
@@ -1049,6 +1052,57 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _artifact_review_feedback_from_routing(
+    routing_decision: Mapping[str, JsonValue],
+) -> _UserArtifactReviewFeedback | None:
+    raw = routing_decision.get("artifact_review_feedback")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        _fail("artifact review feedback payload is invalid")
+    stage_id = raw.get("stage_id")
+    artifact_id = raw.get("artifact_id")
+    feedback = raw.get("feedback")
+    if (
+        type(stage_id) is not str
+        or not stage_id.strip()
+        or type(artifact_id) is not str
+        or type(feedback) is not str
+        or not feedback.strip()
+        or len(feedback.encode("utf-8")) > 8192
+    ):
+        _fail("artifact review feedback payload is invalid")
+    try:
+        if str(UUID(artifact_id)) != artifact_id:
+            _fail("artifact review feedback payload is invalid")
+    except ValueError:
+        _fail("artifact review feedback payload is invalid")
+    return _UserArtifactReviewFeedback(
+        stage_id=stage_id,
+        artifact_id=artifact_id,
+        feedback=feedback.strip(),
+    )
+
+
+def _step_ids_invalidated_by_review_feedback(
+    plan: DispatchPlan, stage_id: str
+) -> frozenset[str]:
+    step_ids = {step.id for step in plan.steps}
+    if stage_id not in step_ids:
+        _fail("artifact review feedback stage is invalid")
+    invalidated = {stage_id}
+    changed = True
+    while changed:
+        changed = False
+        for step in plan.steps:
+            if step.id in invalidated:
+                continue
+            if any(dependency in invalidated for dependency in step.depends_on):
+                invalidated.add(step.id)
+                changed = True
+    return frozenset(invalidated)
 
 
 def _model_request_checkpoint_mismatch_reason(
@@ -1447,6 +1501,13 @@ class _ReviewLedger:
 
 
 @dataclass(frozen=True, slots=True)
+class _UserArtifactReviewFeedback:
+    stage_id: str
+    artifact_id: str
+    feedback: str
+
+
+@dataclass(frozen=True, slots=True)
 class _RunToken:
     generation: int
 
@@ -1615,12 +1676,15 @@ class CrewDispatchRuntime:
         model_ledger = _ModelLedger()
         usage_ledger = _UsageLedger()
         review_ledger = _ReviewLedger()
+        user_feedback_by_step: dict[str, str] = {}
+        invalidated_artifact_ids: set[str] = set()
         artifact_registry: dict[str, Artifact] = {}
         self._current_artifact_registry = artifact_registry
         restored = self._restored_checkpoint
         protected_checkpoint = restored or context.checkpoint
         hydrating_restored = protected_checkpoint is not None
         terminal_item: _Terminal | None = None
+        review_feedback_applied = False
 
         async def store_artifact(artifact: Artifact) -> UUID:
             if not self._accepts_artifact_writes(state):
@@ -1661,6 +1725,7 @@ class CrewDispatchRuntime:
 
         try:
             plan = DispatchPlan.revalidate(self._plan)
+            steps = {step.id: step for step in plan.steps}
             self._validate_checkpoint_metadata_budget(plan)
             state.deadline = asyncio.get_running_loop().time() + min(
                 context.timeout_seconds, plan.total_timeout_seconds
@@ -1688,10 +1753,67 @@ class CrewDispatchRuntime:
                     restored_artifacts,
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
                 artifact_registry.update(restored_artifacts)
+                user_feedback = _artifact_review_feedback_from_routing(
+                    context.routing_decision
+                )
+                if user_feedback is not None:
+                    rejected_artifact = completed.get(user_feedback.stage_id)
+                    if (
+                        rejected_artifact is not None
+                        and str(rejected_artifact.id) == user_feedback.artifact_id
+                    ):
+                        invalidated = _step_ids_invalidated_by_review_feedback(
+                            plan, user_feedback.stage_id
+                        )
+                        review_feedback_applied = True
+                        user_feedback_by_step[user_feedback.stage_id] = (
+                            user_feedback.feedback
+                        )
+                        for step_id in invalidated:
+                            artifact = completed.pop(step_id, None)
+                            retry_counts.pop(step_id, None)
+                            review_artifact = review_ledger.artifacts.pop(
+                                step_id, None
+                            )
+                            if review_artifact is not None:
+                                review_artifact_id = str(review_artifact.id)
+                                invalidated_artifact_ids.add(review_artifact_id)
+                                artifact_registry.pop(review_artifact_id, None)
+                            if artifact is not None:
+                                artifact_id = str(artifact.id)
+                                invalidated_artifact_ids.add(artifact_id)
+                                artifact_registry.pop(artifact_id, None)
+                        for key, item in tuple(model_ledger.states.items()):
+                            if item.get("step_id") in invalidated:
+                                model_ledger.states.pop(key, None)
+                                model_artifact = model_ledger.artifacts.pop(key, None)
+                                if model_artifact is not None:
+                                    model_artifact_id = str(model_artifact.id)
+                                    invalidated_artifact_ids.add(model_artifact_id)
+                                    artifact_registry.pop(model_artifact_id, None)
+                        for key, item in tuple(tool_ledger.states.items()):
+                            if item.get("step_id") in invalidated:
+                                tool_ledger.states.pop(key, None)
+                                tool_artifact = tool_ledger.artifacts.pop(key, None)
+                                if tool_artifact is not None:
+                                    tool_artifact_id = str(tool_artifact.id)
+                                    invalidated_artifact_ids.add(tool_artifact_id)
+                                    artifact_registry.pop(tool_artifact_id, None)
+                        await emit(
+                            kind=EventKind.STEP_RETRYING,
+                            step_id=user_feedback.stage_id,
+                            actor=steps[user_feedback.stage_id].agent,
+                            reason="user rejected artifact review; regenerating stage",
+                            payload={
+                                "attempt": 1,
+                                "artifact_id": user_feedback.artifact_id,
+                                "feedback": user_feedback.feedback,
+                            },
+                        )
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
-                if restored_phase == "completed":
+                if restored_phase == "completed" and not review_feedback_applied:
                     await emit(
                         kind=EventKind.RUNTIME_COMPLETED,
                         inputs=(completed[plan.final_step.id],),
@@ -1722,8 +1844,8 @@ class CrewDispatchRuntime:
                 artifact
                 for artifact in context.artifacts
                 if str(artifact.id) not in artifact_registry
+                and str(artifact.id) not in invalidated_artifact_ids
             )
-            steps = {step.id: step for step in plan.steps}
             checkpoint_lock = asyncio.Lock()
 
             async def boundary(
@@ -2081,6 +2203,7 @@ class CrewDispatchRuntime:
                             model_ledger,
                             state,
                             review_ledger,
+                            user_feedback_by_step.get(step.id),
                         )
 
                 tasks = {asyncio.create_task(execute(step)): step for step in ready}
@@ -2346,6 +2469,7 @@ class CrewDispatchRuntime:
         model_ledger: _ModelLedger,
         run_state: _RunState,
         review_ledger: _ReviewLedger,
+        user_feedback: str | None = None,
     ) -> _StepResult:
         async def event(**values: object) -> None:
             await emit(**values)
@@ -2358,6 +2482,8 @@ class CrewDispatchRuntime:
             feedback_artifact.content.get("feedback") if feedback_artifact is not None else None
         )
         feedback = cast(str | None, feedback_value)
+        if user_feedback is not None:
+            feedback = user_feedback
         step_deadline = asyncio.get_running_loop().time() + min(
             step.timeout_seconds * (1 + _STEP_TIMEOUT_RECOVERY_RETRIES),
             self._remaining_timeout(run_state),
@@ -2770,6 +2896,7 @@ class CrewDispatchRuntime:
             retries,
             run_state,
             step_deadline,
+            feedback,
         )
         if direct_multimedia is not None:
             return direct_multimedia
@@ -2970,6 +3097,7 @@ class CrewDispatchRuntime:
         retries: int,
         run_state: _RunState,
         step_deadline: float,
+        feedback: str | None = None,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]] | None:
         if self._capabilities is None or not _should_direct_execute_multimedia(step, agent):
             return None
@@ -2985,7 +3113,9 @@ class CrewDispatchRuntime:
         logical_model = selected if isinstance(selected, str) and selected.strip() else None
         if logical_model is None:
             _fail(f"capability failed: no configured {kind} generation model")
-        generation_prompt = _direct_multimedia_generation_prompt(context, step, sources)
+        generation_prompt = _direct_multimedia_generation_prompt(
+            context, step, sources, feedback
+        )
         if not generation_prompt:
             _fail("capability failed: multimedia generation prompt is empty")
         arguments: Mapping[str, JsonValue] = {
@@ -5434,9 +5564,22 @@ class CrewDispatchRuntime:
             ):
                 _fail("runtime checkpoint review artifact is unavailable")
             review_ledger.artifacts[step_id] = artifact
+        validation_artifact_ids = set(registry)
+        pending_validation_artifact_ids = list(validation_artifact_ids)
+        while pending_validation_artifact_ids:
+            artifact_id = pending_validation_artifact_ids.pop()
+            artifact = by_id.get(artifact_id)
+            if artifact is None:
+                _fail("runtime checkpoint artifacts are unavailable")
+            for source_id in artifact.source_ids:
+                if source_id not in by_id:
+                    _fail("runtime checkpoint artifacts are unavailable")
+                if source_id not in validation_artifact_ids:
+                    validation_artifact_ids.add(source_id)
+                    pending_validation_artifact_ids.append(source_id)
         self._validate_artifact_graph(
             plan,
-            tuple(by_id.values()),
+            tuple(by_id[artifact_id] for artifact_id in sorted(validation_artifact_ids)),
             completed,
             retries,
             tool_ledger,

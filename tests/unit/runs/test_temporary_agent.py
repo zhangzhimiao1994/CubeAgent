@@ -215,6 +215,7 @@ class FakeRepository:
                 "approval_stage_id",
                 "approval_artifact_id",
                 "approved_artifacts",
+                "artifact_review_feedback",
             }
         }
         if plan is None:
@@ -301,7 +302,7 @@ class FakeRepository:
             id=record.id,
             tenant_id=record.tenant_id,
             actor_id=record.actor_id,
-            request=f"{record.request}\n\nUser feedback for artifact review: {feedback}",
+            request=record.request,
             mode=record.mode,
             status=RunStatus.QUEUED,
             version=record.version + 1,
@@ -1186,6 +1187,11 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
             "approval_action": "artifact_review",
             "approval_stage_id": "character_model_sheet",
             "approval_artifact_id": "artifact-001",
+            "artifact_review_feedback": {
+                "stage_id": "character_model_sheet",
+                "artifact_id": "artifact-previous",
+                "feedback": "old rejection feedback",
+            },
         },
     )
     service = RunService(
@@ -1214,6 +1220,7 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
         {"stage_id": "character_model_sheet", "artifact_id": "artifact-001"}
     ]
     assert "approved_artifacts" not in routing
+    assert "artifact_review_feedback" not in routing
     assert "approval_id" not in routing
     assert "approval_kind" not in routing
 
@@ -1272,7 +1279,7 @@ async def test_user_can_reject_runtime_artifact_review_with_feedback_and_continu
         (run_id, f"{tenant_id}:{run_id}:artifact-review-revision:9")
     ]
     record = repository.records[run_id]
-    assert "User feedback for artifact review: 角色脸型和服装不一致" in record.request
+    assert record.request == "生成角色参考设定表后再剪辑成片"
     routing = record.routing_decision
     assert routing is not None
     plan = routing["media_pipeline_plan"]

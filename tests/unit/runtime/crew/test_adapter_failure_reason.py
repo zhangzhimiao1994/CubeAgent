@@ -30,6 +30,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _direct_multimedia_generation_prompt,
     _normalize_tool_call_arguments,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -626,6 +627,7 @@ def _context(
     *,
     artifacts: tuple[Artifact, ...] = (),
     checkpoint: RuntimeCheckpoint | None = None,
+    routing_decision: Mapping[str, JsonValue] | None = None,
     timeout_seconds: float = 60.0,
     request: str = "Write a short answer",
 ) -> TaskContext:
@@ -636,6 +638,7 @@ def _context(
         request=request,
         artifacts=artifacts,
         checkpoint=checkpoint,
+        routing_decision={} if routing_decision is None else routing_decision,
         timeout_seconds=timeout_seconds,
         token_budget=1000,
     )
@@ -819,6 +822,300 @@ async def test_user_review_gate_requests_approval_before_downstream_step() -> No
         for event in events
     )
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
+async def test_rejected_user_review_checkpoint_reruns_stage_before_downstream_step() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="character_designer",
+                role="Character Designer",
+                goal="Generate character references",
+                logical_model="general",
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Finish after approval",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="character_designer",
+                task="Generate Character Model Sheet.",
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Continue only after the model sheet is approved.",
+                depends_on=("character_model_sheet",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色设定后再剪辑成片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    rejected_artifact_id = cast(str, approval.payload["artifact_id"])
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    feedback = "角色脸部一致性不足，重新生成完整 Character Model Sheet。"
+    restored_factory = CapturingFactory()
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=restored_factory,
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="生成角色设定后再剪辑成片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "character_model_sheet",
+                        "artifact_id": rejected_artifact_id,
+                        "feedback": feedback,
+                    }
+                },
+            )
+        )
+    ]
+
+    started_steps = [
+        event.step_id for event in restored_events if event.kind is EventKind.STEP_STARTED
+    ]
+    assert started_steps == ["character_model_sheet"]
+    retry = next(event for event in restored_events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.step_id == "character_model_sheet"
+    assert retry.reason == "user rejected artifact review; regenerating stage"
+    assert retry.payload["attempt"] == 1
+    assert retry.payload["artifact_id"] == rejected_artifact_id
+    assert retry.payload["feedback"] == feedback
+    regenerated = next(
+        event.artifact
+        for event in restored_events
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.actor == "character_designer"
+        and event.artifact is not None
+    )
+    assert str(regenerated.id) != rejected_artifact_id
+    assert feedback in restored_factory.generation.prompts[0]
+    refreshed_approval = next(
+        event for event in restored_events if event.kind is EventKind.APPROVAL_REQUESTED
+    )
+    assert refreshed_approval.payload["artifact_id"] == str(regenerated.id)
+    assert refreshed_approval.payload["stage_id"] == "character_model_sheet"
+    assert not any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in restored_events
+    )
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in restored_events)
+
+    regenerated_checkpoint = next(
+        event.checkpoint
+        for event in reversed(restored_events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert regenerated_checkpoint is not None
+    all_artifacts = (
+        *stored_artifacts,
+        *(
+            event.artifact
+            for event in restored_events
+            if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+        ),
+    )
+    approved = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await approved.restore_checkpoint(regenerated_checkpoint)
+
+    approved_events = [
+        event
+        async for event in approved.run(
+            _context(
+                checkpoint=regenerated_checkpoint,
+                artifacts=all_artifacts,
+                request="生成角色设定后再剪辑成片",
+                routing_decision={
+                    "media_pipeline_plan": {
+                        "approved_artifacts": (
+                            {
+                                "stage_id": "character_model_sheet",
+                                "artifact_id": str(regenerated.id),
+                            }
+                        ),
+                    }
+                },
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in approved_events
+    )
+    assert approved_events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_user_rejection_after_reviewer_revision_reruns_stage_cleanly() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="Writer", goal="Draft asset", logical_model="general"),
+            AgentSpec(id="critic", role="Critic", goal="Review asset", logical_model="general"),
+            AgentSpec(id="final", role="Final", goal="Finish", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="storyboard",
+                agent="writer",
+                task="Draft storyboard.",
+                reviewer="critic",
+                reviewer_retries=1,
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final",
+                task="Finish after approved storyboard.",
+                depends_on=("storyboard",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=300,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                '{"verdict":"revise","feedback":"补齐缺失镜头。"}',
+                '{"verdict":"approve"}',
+            )
+        ),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="先出分镜图，再剪辑成片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    assert any(
+        event.kind is EventKind.REVIEW_COMPLETED
+        and event.payload.get("verdict") == "revise"
+        for event in events
+    )
+    assert checkpoint.state["retries"] == {"storyboard": 1}
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    restored_factory = CapturingFactory()
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(('{"verdict":"approve"}',)),
+        plan,
+        crew_factory=restored_factory,
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="先出分镜图，再剪辑成片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "storyboard",
+                        "artifact_id": cast(str, approval.payload["artifact_id"]),
+                        "feedback": "分镜节奏不对，重新生成。",
+                    }
+                },
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_STARTED
+        and event.step_id == "storyboard"
+        and event.payload["attempt"] == 1
+        for event in restored_events
+    )
+    assert "分镜节奏不对" in restored_factory.generation.prompts[0]
+    refreshed_checkpoint = next(
+        event.checkpoint
+        for event in reversed(restored_events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert refreshed_checkpoint is not None
+    assert refreshed_checkpoint.state["retries"] == {"storyboard": 0}
+    assert any(event.kind is EventKind.APPROVAL_REQUESTED for event in restored_events)
+    await CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    ).restore_checkpoint(refreshed_checkpoint)
+
+
+def test_direct_multimedia_generation_prompt_includes_user_review_feedback() -> None:
+    step = DispatchStep(
+        id="character_model_sheet",
+        agent="multimedia_generator",
+        task="生成角色 Character Model Sheet 图片。",
+        token_budget=100,
+    )
+
+    prompt = _direct_multimedia_generation_prompt(
+        _context(request="生成女主角定妆设定表"),
+        step,
+        (),
+        "服装和脸型不一致，按原角色设定重新生成。",
+    )
+
+    assert "用户审核退回意见" in prompt
+    assert "服装和脸型不一致" in prompt
 
 
 @pytest.mark.parametrize(
