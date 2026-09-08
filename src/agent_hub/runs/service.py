@@ -2706,10 +2706,12 @@ def _is_media_pipeline_script_authoring_request(text: str) -> bool:
     for clause in _split_media_pipeline_clauses(text):
         if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
             continue
+        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS) and any(
+            term in clause for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS
+        ):
+            continue
         if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS):
             return True
-        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS):
-            continue
     return False
 
 

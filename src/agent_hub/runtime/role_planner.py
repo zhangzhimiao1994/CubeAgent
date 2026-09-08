@@ -1917,6 +1917,8 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         return False
     if not _is_multimedia_generation_request(task):
         return False
+    if _has_unnegated_script_authoring_clause(normalized):
+        return False
     blocked_terms = (
         "代码",
         "源码",
@@ -1966,6 +1968,46 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         normalized,
         _MULTIMEDIA_GENERATION_NEGATIONS,
     )
+
+
+def _has_unnegated_script_authoring_clause(normalized: str) -> bool:
+    authoring_terms = (
+        "write",
+        "draft",
+        "create",
+        "generate",
+        "produce",
+        "写",
+        "撰写",
+        "创作",
+        "生成",
+        "产出",
+    )
+    reference_terms = (
+        "based on",
+        "from the previous",
+        "previous script",
+        "existing script",
+        "基于",
+        "根据",
+        "刚才",
+        "上面",
+        "前面",
+        "已有",
+        "现有",
+    )
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in _MULTIMEDIA_GENERATION_NEGATIONS):
+            continue
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if any(term in clause for term in reference_terms) and any(
+            term in clause for term in _MULTIMEDIA_MEDIA_TERMS
+        ):
+            continue
+        if any(term in clause for term in authoring_terms):
+            return True
+    return False
 
 
 def _is_document_generation_request(task: str) -> bool:
