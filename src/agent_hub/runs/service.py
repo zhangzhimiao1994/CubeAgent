@@ -2621,6 +2621,31 @@ _MEDIA_PIPELINE_SCRIPT_TERMS = (
     "脚本",
     "故事大纲",
 )
+_MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS = (
+    "write",
+    "draft",
+    "create",
+    "generate",
+    "produce",
+    "写",
+    "撰写",
+    "创作",
+    "生成",
+    "产出",
+)
+_MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS = (
+    "based on",
+    "from the previous",
+    "previous script",
+    "existing script",
+    "基于",
+    "根据",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+)
 _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
     "character model sheet",
     "model sheet",
@@ -2645,7 +2670,7 @@ _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
 
 def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
     text = message.casefold()
-    if not any(term in text for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+    if not _is_media_pipeline_script_authoring_request(text):
         return None
     if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
         return None
@@ -2675,6 +2700,25 @@ def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
         ],
         "approved_artifacts": [],
     }
+
+
+def _is_media_pipeline_script_authoring_request(text: str) -> bool:
+    for clause in _split_media_pipeline_clauses(text):
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS):
+            return True
+        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS):
+            continue
+    return False
+
+
+def _split_media_pipeline_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
+        if clause.strip()
+    )
 
 
 def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:

@@ -300,6 +300,44 @@ def test_deferred_script_media_plan_does_not_start_media_generation_roles() -> N
     assert "video_compositor" not in role_ids
 
 
+def test_script_plan_with_explicit_no_video_now_does_not_start_video_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "请为一个 8 秒玄幻恐怖短片写极短剧本，主题是石门内的影子。"
+                "只生成剧本和多媒体制作计划，暂时不要生成图片、不要生成视频、不要剪辑成片；"
+                "计划里保留 Character Model Sheet、角色服装设定板、资产图、分镜图、镜头视频、最终剪辑成片这些后续阶段。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "video_editor" not in role_ids
+    assert "multimedia_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
+def test_character_sheet_followup_with_negated_video_routes_to_media_generator_only() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "基于刚才剧本，只生成 Character Model Sheet 形式的角色参考设定表和角色服装设定板图片，"
+                "不要生成视频，不要剪辑成片。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

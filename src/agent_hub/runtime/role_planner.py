@@ -1784,9 +1784,14 @@ _DEFERRED_MEDIA_PIPELINE_MARKERS = (
     "未来再",
     "可能要",
     "可能会",
+    "计划里保留",
+    "保留",
     "随时",
+    "暂时不要",
     "暂时不用",
+    "暂时不",
     "暂不",
+    "先不",
     "later",
     "afterward",
     "afterwards",
@@ -1937,8 +1942,6 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "prompt",
         "提示词",
         "文案",
-        "脚本",
-        "剧本",
         "剪辑",
         "合成",
         "合并",
@@ -1953,9 +1956,14 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "combine videos",
         "edit these videos",
     )
-    return not _has_unnegated_terms(
+    if _has_unnegated_terms(
         normalized,
         blocked_terms,
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    ):
+        return False
+    return _has_positive_multimedia_generation_clause(
+        normalized,
         _MULTIMEDIA_GENERATION_NEGATIONS,
     )
 
