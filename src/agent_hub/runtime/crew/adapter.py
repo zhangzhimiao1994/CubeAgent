@@ -1113,10 +1113,16 @@ def _should_direct_execute_compose_video(
     step: DispatchStep,
     agent: AgentSpec,
     sources: tuple[Artifact, ...],
+    *,
+    available_artifacts: tuple[Artifact, ...] = (),
 ) -> bool:
     if "compose_video" not in step.tools:
         return False
-    if not _direct_compose_video_arguments(step, sources):
+    if not _direct_compose_video_arguments(
+        step,
+        sources,
+        available_artifacts=available_artifacts,
+    ):
         return False
     text = f"{step.agent} {agent.role} {agent.goal} {step.task}".casefold()
     return any(
@@ -1153,7 +1159,10 @@ def _is_direct_capability_step(step: DispatchStep) -> bool:
 def _direct_compose_video_arguments(
     step: DispatchStep,
     sources: tuple[Artifact, ...],
+    *,
+    available_artifacts: tuple[Artifact, ...] = (),
 ) -> Mapping[str, JsonValue] | None:
+    expanded_sources = _lineage_expanded_artifacts(sources, available_artifacts)
     base: Mapping[str, JsonValue] = {
         "title": _truncate_prompt_text(step.task.strip() or "Composed video", max_bytes=120),
         "filename": "final-video.mp4",
@@ -1162,11 +1171,37 @@ def _direct_compose_video_arguments(
         "presentation": "final_attachment",
         "clips": (),
     }
-    normalized = _normalize_compose_video_arguments_with_sources(base, sources)
+    normalized = _normalize_compose_video_arguments_with_sources(base, expanded_sources)
     clips = normalized.get("clips")
     if not isinstance(clips, tuple) or not clips:
         return None
     return normalized
+
+
+def _lineage_expanded_artifacts(
+    sources: tuple[Artifact, ...],
+    available_artifacts: tuple[Artifact, ...],
+) -> tuple[Artifact, ...]:
+    if not available_artifacts:
+        return sources
+    by_id = {str(artifact.id): artifact for artifact in available_artifacts}
+    ordered: list[Artifact] = []
+    seen: set[str] = set()
+
+    def add_with_lineage(artifact: Artifact) -> None:
+        artifact_id = str(artifact.id)
+        if artifact_id in seen:
+            return
+        seen.add(artifact_id)
+        ordered.append(artifact)
+        for source_id in artifact.source_ids:
+            parent = by_id.get(source_id)
+            if parent is not None:
+                add_with_lineage(parent)
+
+    for source in sources:
+        add_with_lineage(source)
+    return tuple(ordered)
 
 
 def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
@@ -3401,10 +3436,26 @@ class CrewDispatchRuntime:
         started_payload: Mapping[str, JsonValue]
         direct_completion_text: str
         final_fallback_text: str
-        if _should_direct_execute_compose_video(step, agent, sources):
+        available_artifacts = self._ordered_artifacts(
+            (
+                *context.artifacts,
+                *tuple(model_ledger.artifacts.values()),
+                *tuple(tool_ledger.artifacts.values()),
+            )
+        )
+        if _should_direct_execute_compose_video(
+            step,
+            agent,
+            sources,
+            available_artifacts=available_artifacts,
+        ):
             capability_name = "compose_video"
             logical_model = agent.logical_model
-            compose_arguments = _direct_compose_video_arguments(step, sources)
+            compose_arguments = _direct_compose_video_arguments(
+                step,
+                sources,
+                available_artifacts=available_artifacts,
+            )
             if compose_arguments is None:
                 return None
             arguments = compose_arguments
