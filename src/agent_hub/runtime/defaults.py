@@ -1090,6 +1090,12 @@ def _role_allowed_tools(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
+    if (
+        context is not None
+        and role.id == "copywriter"
+        and _is_deferred_media_script_plan_context(context)
+    ):
+        requested = tuple(tool for tool in requested if tool != "read_context")
     if not requested or context is None or capability_gateway is None:
         return ()
     is_available = getattr(capability_gateway, "is_available", None)
@@ -1105,6 +1111,29 @@ def _role_allowed_tools(
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
     return tuple(dict.fromkeys(filtered))
+
+
+def _is_deferred_media_script_plan_context(context: TaskContext) -> bool:
+    if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
+        return False
+    text = context.request.casefold()
+    has_script_plan = any(term in text for term in ("script", "screenplay", "剧本", "脚本"))
+    has_plan_intent = any(term in text for term in ("plan", "计划", "规划"))
+    has_deferred_generation = any(
+        term in text
+        for term in (
+            "暂时不要生成",
+            "暂时不生成",
+            "暂不生成",
+            "不要生成图片",
+            "不要生成视频",
+            "不要剪辑成片",
+            "do not generate",
+            "later",
+            "in future",
+        )
+    )
+    return has_script_plan and has_plan_intent and has_deferred_generation
 
 
 def _plan_allowed_tools(

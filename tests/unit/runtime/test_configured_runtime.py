@@ -1855,6 +1855,64 @@ def test_dispatch_plan_composes_after_generated_media_step() -> None:
     assert "compose_video" in compositor_step.tools
 
 
+def test_deferred_media_script_plan_copywriter_does_not_use_read_context_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Produce the short script text.",
+            must_answer=("What script was produced?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="planner",
+            role="Planner",
+            purpose=RolePurpose.PLAN,
+            mission="Produce the deferred media production plan.",
+            must_answer=("What plan was produced?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "请为一个 8 秒玄幻恐怖短片写极短剧本，主题是石门内的影子。"
+                "只生成剧本和多媒体制作计划，暂时不要生成图片、不要生成视频、不要剪辑成片；"
+                "计划里保留 Character Model Sheet、角色服装设定板、资产图、分镜图、镜头视频、最终剪辑成片这些后续阶段。"
+            ),
+            routing_decision={
+                "media_pipeline_plan": {
+                    "plan_id": "media-plan-001",
+                    "status": "planned",
+                },
+            },
+        ),
+        capability_gateway=FakeCapabilityAvailability({"read_context"}),
+    )
+
+    copywriter = next(agent for agent in plan.agents if agent.id == "copywriter")
+    copywriter_step = next(step for step in plan.steps if step.agent == "copywriter")
+    planner = next(agent for agent in plan.agents if agent.id == "planner")
+
+    assert copywriter.allowed_tools == ()
+    assert copywriter_step.tools == ()
+    assert planner.allowed_tools == ("read_context",)
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
