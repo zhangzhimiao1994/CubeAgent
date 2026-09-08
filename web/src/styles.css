@@ -2364,6 +2364,92 @@ button.agent-cluster-status:focus-visible {
   padding: 0.46rem 0.76rem;
 }
 
+.artifact-review-card {
+  background:
+    linear-gradient(135deg, rgba(34, 211, 238, 0.08), rgba(255, 255, 255, 0.035)),
+    rgba(3, 10, 20, 0.5);
+  border: 1px solid rgba(123, 225, 255, 0.2);
+  border-radius: 1rem;
+  color: var(--text);
+  display: grid;
+  gap: 0.75rem;
+  max-width: 58rem;
+  padding: 0.85rem;
+}
+
+.artifact-review-head {
+  align-items: center;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
+}
+
+.artifact-review-head h3 {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.artifact-review-meta {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+}
+
+.artifact-review-meta div {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.1);
+  border-radius: 0.7rem;
+  padding: 0.5rem;
+}
+
+.artifact-review-meta dt,
+.artifact-review-feedback span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+  margin-bottom: 0.2rem;
+}
+
+.artifact-review-meta dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.artifact-review-card p {
+  color: var(--muted);
+  margin: 0;
+}
+
+.artifact-review-feedback {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.artifact-review-feedback textarea {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 0.75rem;
+  color: var(--text);
+  font: inherit;
+  min-height: 5rem;
+  padding: 0.65rem 0.7rem;
+  resize: vertical;
+}
+
+.artifact-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.artifact-review-actions button {
+  border-radius: 999px;
+  padding: 0.46rem 0.76rem;
+}
+
 .temporary-agent-detail-dialog {
   background:
     linear-gradient(180deg, rgba(15, 24, 46, 0.98), rgba(5, 10, 22, 0.99)),

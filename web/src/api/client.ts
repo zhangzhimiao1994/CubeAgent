@@ -614,6 +614,7 @@ const RunEventSchema = z.object({
   step_id: z.string().nullable().optional(),
   action: z.string().nullable().optional(),
   decision: z.string().nullable().optional(),
+  approval_id: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
   artifact: RunArtifactSchema.nullable().optional(),
 });
@@ -1672,6 +1673,28 @@ export const api = {
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/approve-temporary-agent`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  approveArtifactReview(
+    id: string,
+    approvalId: string,
+    payload: { version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/artifact-reviews/${encodeURIComponent(approvalId)}/approve`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  rejectArtifactReview(
+    id: string,
+    approvalId: string,
+    payload: { version: number; feedback: string },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/artifact-reviews/${encodeURIComponent(approvalId)}/reject`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

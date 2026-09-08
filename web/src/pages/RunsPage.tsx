@@ -47,6 +47,15 @@ type SkillUploadConflict = {
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
+type ArtifactReviewApproval = {
+  runId: string;
+  approvalId: string;
+  version: number;
+  stageId: string;
+  artifactId: string;
+  producer: string | null;
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null;
+};
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
@@ -399,6 +408,7 @@ type ChatMessage = {
   body: string;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
   temporaryAgentProposal?: TemporaryAgentProposal;
+  artifactReviewApproval?: ArtifactReviewApproval;
 };
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -794,6 +804,7 @@ function temporaryAgentCardSummary(proposal: TemporaryAgentProposal) {
 
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
+  const artifactReviewApproval = artifactReviewApprovalFromRunDetail(detail);
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
@@ -861,7 +872,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.temporary_agent_proposal
       ? [
           {
-            id: `${detail.id}-temporary-agent-approval`,
+            id: "temporary-agent-approval",
             role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentSummary(detail.temporary_agent_proposal),
@@ -872,7 +883,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.schedule_proposal
       ? [
           {
-            id: `${detail.id}-schedule-approval`,
+            id: "schedule-approval",
             role: "assistant" as const,
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
@@ -882,10 +893,22 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.openclaw_proposal
       ? [
           {
-            id: `${detail.id}-openclaw-approval`,
+            id: "openclaw-approval",
             role: "assistant" as const,
             title: "OpenClaw 操作确认",
             body: openClawProposalBody(detail.openclaw_proposal),
+          },
+        ]
+      : []),
+    ...(artifactReviewApproval
+      ? [
+          {
+            id: "artifact-review-approval",
+            role: "assistant" as const,
+            title: "中间产物审核",
+            body: `阶段 ${artifactReviewApproval.stageId} 已生成中间产物，请确认是否放行进入下一步。`,
+            artifact: artifactReviewApproval.artifact ?? undefined,
+            artifactReviewApproval,
           },
         ]
       : []),
@@ -929,6 +952,35 @@ function runConversationId(detail: RunDetail | undefined) {
 function payloadText(payload: Record<string, unknown>, key: string) {
   const value = payload[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): ArtifactReviewApproval | null {
+  if (!run || run.status !== "waiting_approval") return null;
+  const requested = [...run.events]
+    .sort((left, right) => right.sequence - left.sequence)
+    .find(
+      (event) =>
+        event.kind === "approval.requested" &&
+        event.action === "artifact_review" &&
+        payloadText(event.payload, "approval_kind") === "runtime_artifact_review",
+    );
+  if (!requested?.approval_id) return null;
+  const stageId = payloadText(requested.payload, "stage_id");
+  const artifactId = payloadText(requested.payload, "artifact_id");
+  if (!stageId || !artifactId) return null;
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  return {
+    runId: run.id,
+    approvalId: requested.approval_id,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    stageId,
+    artifactId,
+    producer: payloadText(requested.payload, "producer") ?? requested.actor ?? null,
+    artifact:
+      run.artifacts.find((artifact) => artifact.id === artifactId) ??
+      run.events.find((event) => event.artifact?.id === artifactId)?.artifact ??
+      null,
+  };
 }
 
 function payloadNumberValue(payload: Record<string, unknown>, key: string) {
@@ -1961,37 +2013,7 @@ function RunProcessSummary({
   compact?: boolean;
 }) {
   const workItems = buildAgentWorkItems(detail, agentNames, mainAgentModelName);
-  const milestoneItems = runMilestones(detail, workItems);
-  const highlightedIds = new Set<string>();
-  const outputHighlights = [
-    ...workItems.flatMap((item) => item.outputs.map((output) => ({ ...output, agentId: item.id }))),
-    ...workItems.flatMap((item) =>
-      item.activity
-        .filter((activity) => activity.kind === "中间产物" || /输出|产出/.test(`${activity.title} ${activity.summary}`))
-        .map((activity) => ({ ...activity, agentId: item.id })),
-    ),
-  ].filter((item) => {
-    const key = `${item.agentId}-${item.id}`;
-    if (highlightedIds.has(key)) return false;
-    highlightedIds.add(key);
-    return true;
-  });
-  const activityHighlights = workItems
-    .flatMap((item) => item.activity.map((activity) => ({ ...activity, agentId: item.id })))
-    .filter((item) => {
-      const key = `${item.agentId}-${item.id}`;
-      if (highlightedIds.has(key)) return false;
-      highlightedIds.add(key);
-      return true;
-    });
-  const compareActivityTime = (left: AgentWorkActivity, right: AgentWorkActivity) => {
-    if (left.createdAt && right.createdAt) return left.createdAt.localeCompare(right.createdAt);
-    if (left.createdAt) return -1;
-    if (right.createdAt) return 1;
-    return 0;
-  };
-  const highlights = [...outputHighlights.sort(compareActivityTime), ...activityHighlights.sort(compareActivityTime)].slice(0, 3);
-  if (workItems.length === 0 && highlights.length === 0) return null;
+  if (workItems.length === 0) return null;
   const doneCount = workItems.filter((item) => item.status === "done").length;
   const openWorkforce = () =>
     onOpen({
@@ -2003,104 +2025,20 @@ function RunProcessSummary({
     });
   return (
     <section className={`run-process-summary${compact ? " run-process-summary-compact" : ""}`} aria-label="Agent 集群动作">
-      {compact ? (
-        <button
-          type="button"
-          className="agent-cluster-status"
-          aria-label={`查看 Agent 工作席，${workItems.length} 个子 Agent${doneCount > 0 ? `，${doneCount} 已下班` : ""}`}
-          onClick={openWorkforce}
-        >
-          <span aria-hidden="true">⌘</span>
-          <strong>Agent 工作席</strong>
-          <small>
-            {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
-          </small>
-        </button>
-      ) : (
-        <div className="agent-cluster-status" role="status" aria-label={`Agent 工作席，${workItems.length} 个子 Agent`}>
-          <span aria-hidden="true">⌘</span>
-          <strong>Agent 工作席</strong>
-          <small>
-            {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
-          </small>
-        </div>
-      )}
-      {compact ? null : (
-        <>
-          <div className="run-milestones" aria-label="本轮里程碑">
-            {milestoneItems.map((item) => (
-              <span key={item.label} className={`run-milestone run-milestone-${item.state}`}>
-                {item.label}
-              </span>
-            ))}
-          </div>
-          <div className="agent-cluster-actions">
-            {highlights.map((item, index) => (
-              <button
-                key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
-                type="button"
-                className="run-process-toggle process-intermediate-card"
-                onClick={() =>
-                  onOpen({
-                    runId: detail.id,
-                    conversationId: runConversationId(detail),
-                    scopeLabel: runSeatScope(detail),
-                    workItems,
-                    hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
-                    selectedAgentId: item.agentId,
-                    selectedActivityId: item.id,
-                  })
-                }
-              >
-                <span aria-hidden="true">›</span>
-                <small className="process-card-badge">{item.kind}</small>
-                <strong>{item.summary}</strong>
-              </button>
-            ))}
-            <button
-              type="button"
-              className="run-process-toggle process-open-workforce"
-              onClick={openWorkforce}
-            >
-              查看子 Agent 工作席
-            </button>
-          </div>
-        </>
-      )}
+      <button
+        type="button"
+        className="agent-cluster-status"
+        aria-label={`查看 Agent 工作席，${workItems.length} 个子 Agent${doneCount > 0 ? `，${doneCount} 已下班` : ""}`}
+        onClick={openWorkforce}
+      >
+        <span aria-hidden="true">⌘</span>
+        <strong>Agent 工作席</strong>
+        <small>
+          {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
+        </small>
+      </button>
     </section>
   );
-}
-
-function runMilestones(
-  detail: RunDetail,
-  workItems: AgentWorkItem[],
-): { label: string; state: "done" | "active" | "pending" | "failed" }[] {
-  const eventKinds = new Set(detail.events.map((event) => event.kind));
-  const hasAgentActivity =
-    workItems.length > 0 ||
-    detail.events.some((event) =>
-      Boolean(event.actor || event.step_id || event.kind.startsWith("dispatch.") || event.kind.startsWith("model.")),
-    );
-  const hasOutput = detail.events.some((event) =>
-    ["artifact.created", "message.created", "tool.completed", "step.completed"].includes(event.kind),
-  );
-  const isTerminal = TERMINAL_STATUSES.has(detail.status);
-  const failed = detail.status === "failed" || eventKinds.has("runtime.failed");
-  return [
-    { label: "接收", state: "done" as const },
-    {
-      label: "执行",
-      state: hasAgentActivity ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
-    },
-    {
-      label: "产物",
-      state: hasOutput ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
-    },
-    {
-      label: failed ? "失败" : isTerminal ? "完成" : "运行中",
-      state: failed ? ("failed" as const) : isTerminal ? ("done" as const) : ("active" as const),
-    },
-  ];
 }
 
 function HermesMemorySummaryRow({
@@ -2207,6 +2145,7 @@ function RunProcessDrawer({
   const initialAgentId =
     target.selectedAgentId ??
     selectedAgentForActivity(target.workItems, target.selectedActivityId) ??
+    target.workItems.find((item) => dedupeAgentActivities(item).length > 0)?.id ??
     target.workItems[0]?.id ??
     "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
@@ -2618,6 +2557,69 @@ function TemporaryAgentRecruitmentCard({
   );
 }
 
+function ArtifactReviewApprovalCard({
+  approval,
+  feedback,
+  onFeedbackChange,
+  onApprove,
+  onReject,
+  disabled = false,
+}: {
+  approval: ArtifactReviewApproval;
+  feedback: string;
+  onFeedbackChange: (value: string) => void;
+  onApprove: () => void;
+  onReject: () => void;
+  disabled?: boolean;
+}) {
+  const title = approval.artifact?.title || approval.stageId;
+  return (
+    <article className="artifact-review-card" aria-label="中间产物审核">
+      <span className="eyebrow">中间产物审核</span>
+      <div className="artifact-review-head">
+        <h3>{title}</h3>
+        <em className="agent-workforce-status status-working">待审核</em>
+      </div>
+      <dl className="artifact-review-meta">
+        <div>
+          <dt>阶段</dt>
+          <dd>{approval.stageId}</dd>
+        </div>
+        <div>
+          <dt>产物</dt>
+          <dd>{approval.artifactId}</dd>
+        </div>
+        {approval.producer ? (
+          <div>
+            <dt>生成者</dt>
+            <dd>{approval.producer}</dd>
+          </div>
+        ) : null}
+      </dl>
+      <p>确认后进入下一步；退回时会把反馈交给对应阶段重新生成，并再次等待审核。</p>
+      {hasArtifactDownload(approval.artifact) ? <ArtifactFileCard artifact={approval.artifact} compact /> : null}
+      <label className="artifact-review-feedback">
+        <span>退回意见</span>
+        <textarea
+          value={feedback}
+          rows={3}
+          placeholder="说明哪里不合格，例如：角色脸型和服装不一致，重新生成完整 Character Model Sheet。"
+          onChange={(event) => onFeedbackChange(event.currentTarget.value)}
+          disabled={disabled}
+        />
+      </label>
+      <div className="artifact-review-actions">
+        <button type="button" onClick={onApprove} disabled={disabled}>
+          确认放行
+        </button>
+        <button type="button" className="secondary-action" onClick={onReject} disabled={disabled}>
+          退回重做
+        </button>
+      </div>
+    </article>
+  );
+}
+
 function TemporaryAgentDetailDialog({
   proposal,
   onClose,
@@ -2858,6 +2860,7 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
+  const [artifactReviewFeedback, setArtifactReviewFeedback] = useState("");
   const [scheduleApproval, setScheduleApproval] = useState<{
     runId: string;
     proposal: ScheduleProposal;
@@ -2885,6 +2888,7 @@ export function RunsPage() {
       return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
     },
   });
+  const selectedArtifactReviewApproval = artifactReviewApprovalFromRunDetail(selectedRun.data);
 
   const referenceConversation = useQuery({
     queryKey: ["conversation", trimmedReferenceConversationId],
@@ -2976,6 +2980,13 @@ export function RunsPage() {
           : approval,
       );
     }
+    const artifactApproval = artifactReviewApprovalFromRunDetail(selectedRun.data);
+    if (artifactApproval) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setOpenClawApproval(null);
+    }
     const proposedSchedule = scheduleApprovalFromRunDetail(selectedRun.data);
     if (proposedSchedule && !dismissedScheduleApprovalRunIds.includes(proposedSchedule.runId)) {
       setModeSelection(null);
@@ -2999,6 +3010,7 @@ export function RunsPage() {
   useEffect(() => {
     setProcessDetailTarget(null);
     setTemporaryAgentDetail(null);
+    setArtifactReviewFeedback("");
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -3160,6 +3172,54 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
   });
+
+  const approveArtifactReview = useMutation({
+    mutationFn: (approval: ArtifactReviewApproval) =>
+      api.approveArtifactReview(approval.runId, approval.approvalId, {
+        version: approval.version,
+      }),
+    onSuccess: async (run) => {
+      setArtifactReviewFeedback("");
+      setSubmitNotice("已确认中间产物，任务会继续进入下一步。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
+    },
+  });
+
+  const rejectArtifactReview = useMutation({
+    mutationFn: ({ approval, feedback }: { approval: ArtifactReviewApproval; feedback: string }) =>
+      api.rejectArtifactReview(approval.runId, approval.approvalId, {
+        version: approval.version,
+        feedback,
+      }),
+    onSuccess: async (run) => {
+      setArtifactReviewFeedback("");
+      setSubmitNotice("已退回中间产物，主 Agent 会按反馈重新生成该阶段。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
+    },
+  });
+
+  const approveArtifactReviewFromCard = (approval: ArtifactReviewApproval) => {
+    setSubmitNotice("已选择确认放行，正在继续任务。");
+    approveArtifactReview.mutate(approval);
+  };
+
+  const rejectArtifactReviewFromCard = (approval: ArtifactReviewApproval) => {
+    const feedback = artifactReviewFeedback.trim();
+    if (!feedback) {
+      setSubmitNotice("退回中间产物时需要写明问题，主 Agent 会用这段反馈重新生成。");
+      return;
+    }
+    setSubmitNotice("已选择退回重做，正在提交反馈。");
+    rejectArtifactReview.mutate({ approval, feedback });
+  };
 
   const cancelScheduleApproval = () => {
     if (!scheduleApproval) return;
@@ -3422,6 +3482,30 @@ export function RunsPage() {
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    if (selectedArtifactReviewApproval) {
+      const choice = parseChoiceText(trimmed, [
+        { value: "approve", label: "确认放行", aliases: ["同意", "确认", "通过", "放行", "approve", "yes"] },
+        { value: "reject", label: "退回重做", aliases: ["退回", "拒绝", "不通过", "重做", "重新生成", "reject", "revise", "no"] },
+      ]);
+      if (!choice) {
+        setSubmitNotice("请回复 1/确认放行，或回复 2 加上退回意见。");
+        return;
+      }
+      setMessage("");
+      if (choice.option.value === "approve") {
+        approveArtifactReviewFromCard(selectedArtifactReviewApproval);
+        return;
+      }
+      const feedback = choice.note || artifactReviewFeedback.trim();
+      if (!feedback) {
+        setSubmitNotice("退回重做时需要写明问题，例如：2 角色脸型和服装不一致，重新生成完整设定表。");
+        return;
+      }
+      setArtifactReviewFeedback(feedback);
+      setSubmitNotice("已收到退回意见，正在提交给主 Agent。");
+      rejectArtifactReview.mutate({ approval: selectedArtifactReviewApproval, feedback });
+      return;
+    }
     if (temporaryApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "同意临时加入", aliases: ["同意", "接受", "加入", "approve", "yes"] },
@@ -3602,6 +3686,9 @@ export function RunsPage() {
   const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
   const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
+  const artifactReviewApprovalVisibleInMessages =
+    !!selectedArtifactReviewApproval &&
+    messages.some((item) => item.id === `${selectedArtifactReviewApproval.runId}-artifact-review-approval`);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
@@ -3950,6 +4037,16 @@ export function RunsPage() {
                 </ol>
               </article>
             ) : null}
+            {selectedArtifactReviewApproval && !artifactReviewApprovalVisibleInMessages ? (
+              <ArtifactReviewApprovalCard
+                approval={selectedArtifactReviewApproval}
+                feedback={artifactReviewFeedback}
+                onFeedbackChange={setArtifactReviewFeedback}
+                onApprove={() => approveArtifactReviewFromCard(selectedArtifactReviewApproval)}
+                onReject={() => rejectArtifactReviewFromCard(selectedArtifactReviewApproval)}
+                disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
+              />
+            ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
               <TemporaryAgentRecruitmentCard
                 proposal={temporaryApproval.proposal}
@@ -3980,7 +4077,16 @@ export function RunsPage() {
               const shouldDockProcess = item.id.endsWith("-request") && item.run?.id === activeProcessDockRun?.id;
               return (
                 <Fragment key={item.id}>
-                  {item.temporaryAgentProposal ? (
+                  {item.artifactReviewApproval ? (
+                    <ArtifactReviewApprovalCard
+                      approval={item.artifactReviewApproval}
+                      feedback={artifactReviewFeedback}
+                      onFeedbackChange={setArtifactReviewFeedback}
+                      onApprove={() => approveArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval)}
+                      onReject={() => rejectArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval)}
+                      disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
+                    />
+                  ) : item.temporaryAgentProposal ? (
                     <TemporaryAgentRecruitmentCard
                       proposal={item.temporaryAgentProposal}
                       approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
@@ -4046,6 +4152,12 @@ export function RunsPage() {
             ) : null}
             {approveTemporaryAgent.isError ? (
               <p role="alert">{formatApiError(approveTemporaryAgent.error, "临时 Agent 确认失败")}</p>
+            ) : null}
+            {approveArtifactReview.isError ? (
+              <p role="alert">{formatApiError(approveArtifactReview.error, "中间产物确认失败")}</p>
+            ) : null}
+            {rejectArtifactReview.isError ? (
+              <p role="alert">{formatApiError(rejectArtifactReview.error, "中间产物退回失败")}</p>
             ) : null}
             {reviseTemporaryAgent.isError ? (
               <p role="alert">{formatApiError(reviseTemporaryAgent.error, "临时 Agent 重规失败")}</p>
