@@ -499,6 +499,88 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def reject_artifact_review_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for artifact review")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "runtime_artifact_review":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("approval_id") != approval_id:
+                raise RunConflict("artifact review approval id is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            stage_id = routing_decision.get("approval_stage_id")
+            artifact_id = routing_decision.get("approval_artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                raise RunConflict("artifact review payload is invalid")
+            media_pipeline_plan = routing_decision.get("media_pipeline_plan")
+            plan = dict(media_pipeline_plan) if isinstance(media_pipeline_plan, dict) else None
+            raw_plan_rejected = plan.get("rejected_artifacts") if plan is not None else None
+            rejected_artifacts = _merged_rejected_artifact_review_entries(
+                raw_plan_rejected,
+                routing_decision.get("rejected_artifacts"),
+            )
+            review_feedback = {
+                "stage_id": stage_id,
+                "artifact_id": artifact_id,
+                "feedback": feedback,
+            }
+            rejected_artifacts.append(review_feedback)
+            rejected_artifacts = _merged_rejected_artifact_review_entries(rejected_artifacts)
+            updated_routing = {
+                **{
+                    key: value
+                    for key, value in routing_decision.items()
+                    if key
+                    not in {
+                        "reason",
+                        "approval_kind",
+                        "approval_id",
+                        "approval_action",
+                        "approval_stage_id",
+                        "approval_artifact_id",
+                        "rejected_artifacts",
+                    }
+                },
+                "artifact_review_feedback": review_feedback,
+            }
+            if plan is None:
+                updated_routing["rejected_artifacts"] = rejected_artifacts
+            else:
+                updated_routing["media_pipeline_plan"] = {
+                    **plan,
+                    "rejected_artifacts": rejected_artifacts,
+                }
+            row.request = f"{row.request}\n\nUser feedback for artifact review: {feedback}"
+            row.routing_decision = updated_routing
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:artifact-review-revision:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
     async def enqueue_existing_run(
         self,
         *,
@@ -1113,6 +1195,32 @@ def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
                 continue
             seen.add(key)
             entries.append({"stage_id": stage_id, "artifact_id": artifact_id})
+    return entries
+
+
+def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            feedback = item.get("feedback")
+            if (
+                not isinstance(stage_id, str)
+                or not isinstance(artifact_id, str)
+                or not isinstance(feedback, str)
+            ):
+                continue
+            key = (stage_id, artifact_id, feedback)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
     return entries
 
 

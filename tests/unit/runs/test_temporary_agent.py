@@ -239,6 +239,79 @@ class FakeRepository:
         self.outbox.append((run_id, f"{tenant_id}:{run_id}:artifact-review:{version}"))
         return updated
 
+    async def reject_artifact_review_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+    ) -> RunRecord:
+        record = self.records.get(run_id)
+        if record is None or record.tenant_id != tenant_id:
+            raise RunNotFound("run was not found")
+        if record.status is not RunStatus.WAITING_APPROVAL:
+            raise RunConflict("run is not waiting for artifact review")
+        decision = dict(record.routing_decision or {})
+        if decision.get("approval_kind") != "runtime_artifact_review":
+            raise RunConflict("run is waiting for a different approval")
+        if decision.get("approval_id") != approval_id:
+            raise RunConflict("artifact review approval id is invalid")
+        if record.version != version:
+            raise RunConflict("run version is stale")
+        stage_id = decision.get("approval_stage_id")
+        artifact_id = decision.get("approval_artifact_id")
+        if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+            raise RunConflict("artifact review payload is invalid")
+        raw_plan = decision.get("media_pipeline_plan")
+        plan = dict(raw_plan) if isinstance(raw_plan, dict) else None
+        rejected = _merged_rejected_artifact_review_entries(
+            plan.get("rejected_artifacts") if plan is not None else None,
+            decision.get("rejected_artifacts"),
+        )
+        rejected.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
+        updated_decision = {
+            key: value
+            for key, value in decision.items()
+            if key
+            not in {
+                "reason",
+                "approval_kind",
+                "approval_id",
+                "approval_action",
+                "approval_stage_id",
+                "approval_artifact_id",
+                "rejected_artifacts",
+            }
+        }
+        updated_decision["artifact_review_feedback"] = {
+            "stage_id": stage_id,
+            "artifact_id": artifact_id,
+            "feedback": feedback,
+        }
+        if plan is None:
+            updated_decision["rejected_artifacts"] = rejected
+        else:
+            updated_decision["media_pipeline_plan"] = {
+                **plan,
+                "rejected_artifacts": rejected,
+            }
+        updated = RunRecord(
+            id=record.id,
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            request=f"{record.request}\n\nUser feedback for artifact review: {feedback}",
+            mode=record.mode,
+            status=RunStatus.QUEUED,
+            version=record.version + 1,
+            created_at=record.created_at,
+            routing_decision=updated_decision,
+        )
+        self.records[run_id] = updated
+        self.outbox.append((run_id, f"{tenant_id}:{run_id}:artifact-review-revision:{version}"))
+        return updated
+
 
 def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
@@ -258,6 +331,32 @@ def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
                 continue
             seen.add(key)
             entries.append({"stage_id": stage_id, "artifact_id": artifact_id})
+    return entries
+
+
+def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            feedback = item.get("feedback")
+            if (
+                not isinstance(stage_id, str)
+                or not isinstance(artifact_id, str)
+                or not isinstance(feedback, str)
+            ):
+                continue
+            key = (stage_id, artifact_id, feedback)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
     return entries
 
 
@@ -1115,6 +1214,84 @@ async def test_user_can_approve_runtime_artifact_review_and_continue() -> None:
         {"stage_id": "character_model_sheet", "artifact_id": "artifact-001"}
     ]
     assert "approved_artifacts" not in routing
+    assert "approval_id" not in routing
+    assert "approval_kind" not in routing
+
+
+@pytest.mark.asyncio
+async def test_user_can_reject_runtime_artifact_review_with_feedback_and_continue() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    run_id = uuid4()
+    repository.records[run_id] = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="生成角色参考设定表后再剪辑成片",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.WAITING_APPROVAL,
+        version=9,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "source": "video_pipeline",
+            "media_pipeline_plan": {
+                "plan_id": "media-plan-001",
+                "status": "planned",
+                "approved_artifacts": [
+                    {"stage_id": "script", "artifact_id": "artifact-000"}
+                ],
+                "rejected_artifacts": [],
+            },
+            "reason": "runtime_artifact_review_required",
+            "approval_kind": "runtime_artifact_review",
+            "approval_id": "artifact-review-test",
+            "approval_action": "artifact_review",
+            "approval_stage_id": "character_model_sheet",
+            "approval_artifact_id": "artifact-001",
+        },
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    rejected = await service.reject_artifact_review(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=run_id,
+        approval_id="artifact-review-test",
+        version=9,
+        feedback="角色脸型和服装不一致，退回重新生成角色参考设定表。",
+    )
+
+    assert rejected.status is RunStatus.QUEUED
+    assert repository.outbox == [
+        (run_id, f"{tenant_id}:{run_id}:artifact-review-revision:9")
+    ]
+    record = repository.records[run_id]
+    assert "User feedback for artifact review: 角色脸型和服装不一致" in record.request
+    routing = record.routing_decision
+    assert routing is not None
+    plan = routing["media_pipeline_plan"]
+    assert isinstance(plan, dict)
+    assert plan["approved_artifacts"] == [
+        {"stage_id": "script", "artifact_id": "artifact-000"}
+    ]
+    assert plan["rejected_artifacts"] == [
+        {
+            "stage_id": "character_model_sheet",
+            "artifact_id": "artifact-001",
+            "feedback": "角色脸型和服装不一致，退回重新生成角色参考设定表。",
+        }
+    ]
+    assert routing["artifact_review_feedback"] == {
+        "stage_id": "character_model_sheet",
+        "artifact_id": "artifact-001",
+        "feedback": "角色脸型和服装不一致，退回重新生成角色参考设定表。",
+    }
     assert "approval_id" not in routing
     assert "approval_kind" not in routing
 

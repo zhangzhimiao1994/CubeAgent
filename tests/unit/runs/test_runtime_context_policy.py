@@ -111,6 +111,46 @@ def test_conversation_history_includes_media_pipeline_plan() -> None:
     assert "secret/path/must/not/leak" not in text
 
 
+def test_conversation_history_includes_media_pipeline_rejected_artifact_feedback() -> None:
+    artifact = _conversation_history_artifact(
+        conversation_id="conv-video-plan",
+        current_request="重新生成角色参考设定表",
+        context_items=(
+            ConversationContextItem(
+                run_id=uuid4(),
+                request="生成角色参考设定表，审核后再生成视频。",
+                artifacts=(),
+                routing_decision={
+                    "media_pipeline_plan": {
+                        "plan_id": "media-plan-001",
+                        "status": "planned",
+                        "stages": [
+                            {"id": "character_model_sheet", "status": "planned"},
+                            {"id": "storyboard", "status": "planned"},
+                        ],
+                        "rejected_artifacts": [
+                            {
+                                "stage_id": "character_model_sheet",
+                                "artifact_id": "asset-character-bad",
+                                "feedback": "角色脸型和服装不一致，退回重新生成。",
+                            }
+                        ],
+                    },
+                    "storage_key": "secret/path/must/not/leak",
+                },
+            ),
+        ),
+        history_token_budget=4096,
+    )
+
+    assert artifact is not None
+    text = artifact.content["text"]
+    assert isinstance(text, str)
+    assert "rejected_artifacts=character_model_sheet:asset-character-bad" in text
+    assert "角色脸型和服装不一致" in text
+    assert "secret/path/must/not/leak" not in text
+
+
 def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None:
     old_noise = "old implementation detail " * 2000
     latest_decision = "latest important conclusion: use framework-level context compression"

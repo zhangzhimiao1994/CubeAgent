@@ -304,6 +304,27 @@ class StubRunService:
             clarification_reason=None,
         )
 
+    async def reject_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version, feedback
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         return RunSummary(
             id=run_id,
@@ -967,6 +988,21 @@ def test_approve_artifact_review_queues_waiting_run_safely() -> None:
         f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/approve",
         headers=bearer(),
         json={"version": 3},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_reject_artifact_review_accepts_feedback_and_queues_waiting_run() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/reject",
+        headers=bearer(),
+        json={"version": 3, "feedback": "角色形象不一致，退回重新生成。"},
     )
 
     assert response.status_code == 202

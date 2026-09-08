@@ -905,6 +905,32 @@ class RunService:
         )
         return _submitted(record)
 
+    async def reject_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+    ) -> SubmittedRun:
+        del actor_id
+        cleaned_approval_id = approval_id.strip()
+        if not cleaned_approval_id:
+            raise ValueError("artifact review approval id must not be blank")
+        cleaned_feedback = feedback.strip()
+        if not cleaned_feedback:
+            raise ValueError("artifact review feedback must not be blank")
+        record = await self._repository.reject_artifact_review_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=cleaned_approval_id[:128],
+            version=version,
+            feedback=cleaned_feedback[:2000],
+        )
+        return _submitted(record)
+
     async def choose_mode(
         self,
         *,
@@ -2786,6 +2812,7 @@ def _conversation_media_pipeline_plan_line(routing_decision: object) -> str | No
     summary = _safe_public_plan_text(plan.get("summary"), max_chars=320)
     stages = _media_pipeline_stage_summaries(plan.get("stages"))
     approved = _media_pipeline_approved_artifact_summaries(plan.get("approved_artifacts"))
+    rejected = _media_pipeline_rejected_artifact_summaries(plan.get("rejected_artifacts"))
     parts = ["MEDIA_PIPELINE_PLAN"]
     if plan_id:
         parts.append(f"plan_id={plan_id}")
@@ -2797,6 +2824,8 @@ def _conversation_media_pipeline_plan_line(routing_decision: object) -> str | No
         parts.append(f"stages={','.join(stages)}")
     if approved:
         parts.append(f"approved_artifacts={','.join(approved)}")
+    if rejected:
+        parts.append(f"rejected_artifacts={','.join(rejected)}")
     return " ".join(parts) if len(parts) > 1 else None
 
 
@@ -2825,6 +2854,21 @@ def _media_pipeline_approved_artifact_summaries(value: object) -> tuple[str, ...
         artifact_id = _safe_public_plan_text(item.get("artifact_id"), max_chars=96)
         if stage_id and artifact_id:
             summaries.append(f"{stage_id}:{artifact_id}")
+    return tuple(summaries)
+
+
+def _media_pipeline_rejected_artifact_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:24]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("stage_id"), max_chars=64)
+        artifact_id = _safe_public_plan_text(item.get("artifact_id"), max_chars=96)
+        feedback = _safe_public_plan_text(item.get("feedback"), max_chars=160)
+        if stage_id and artifact_id and feedback:
+            summaries.append(f"{stage_id}:{artifact_id}:{feedback}")
     return tuple(summaries)
 
 
