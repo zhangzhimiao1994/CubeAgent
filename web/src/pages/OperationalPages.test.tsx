@@ -32,6 +32,23 @@ function cssRuleBlock(selector: string) {
   return stylesCss.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
 }
 
+function stubCompactChatViewport(matches: boolean) {
+  const listeners = new Set<(event: MediaQueryListEvent) => void>();
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches,
+    media: query,
+    onchange: null,
+    addEventListener: (_event: "change", listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeEventListener: (_event: "change", listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    addListener: (listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeListener: (listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    dispatchEvent: (event: Event) => {
+      listeners.forEach((listener) => listener(event as MediaQueryListEvent));
+      return true;
+    },
+  }));
+}
+
 const runListItem: RunListItem = {
   id: runId,
   status: "running",
@@ -1661,6 +1678,7 @@ describe("operational management pages", () => {
 
   it("docks the latest running agent process above the composer while older process cards stay in history", async () => {
     const user = userEvent.setup();
+    stubCompactChatViewport(true);
     const completedRun = {
       ...runDetail,
       status: "completed",
@@ -1729,13 +1747,15 @@ describe("operational management pages", () => {
     expect(activeDock).not.toBeNull();
     expect(composer).not.toBeNull();
     expect(footer?.parentElement).toBe(stream.parentElement);
-    expect(within(activeDock as HTMLElement).getByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
-    const dockMilestones = within(activeDock as HTMLElement).getByLabelText("本轮里程碑");
-    expect(within(dockMilestones).getByText("接收")).not.toBeNull();
-    expect(within(dockMilestones).getByText("执行")).not.toBeNull();
-    expect(within(activeDock as HTMLElement).getByText(/当前轮规划输出/)).not.toBeNull();
+    const dockButton = within(activeDock as HTMLElement).getByRole("button", { name: /查看 Agent 工作席/ });
+    expect(dockButton).not.toBeNull();
+    expect(within(activeDock as HTMLElement).queryByLabelText("本轮里程碑")).toBeNull();
+    expect(activeDock?.querySelector(".process-intermediate-card")).toBeNull();
+    expect(within(activeDock as HTMLElement).queryByText(/当前轮规划输出/)).toBeNull();
     expect(within(stream).getByText(/上一轮规划输出/)).not.toBeNull();
     expect(within(stream).queryByText(/当前轮规划输出/)).toBeNull();
+    await user.click(dockButton);
+    expect(await screen.findByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
     expect(
       Boolean(
         (activeDock as HTMLElement).compareDocumentPosition(composer as HTMLFormElement) &

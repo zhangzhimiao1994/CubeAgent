@@ -256,6 +256,7 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/\.chat-stream\s*{[\s\S]*min-height:\s*0;[\s\S]*overflow-y:\s*auto;/);
     expect(stylesCss).toMatch(/\.chat-sticky-footer\s*{[\s\S]*bottom:\s*0;[\s\S]*position:\s*sticky;/);
     expect(stylesCss).toMatch(/\.chat-active-process-dock\s*{[\s\S]*max-height:\s*min\(32dvh, 260px\);[\s\S]*overflow-y:\s*auto;/);
+    expect(stylesCss).toMatch(/@media \(max-width: 640px\)[\s\S]*\.chat-active-process-dock\s*{[\s\S]*max-height:\s*3\.25rem;[\s\S]*overflow:\s*visible;/);
   });
 
   it("keeps chat history text selectable while excluding process controls", () => {

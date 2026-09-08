@@ -55,6 +55,7 @@ type RunSubmissionOverride = {
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const COMPACT_CHAT_MEDIA_QUERY = "(max-width: 640px)";
 const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
 const ARCHIVE_EXTENSIONS = [
   ".zip",
@@ -122,6 +123,24 @@ function newConversationId() {
     return `conv-${crypto.randomUUID()}`;
   }
   return `conv-${Date.now().toString(36)}`;
+}
+
+function useCompactChatViewport() {
+  const [compact, setCompact] = useState(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+    return window.matchMedia(COMPACT_CHAT_MEDIA_QUERY).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(COMPACT_CHAT_MEDIA_QUERY);
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return compact;
 }
 
 function displayMode(mode: string | null | undefined) {
@@ -1933,11 +1952,13 @@ function RunProcessSummary({
   onOpen,
   agentNames,
   mainAgentModelName,
+  compact = false,
 }: {
   detail: RunDetail;
   onOpen: (target: ProcessDrawerTarget) => void;
   agentNames: Map<string, string>;
   mainAgentModelName?: string;
+  compact?: boolean;
 }) {
   const workItems = buildAgentWorkItems(detail, agentNames, mainAgentModelName);
   const milestoneItems = runMilestones(detail, workItems);
@@ -1972,61 +1993,80 @@ function RunProcessSummary({
   const highlights = [...outputHighlights.sort(compareActivityTime), ...activityHighlights.sort(compareActivityTime)].slice(0, 3);
   if (workItems.length === 0 && highlights.length === 0) return null;
   const doneCount = workItems.filter((item) => item.status === "done").length;
+  const openWorkforce = () =>
+    onOpen({
+      runId: detail.id,
+      conversationId: runConversationId(detail),
+      scopeLabel: runSeatScope(detail),
+      workItems,
+      hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
+    });
   return (
-    <section className="run-process-summary" aria-label="Agent 集群动作">
-      <div className="agent-cluster-status" role="status" aria-label={`Agent 工作席，${workItems.length} 个子 Agent`}>
-        <span aria-hidden="true">⌘</span>
-        <strong>Agent 工作席</strong>
-        <small>
-          {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
-        </small>
-      </div>
-      <div className="run-milestones" aria-label="本轮里程碑">
-        {milestoneItems.map((item) => (
-          <span key={item.label} className={`run-milestone run-milestone-${item.state}`}>
-            {item.label}
-          </span>
-        ))}
-      </div>
-      <div className="agent-cluster-actions">
-        {highlights.map((item, index) => (
-          <button
-            key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
-            type="button"
-            className="run-process-toggle process-intermediate-card"
-            onClick={() =>
-              onOpen({
-                runId: detail.id,
-                conversationId: runConversationId(detail),
-                scopeLabel: runSeatScope(detail),
-                workItems,
-                hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
-                selectedAgentId: item.agentId,
-                selectedActivityId: item.id,
-              })
-            }
-          >
-            <span aria-hidden="true">›</span>
-            <small className="process-card-badge">{item.kind}</small>
-            <strong>{item.summary}</strong>
-          </button>
-        ))}
+    <section className={`run-process-summary${compact ? " run-process-summary-compact" : ""}`} aria-label="Agent 集群动作">
+      {compact ? (
         <button
           type="button"
-          className="run-process-toggle process-open-workforce"
-          onClick={() =>
-            onOpen({
-              runId: detail.id,
-              conversationId: runConversationId(detail),
-              scopeLabel: runSeatScope(detail),
-              workItems,
-              hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
-            })
-          }
+          className="agent-cluster-status"
+          aria-label={`查看 Agent 工作席，${workItems.length} 个子 Agent${doneCount > 0 ? `，${doneCount} 已下班` : ""}`}
+          onClick={openWorkforce}
         >
-          查看子 Agent 工作席
+          <span aria-hidden="true">⌘</span>
+          <strong>Agent 工作席</strong>
+          <small>
+            {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
+          </small>
         </button>
-      </div>
+      ) : (
+        <div className="agent-cluster-status" role="status" aria-label={`Agent 工作席，${workItems.length} 个子 Agent`}>
+          <span aria-hidden="true">⌘</span>
+          <strong>Agent 工作席</strong>
+          <small>
+            {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
+          </small>
+        </div>
+      )}
+      {compact ? null : (
+        <>
+          <div className="run-milestones" aria-label="本轮里程碑">
+            {milestoneItems.map((item) => (
+              <span key={item.label} className={`run-milestone run-milestone-${item.state}`}>
+                {item.label}
+              </span>
+            ))}
+          </div>
+          <div className="agent-cluster-actions">
+            {highlights.map((item, index) => (
+              <button
+                key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
+                type="button"
+                className="run-process-toggle process-intermediate-card"
+                onClick={() =>
+                  onOpen({
+                    runId: detail.id,
+                    conversationId: runConversationId(detail),
+                    scopeLabel: runSeatScope(detail),
+                    workItems,
+                    hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
+                    selectedAgentId: item.agentId,
+                    selectedActivityId: item.id,
+                  })
+                }
+              >
+                <span aria-hidden="true">›</span>
+                <small className="process-card-badge">{item.kind}</small>
+                <strong>{item.summary}</strong>
+              </button>
+            ))}
+            <button
+              type="button"
+              className="run-process-toggle process-open-workforce"
+              onClick={openWorkforce}
+            >
+              查看子 Agent 工作席
+            </button>
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -2784,6 +2824,7 @@ function MessageBody({ text, title }: { text: string; title: string }) {
 }
 export function RunsPage() {
   const queryClient = useQueryClient();
+  const compactChatViewport = useCompactChatViewport();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
   const runListItems = runs.data ?? [];
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
@@ -3994,6 +4035,7 @@ export function RunsPage() {
                 onOpen={setProcessDetailTarget}
                 agentNames={agentNameMap}
                 mainAgentModelName={mainAgentModelName}
+                compact={compactChatViewport}
               />
             </div>
           ) : null}

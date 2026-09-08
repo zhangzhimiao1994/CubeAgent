@@ -181,7 +181,11 @@ class HybridRuntime:
                         yield event
                 except RuntimeExecutionError as error:
                     failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
-                    if is_discussion and _has_later_synthesis_stage(stages, stage_index):
+                    if (
+                        is_discussion
+                        and _has_later_synthesis_stage(stages, stage_index)
+                        and not _is_negative_discussion_consensus_failure(failure_reason)
+                    ):
                         yield RunEvent(
                             kind=EventKind.STEP_FAILED,
                             sequence=sequence,
@@ -355,6 +359,10 @@ class HybridRuntime:
                 if item.kind is EventKind.RUNTIME_CANCELLED:
                     raise asyncio.CancelledError
                 if item.kind is EventKind.RUNTIME_COMPLETED:
+                    if mode is TaskMode.DISCUSS and item.reason == "negative_consensus":
+                        raise RuntimeExecutionError(
+                            "hybrid discuss failed: discussion negative consensus"
+                        )
                     terminal_seen = True
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
@@ -497,6 +505,10 @@ class HybridRuntime:
 
 def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
     return safe_runtime_failure_reason(error, fallback=fallback)
+
+
+def _is_negative_discussion_consensus_failure(failure_reason: str) -> bool:
+    return failure_reason == "hybrid discuss failed: discussion negative consensus"
 
 
 def _is_forwardable_child_event(event: RunEvent) -> bool:

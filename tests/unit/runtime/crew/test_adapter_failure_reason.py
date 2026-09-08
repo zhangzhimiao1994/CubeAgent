@@ -1278,6 +1278,44 @@ async def test_reviewer_invalid_json_retries_with_optimized_prompt_before_skip()
     assert review.payload["verdict"] == "approve"
 
 
+async def test_reviewer_chinese_consensus_rejection_requests_step_revision() -> None:
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                (
+                    "# Skeptic 审查结论\n\n"
+                    "## [CONSENSUS] 不通过——现有交付物为残缺品，拒绝放行\n\n"
+                    "核心问题：产物被截断，剧本不完整。需要退回重新生成完整剧本。"
+                ),
+                '{"verdict":"approve"}',
+            )
+        ),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    revisions = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("verdict") == "revise"
+    ]
+    assert len(revisions) == 1
+    assert "产物被截断" in str(revisions[0].payload["feedback"])
+    retry = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_RETRYING
+        and event.actor == "writer"
+        and event.reason == "review requested revision"
+    )
+    assert retry.payload["attempt"] == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:
     original_text = "长文本" * 1_000
     artifact = Artifact(

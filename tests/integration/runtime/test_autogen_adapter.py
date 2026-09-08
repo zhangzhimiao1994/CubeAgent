@@ -252,6 +252,26 @@ async def test_consensus_requires_distinct_participants() -> None:
     assert len(terminal_events(events)) == 1
 
 
+async def test_negative_consensus_stops_with_stable_rejection_reason() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("analyst", 1, Decimal(0)),
+            ("[CONSENSUS] 不通过——产物被截断，拒绝放行，需要退回重新生成。", 1, Decimal(0)),
+            ("critic", 1, Decimal(0)),
+            ("[CONSENSUS] 不通过——剧本不完整，拒绝放行。", 1, Decimal(0)),
+        ]
+    )
+
+    events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+    assert completed.payload["reason"] == "negative_consensus"
+    assert completed.payload["consensus_verdict"] == "revise"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "negative_consensus"
+    assert len(terminal_events(events)) == 1
+
+
 async def test_unpriced_but_token_accounted_usage_does_not_block_discussion() -> None:
     gateway = ScriptedGateway(
         [

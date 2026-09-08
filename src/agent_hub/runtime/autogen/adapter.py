@@ -66,7 +66,11 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepositoryError,
     InMemoryArtifactRepository,
 )
-from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
+from agent_hub.runtime.autogen.termination import (
+    CompositeDiscussionTermination,
+    DiscussionUsage,
+    is_negative_consensus_text,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -1352,6 +1356,9 @@ class AutoGenDiscussionRuntime:
             if wall_expired.is_set():
                 reason = "wall_time"
             reason = reason or termination.reason or "max_turns"
+            if _has_negative_consensus_message(message_artifacts):
+                reason = "negative_consensus"
+                termination.consensus_verdict = "revise"
             last_discussion = next(
                 (
                     preview
@@ -1373,6 +1380,11 @@ class AutoGenDiscussionRuntime:
                     "participant_models": participant_models,
                     "summary": last_discussion,
                     "reason": reason,
+                    **(
+                        {"consensus_verdict": termination.consensus_verdict}
+                        if termination.consensus_verdict is not None
+                        else {}
+                    ),
                 },
             )
             sequence += 1
@@ -1566,6 +1578,7 @@ class AutoGenDiscussionRuntime:
             "wall_time",
             "cancelled",
             "max_turns",
+            "negative_consensus",
         }:
             return reason
         if reason and "maximum number of turns" in reason.casefold():
@@ -1905,6 +1918,16 @@ def _discussion_has_enough_distinct_outputs(
         if artifact.producer:
             speakers.add(artifact.producer)
     return len(speakers) >= required
+
+
+def _has_negative_consensus_message(message_artifacts: Sequence[Artifact]) -> bool:
+    for artifact in message_artifacts:
+        if not isinstance(artifact.content, Mapping):
+            continue
+        text = artifact.content.get("text")
+        if isinstance(text, str) and is_negative_consensus_text(text):
+            return True
+    return False
 
 
 def _should_fail_on_autogen_cleanup(

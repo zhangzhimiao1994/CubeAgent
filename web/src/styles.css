@@ -1346,9 +1346,20 @@ article:hover {
   border: 1px solid rgba(123, 225, 255, 0.14);
   border-radius: 999px;
   display: inline-flex;
+  font: inherit;
   gap: 0.48rem;
   padding: 0.35rem 0.72rem;
   width: fit-content;
+}
+
+button.agent-cluster-status {
+  cursor: pointer;
+}
+
+button.agent-cluster-status:hover,
+button.agent-cluster-status:focus-visible {
+  background: rgba(85, 215, 255, 0.08);
+  border-color: rgba(85, 215, 255, 0.34);
 }
 
 .agent-cluster-status span {
@@ -4480,8 +4491,8 @@ article:hover {
   }
 
   .chat-panel:has(.chat-active-process-dock) .chat-stream {
-    padding-bottom: calc(var(--chat-footer-height, 12rem) + 1rem + env(safe-area-inset-bottom));
-    scroll-padding-bottom: calc(var(--chat-footer-height, 12rem) + 1rem + env(safe-area-inset-bottom));
+    padding-bottom: calc(var(--chat-footer-height, 9rem) + 1rem + env(safe-area-inset-bottom));
+    scroll-padding-bottom: calc(var(--chat-footer-height, 9rem) + 1rem + env(safe-area-inset-bottom));
   }
 
   .page-surface-chat .chat-session-toolbar {
@@ -4513,7 +4524,8 @@ article:hover {
   }
 
   .chat-active-process-dock {
-    max-height: min(18dvh, 140px);
+    max-height: 3.25rem;
+    overflow: visible;
   }
 
   .chat-message {

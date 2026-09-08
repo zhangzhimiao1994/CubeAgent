@@ -657,6 +657,59 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
+def _fallback_review_response_from_text(text: str) -> tuple[str, str | None] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    lowered = stripped.casefold()
+    has_review_marker = any(
+        marker in lowered
+        for marker in (
+            "[consensus]",
+            "审查结论",
+            "审查结果",
+            "review conclusion",
+            "review result",
+        )
+    )
+    if not has_review_marker:
+        return None
+    if any(
+        marker in lowered
+        for marker in (
+            "不通过",
+            "未通过",
+            "审查不合格",
+            "拒绝放行",
+            "不能放行",
+            "退回",
+            "返工",
+            "重新生成",
+            "重写",
+            "revise",
+            "revision required",
+            "reject",
+            "rejected",
+            "do not approve",
+            "not approved",
+        )
+    ):
+        return "revise", _truncate_prompt_text(stripped, max_bytes=8192)
+    if any(
+        marker in lowered
+        for marker in (
+            "通过",
+            "同意放行",
+            "允许放行",
+            "approve",
+            "approved",
+            "pass",
+        )
+    ):
+        return "approve", None
+    return None
+
+
 def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
     for item in reversed(results):
         result = item.get("result")
@@ -4046,20 +4099,25 @@ class CrewDispatchRuntime:
         try:
             value = json.loads(text)
         except (TypeError, ValueError):
+            fallback = _fallback_review_response_from_text(text)
+            if fallback is not None:
+                fallback_verdict, fallback_feedback = fallback
+                return fallback_verdict, fallback_feedback, tuple(evidence)
             _fail("reviewer returned non-json response")
         if type(value) is not dict or not set(value) <= {"verdict", "feedback"}:
             _fail("reviewer returned unsupported JSON schema")
-        verdict = value.get("verdict")
-        feedback = value.get("feedback")
-        if verdict not in {"approve", "revise", "reject"}:
+        json_verdict = value.get("verdict")
+        json_feedback = value.get("feedback")
+        if json_verdict not in {"approve", "revise", "reject"}:
             _fail("reviewer returned unsupported verdict")
-        if feedback is not None and (
-            type(feedback) is not str
-            or not feedback.strip()
-            or len(feedback.encode("utf-8")) > 8192
+        if json_feedback is not None and (
+            type(json_feedback) is not str
+            or not json_feedback.strip()
+            or len(json_feedback.encode("utf-8")) > 8192
         ):
             _fail("reviewer returned invalid feedback")
-        return cast(str, verdict), feedback, tuple(evidence)
+        verdict = cast(str, json_verdict)
+        return verdict, json_feedback, tuple(evidence)
 
     def _existing_review_evidence(
         self,

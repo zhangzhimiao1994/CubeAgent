@@ -132,6 +132,30 @@ class FailingRuntime:
         return None
 
 
+class CompletedReasonRuntime(MultiArtifactRuntime):
+    def __init__(self, mode: TaskMode, outputs: tuple[Artifact, ...], reason: str) -> None:
+        super().__init__(mode, outputs)
+        self._reason = reason
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        sequence = 1
+        for output in self.outputs:
+            yield RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=sequence,
+                run_id=context.run_id,
+                artifact=output,
+            )
+            sequence += 1
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=sequence,
+            run_id=context.run_id,
+            reason=self._reason,
+        )
+
+
 class UnusedRuntime(FailingRuntime):
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         raise AssertionError(f"{self.mode.value} should not run for this test")
@@ -330,6 +354,39 @@ async def test_hybrid_runtime_synthesizes_when_discussion_gateway_fails_after_di
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_does_not_synthesize_after_negative_discussion_consensus() -> None:
+    dispatch_output = artifact("planner", "dispatch result")
+    discussion_output = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 不通过——拒绝放行，需要重新生成。",
+    )
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        CompletedReasonRuntime(TaskMode.DISCUSS, (discussion_output,), "negative_consensus"),
+        UnusedRuntime(TaskMode.DIRECT, "synthesis should not run"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并审查。",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == discussion_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "hybrid discuss failed: discussion negative consensus"
 
 
 @pytest.mark.asyncio
