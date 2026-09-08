@@ -1109,8 +1109,64 @@ def _should_direct_execute_multimedia(step: DispatchStep, agent: AgentSpec) -> b
     return any(hint in text for hint in _DIRECT_MULTIMEDIA_AGENT_HINTS)
 
 
+def _should_direct_execute_compose_video(
+    step: DispatchStep,
+    agent: AgentSpec,
+    sources: tuple[Artifact, ...],
+) -> bool:
+    if "compose_video" not in step.tools:
+        return False
+    if not _direct_compose_video_arguments(step, sources):
+        return False
+    text = f"{step.agent} {agent.role} {agent.goal} {step.task}".casefold()
+    return any(
+        hint in text
+        for hint in (
+            "video compositor",
+            "video_compositor",
+            "compositor",
+            "剪辑",
+            "合并",
+            "成片",
+            "最终视频",
+            "final video",
+        )
+    )
+
+
+def _direct_capability_names_for_step(step: DispatchStep) -> frozenset[str]:
+    return frozenset(
+        name
+        for name in ("generate_multimedia", "compose_video")
+        if name in step.tools
+    )
+
+
 def _is_direct_multimedia_step(step: DispatchStep) -> bool:
     return "generate_multimedia" in step.tools
+
+
+def _is_direct_capability_step(step: DispatchStep) -> bool:
+    return bool(_direct_capability_names_for_step(step))
+
+
+def _direct_compose_video_arguments(
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> Mapping[str, JsonValue] | None:
+    base: Mapping[str, JsonValue] = {
+        "title": _truncate_prompt_text(step.task.strip() or "Composed video", max_bytes=120),
+        "filename": "final-video.mp4",
+        "aspect_ratio": "original",
+        "image_duration_seconds": 3,
+        "presentation": "final_attachment",
+        "clips": (),
+    }
+    normalized = _normalize_compose_video_arguments_with_sources(base, sources)
+    clips = normalized.get("clips")
+    if not isinstance(clips, tuple) or not clips:
+        return None
+    return normalized
 
 
 def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
@@ -3337,33 +3393,61 @@ class CrewDispatchRuntime:
         step_deadline: float,
         feedback: str | None = None,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]] | None:
-        if self._capabilities is None or not _should_direct_execute_multimedia(step, agent):
+        if self._capabilities is None:
             return None
-        kind = _infer_direct_multimedia_kind(context, step)
-        if kind is None:
+        capability_name: str
+        logical_model: str
+        arguments: Mapping[str, JsonValue]
+        started_payload: Mapping[str, JsonValue]
+        direct_completion_text: str
+        final_fallback_text: str
+        if _should_direct_execute_compose_video(step, agent, sources):
+            capability_name = "compose_video"
+            logical_model = agent.logical_model
+            compose_arguments = _direct_compose_video_arguments(step, sources)
+            if compose_arguments is None:
+                return None
+            arguments = compose_arguments
+            started_payload = {"direct_dispatch": True}
+            direct_completion_text = "Video composition dispatched directly."
+            final_fallback_text = "Composed final video artifact."
+        elif _should_direct_execute_multimedia(step, agent):
+            capability_name = "generate_multimedia"
+            kind = _infer_direct_multimedia_kind(context, step)
+            if kind is None:
+                return None
+            selector = getattr(self._capabilities, "default_logical_model_for_multimedia", None)
+            selected: object = (
+                selector(tenant_id=context.tenant_id, kind=kind) if callable(selector) else None
+            )
+            if hasattr(selected, "__await__"):
+                selected = await cast(Coroutine[Any, Any, object], selected)
+            selected_model = selected if isinstance(selected, str) and selected.strip() else None
+            if selected_model is None:
+                _fail(f"capability failed: no configured {kind} generation model")
+            logical_model = selected_model
+            generation_prompt = _direct_multimedia_generation_prompt(
+                context, step, sources, feedback
+            )
+            if not generation_prompt:
+                _fail("capability failed: multimedia generation prompt is empty")
+            arguments = {
+                "kind": kind,
+                "logical_model": logical_model,
+                "generation_prompt": generation_prompt,
+            }
+            started_payload = {
+                "kind": kind,
+                "logical_model": logical_model,
+                "direct_dispatch": True,
+            }
+            direct_completion_text = "Multimedia generation dispatched directly."
+            final_fallback_text = f"Generated {kind} artifact with {logical_model}."
+        else:
             return None
-        selector = getattr(self._capabilities, "default_logical_model_for_multimedia", None)
-        selected: object = (
-            selector(tenant_id=context.tenant_id, kind=kind) if callable(selector) else None
-        )
-        if hasattr(selected, "__await__"):
-            selected = await cast(Coroutine[Any, Any, object], selected)
-        logical_model = selected if isinstance(selected, str) and selected.strip() else None
-        if logical_model is None:
-            _fail(f"capability failed: no configured {kind} generation model")
-        generation_prompt = _direct_multimedia_generation_prompt(
-            context, step, sources, feedback
-        )
-        if not generation_prompt:
-            _fail("capability failed: multimedia generation prompt is empty")
-        arguments: Mapping[str, JsonValue] = {
-            "kind": kind,
-            "logical_model": logical_model,
-            "generation_prompt": generation_prompt,
-        }
         completion = _direct_runtime_completion(
             logical_model=logical_model,
-            text="Multimedia generation dispatched directly.",
+            text=direct_completion_text,
         )
         model_key = self._model_call_key(
             context.run_id,
@@ -3376,7 +3460,7 @@ class CrewDispatchRuntime:
         request_sha256 = hashlib.sha256(
             json.dumps(
                 {
-                    "direct_capability": "generate_multimedia",
+                    "direct_capability": capability_name,
                     "step_id": step.id,
                     "actor": agent.id,
                     "arguments": _mutable_json(arguments),
@@ -3459,7 +3543,7 @@ class CrewDispatchRuntime:
             retries,
             0,
             0,
-            "generate_multimedia",
+            capability_name,
             arguments_sha256,
         )
         call_id = f"call-{tool_key[:32]}"
@@ -3476,11 +3560,11 @@ class CrewDispatchRuntime:
                 kind=EventKind.TOOL_COMPLETED,
                 actor=step.agent,
                 tool_call_id=call_id,
-                tool_name="generate_multimedia",
+                tool_name=capability_name,
                 artifact=tool_artifact,
             )
         else:
-            replay_safe = bool(self._capabilities.is_replay_safe("generate_multimedia"))
+            replay_safe = bool(self._capabilities.is_replay_safe(capability_name))
             if (
                 existing_tool is not None
                 and existing_tool.get("status") in {"running", "uncertain"}
@@ -3493,7 +3577,7 @@ class CrewDispatchRuntime:
                 "attempt": retries,
                 "round": 0,
                 "tool_index": 0,
-                "name": "generate_multimedia",
+                "name": capability_name,
                 "arguments_sha256": arguments_sha256,
                 "trigger_model_artifact_id": str(model_artifact.id),
                 "replay_safe": replay_safe,
@@ -3505,12 +3589,8 @@ class CrewDispatchRuntime:
                 kind=EventKind.TOOL_STARTED,
                 actor=step.agent,
                 tool_call_id=call_id,
-                tool_name="generate_multimedia",
-                payload={
-                    "kind": kind,
-                    "logical_model": logical_model,
-                    "direct_dispatch": True,
-                },
+                tool_name=capability_name,
+                payload=started_payload,
             )
             running_tool = dict(prepared_tool)
             running_tool["status"] = "running"
@@ -3521,7 +3601,7 @@ class CrewDispatchRuntime:
                         tenant_id=context.tenant_id,
                         run_id=context.run_id,
                         actor=step.agent,
-                        name="generate_multimedia",
+                        name=capability_name,
                         arguments=arguments,
                         idempotency_key=tool_key,
                     )
@@ -3547,7 +3627,7 @@ class CrewDispatchRuntime:
                     kind=EventKind.TOOL_FAILED,
                     actor=step.agent,
                     tool_call_id=call_id,
-                    tool_name="generate_multimedia",
+                    tool_name=capability_name,
                     reason=failure_reason,
                     payload=runtime_failure_diagnostic_from_reason(failure_reason),
                 )
@@ -3566,7 +3646,7 @@ class CrewDispatchRuntime:
                 kind=EventKind.TOOL_COMPLETED,
                 actor=step.agent,
                 tool_call_id=call_id,
-                tool_name="generate_multimedia",
+                tool_name=capability_name,
                 artifact=tool_artifact,
             )
             succeeded_tool = dict(running_tool)
@@ -3577,10 +3657,10 @@ class CrewDispatchRuntime:
             )
             await tool_boundary(tool_key, succeeded_tool, tool_artifact)
         final_summary = _final_attachment_summary(
-            [{"name": "generate_multimedia", "result": result}]
+            [{"name": capability_name, "result": result}]
         )
         if final_summary is None:
-            final_summary = f"Generated {kind} artifact with {logical_model}."
+            final_summary = final_fallback_text
         final_completion = _direct_runtime_completion(
             logical_model=logical_model,
             text=final_summary,
@@ -5500,7 +5580,7 @@ class CrewDispatchRuntime:
                         or (
                             model_artifact.provenance.logical_model
                             != agents[step.agent].logical_model
-                            and not _is_direct_multimedia_step(step)
+                            and not _is_direct_capability_step(step)
                         )
                     ):
                         _fail("runtime checkpoint model artifact lineage is invalid")
@@ -5510,15 +5590,17 @@ class CrewDispatchRuntime:
                     evidence_ids.append(str(model_artifact.id))
                     round_tools = tools.get((step.id, attempt, call_index), {})
                     calls = completion.response.tool_calls
-                    direct_multimedia_tool = _is_direct_multimedia_step(step) and not calls
-                    if len(round_tools) > len(calls) and not direct_multimedia_tool:
+                    direct_tool_names = (
+                        _direct_capability_names_for_step(step) if not calls else frozenset()
+                    )
+                    if len(round_tools) > len(calls) and not direct_tool_names:
                         _fail("runtime checkpoint capability artifact lineage is invalid")
                     for tool_index in range(len(round_tools)):
                         tool_state, tool_artifact = round_tools[tool_index]
-                        if direct_multimedia_tool:
+                        if direct_tool_names:
                             if (
                                 len(round_tools) != 1
-                                or tool_state["name"] != "generate_multimedia"
+                                or tool_state["name"] not in direct_tool_names
                                 or tool_state["trigger_model_artifact_id"] != str(model_artifact.id)
                             ):
                                 _fail("runtime checkpoint capability artifact lineage is invalid")
@@ -5553,7 +5635,7 @@ class CrewDispatchRuntime:
                     if (
                         call_index < len(step_calls) - 1
                         and len(round_tools) != len(calls)
-                        and not direct_multimedia_tool
+                        and not direct_tool_names
                     ):
                         _fail("runtime checkpoint artifact graph is invalid")
                 output_sources = (*input_ids, *evidence_ids)

@@ -601,6 +601,8 @@ def test_multimedia_generation_dispatch_covers_final_and_intermediate_media_arti
             "只需要图片，不要生成视频成片。"
         ),
         "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
+        "只生成角色参考设定表，不要生成视频。",
+        "生成角色定妆照，暂时不剪辑成片。",
     ),
 )
 def test_image_only_character_model_sheet_request_does_not_route_to_video_roles(

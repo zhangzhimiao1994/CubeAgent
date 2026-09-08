@@ -864,6 +864,124 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     assert completed.payload["logical_model"] == "media_primary"
 
 
+async def test_video_compositor_directly_composes_upstream_file_handles_without_text_model() -> None:
+    class FailingTextGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            self.calls += 1
+            raise AssertionError("text gateway must not be called for direct video composition")
+
+    class DirectComposeCapabilities(DirectMultimediaCapabilities):
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, idempotency_key
+            self.calls.append((actor, name, arguments))
+            assert name == "compose_video"
+            return {
+                "job_id": "compose-test",
+                "status": "completed",
+                "executor_id": actor,
+                "summary": "Composed final video.",
+                "artifacts": (
+                    {
+                        "filename": "final.mp4",
+                        "mime_type": "video/mp4",
+                        "download_url": "/api/v1/admin/compositions/compose-test/artifacts/0/download",
+                    },
+                ),
+                "presentation": "final_attachment",
+            }
+
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "generate_multimedia"
+
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "artifact_id": "source-video-artifact",
+                        "download_url": "/api/v1/admin/runs/run/artifacts/source-video-artifact/download",
+                        "filename": "shot-001.mp4",
+                        "mime_type": "video/mp4",
+                        "storage_key": "tenant/run/source/shot-001.mp4",
+                    },
+                ),
+            }
+        },
+        source_ids=(),
+    )
+    gateway = FailingTextGateway()
+    capabilities = DirectComposeCapabilities()
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="video_compositor",
+                role="Video Compositor",
+                goal="合并剪辑上游镜头并输出最终成片",
+                logical_model="general",
+                allowed_tools=("compose_video",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="compose",
+                agent="video_compositor",
+                task="将上游镜头剪辑成最终 5 秒 MP4",
+                tools=("compose_video",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("compose_video",),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                artifacts=(source,),
+                request="请把已经生成的上游视频剪辑成片，输出 5 秒 MP4",
+            )
+        )
+    ]
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    final = next(artifact for artifact in artifacts if artifact.type == "text")
+
+    assert gateway.calls == 0
+    assert len(capabilities.calls) == 1
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "video_compositor"
+    assert name == "compose_video"
+    clips = arguments["clips"]
+    assert isinstance(clips, tuple)
+    first_clip = cast(Mapping[str, JsonValue], clips[0])
+    assert first_clip["storage_key"] == "tenant/run/source/shot-001.mp4"
+    assert first_clip["mime_type"] == "video/mp4"
+    assert first_clip["filename"] == "shot-001.mp4"
+    assert "final.mp4" in cast(str, final.content["text"])
+    assert any(
+        event.kind is EventKind.TOOL_STARTED
+        and event.tool_name == "compose_video"
+        and event.payload.get("direct_dispatch") is True
+        for event in events
+    )
+
+
 async def test_user_review_gate_requests_approval_before_downstream_step() -> None:
     plan = DispatchPlan(
         agents=(
