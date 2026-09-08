@@ -496,6 +496,36 @@ def test_multimedia_generation_dispatch_covers_final_and_intermediate_media_arti
     assert "generate_multimedia" in executor.allowed_tools
 
 
+@pytest.mark.parametrize(
+    "task",
+    (
+        (
+            "根据这个剧情生成 Character Model Sheet 形式的角色参考设定表，"
+            "只需要图片，不要生成视频成片。"
+        ),
+        "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
+    ),
+)
+def test_image_only_character_model_sheet_request_does_not_route_to_video_roles(
+    task: str,
+) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "video_editor" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
 def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

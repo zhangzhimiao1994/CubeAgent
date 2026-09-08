@@ -1953,7 +1953,11 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "combine videos",
         "edit these videos",
     )
-    return not any(term in normalized for term in blocked_terms)
+    return not _has_unnegated_terms(
+        normalized,
+        blocked_terms,
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    )
 
 
 def _is_document_generation_request(task: str) -> bool:
@@ -2106,7 +2110,44 @@ def _has_generation_negation(normalized: str) -> bool:
         "prompt only",
         "analysis only",
     )
-    return any(negation in normalized for negation in scoped_negations)
+    return any(negation in normalized for negation in scoped_negations) and not (
+        _has_positive_multimedia_generation_clause(normalized, scoped_negations)
+    )
+
+
+def _has_positive_multimedia_generation_clause(
+    normalized: str,
+    negations: tuple[str, ...],
+) -> bool:
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in negations):
+            continue
+        if _has_delivery_action(clause) and any(
+            term in clause for term in _MULTIMEDIA_MEDIA_TERMS
+        ):
+            return True
+    return False
+
+
+def _has_unnegated_terms(
+    normalized: str,
+    terms: tuple[str, ...],
+    negations: tuple[str, ...],
+) -> bool:
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in negations):
+            continue
+        if any(term in clause for term in terms):
+            return True
+    return False
+
+
+def _split_semantic_clauses(normalized: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", normalized)
+        if clause.strip()
+    )
 
 
 def _has_office_generation_negation(normalized: str, negations: tuple[str, ...]) -> bool:
@@ -2146,6 +2187,10 @@ def _has_delivery_action(normalized: str) -> bool:
             "渲染",
             "合成",
             "给我",
+            "只要",
+            "只需要",
+            "仅要",
+            "仅需要",
         )
     )
 

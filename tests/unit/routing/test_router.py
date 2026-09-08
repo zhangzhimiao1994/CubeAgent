@@ -256,6 +256,11 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
             "女主角是东西方融合的结晶，既能修仙也能继承神位，为了男主角回归，苦苦追寻男主角。"
             "然后根据剧情以Character Model Sheet的形式生成角色参考设定表"
         ),
+        (
+            "根据这个剧情生成 Character Model Sheet 形式的角色参考设定表，"
+            "只需要图片，不要生成视频成片。"
+        ),
+        "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
     ],
 )
 async def test_multimedia_generation_auto_routes_to_dispatch_without_classifier(text: str) -> None:

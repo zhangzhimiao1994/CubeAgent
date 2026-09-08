@@ -494,7 +494,7 @@ def assess_rules(task_text: str, *, risk_policy: RiskRulePolicy | None = None) -
 
 def _is_multimedia_generation_request(task_text: str) -> bool:
     normalized = unicodedata.normalize("NFKC", task_text).casefold()
-    if any(term in normalized for term in _MULTIMEDIA_GENERATION_NEGATIONS):
+    if _has_multimedia_generation_negation(normalized):
         return False
     if _looks_like_multimedia_explanation(normalized):
         return False
@@ -502,6 +502,36 @@ def _is_multimedia_generation_request(task_text: str) -> bool:
         return True
     if not any(term in normalized for term in _MULTIMEDIA_MEDIA_TERMS):
         return False
+    return _has_multimedia_delivery_action(normalized)
+
+
+def _has_multimedia_generation_negation(normalized: str) -> bool:
+    return any(term in normalized for term in _MULTIMEDIA_GENERATION_NEGATIONS) and not (
+        _has_positive_multimedia_generation_clause(normalized)
+    )
+
+
+def _has_positive_multimedia_generation_clause(normalized: str) -> bool:
+    for clause in _split_semantic_clauses(normalized):
+        if any(term in clause for term in _MULTIMEDIA_GENERATION_NEGATIONS):
+            continue
+        if any(term in clause for term in _MULTIMEDIA_MEDIA_TERMS) and (
+            any(term in clause for term in _MULTIMEDIA_GENERATION_TERMS)
+            or _has_multimedia_delivery_action(clause)
+        ):
+            return True
+    return False
+
+
+def _split_semantic_clauses(normalized: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", normalized)
+        if clause.strip()
+    )
+
+
+def _has_multimedia_delivery_action(normalized: str) -> bool:
     return any(
         action in normalized
         for action in (
@@ -525,6 +555,10 @@ def _is_multimedia_generation_request(task_text: str) -> bool:
             "产出",
             "输出",
             "给我",
+            "只要",
+            "只需要",
+            "仅要",
+            "仅需要",
         )
     )
 
