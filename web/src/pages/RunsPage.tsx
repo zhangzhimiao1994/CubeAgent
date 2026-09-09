@@ -47,6 +47,25 @@ type SkillUploadConflict = {
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
+type ArtifactReviewArtifact = RunDetail["artifacts"][number] | NonNullable<RunDetail["events"][number]["artifact"]>;
+type ArtifactReviewItem = {
+  id: string;
+  artifactId: string | null;
+  title: string | null;
+  filename: string | null;
+  sha256: string | null;
+  mimeType: string | null;
+  kind: string | null;
+  artifact: ArtifactReviewArtifact | null;
+};
+type ArtifactReviewRejectedItem = {
+  id: string;
+  feedback: string;
+};
+type ArtifactReviewRejectPayload = {
+  feedback?: string;
+  rejectedItems?: ArtifactReviewRejectedItem[];
+};
 type ArtifactReviewApproval = {
   runId: string;
   approvalId: string;
@@ -54,8 +73,9 @@ type ArtifactReviewApproval = {
   stageId: string;
   artifactId: string;
   producer: string | null;
-  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null;
-  artifacts: Array<RunArtifact | NonNullable<RunEvent["artifact"]>>;
+  artifact: ArtifactReviewArtifact | null;
+  artifacts: ArtifactReviewArtifact[];
+  reviewItems: ArtifactReviewItem[];
 };
 type RunSubmissionOverride = {
   message?: string;
@@ -840,7 +860,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   const fallbackArtifactMessages = replyArtifact
     ? []
     : detail.artifacts
-        .filter((artifact) => !artifact.text?.trim())
+        .filter((artifact) => !artifact.text?.trim() && !hasArtifactDownload(artifact))
         .map((artifact) => ({
           id: `artifact-${artifact.id}`,
           role: "assistant" as const,
@@ -957,6 +977,55 @@ function payloadText(payload: Record<string, unknown>, key: string) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function artifactReviewString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function artifactReviewItemsFromPayload(
+  payload: Record<string, unknown>,
+  artifacts: ArtifactReviewArtifact[],
+): ArtifactReviewItem[] {
+  const rawItems = payload.review_items;
+  if (!Array.isArray(rawItems)) return [];
+  const artifactsById = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+  const artifactsByFilename = new Map(
+    artifacts
+      .filter((artifact) => artifact.filename?.trim())
+      .map((artifact) => [artifact.filename?.trim() as string, artifact]),
+  );
+  const artifactsBySha = new Map(
+    artifacts.filter((artifact) => artifact.sha256?.trim()).map((artifact) => [artifact.sha256?.trim() as string, artifact]),
+  );
+  const seen = new Set<string>();
+  const items: ArtifactReviewItem[] = [];
+  for (const rawItem of rawItems) {
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+    const record = rawItem as Record<string, unknown>;
+    const id = artifactReviewString(record.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const artifactId = artifactReviewString(record.artifact_id);
+    const filename = artifactReviewString(record.filename);
+    const sha256 = artifactReviewString(record.sha256);
+    const artifact =
+      artifactsById.get(id) ??
+      (filename ? artifactsByFilename.get(filename) : undefined) ??
+      (sha256 ? artifactsBySha.get(sha256) : undefined) ??
+      null;
+    items.push({
+      id,
+      artifactId,
+      title: artifactReviewString(record.title) ?? artifact?.title ?? null,
+      filename: filename ?? artifact?.filename ?? null,
+      sha256: sha256 ?? artifact?.sha256 ?? null,
+      mimeType: artifactReviewString(record.mime_type) ?? artifact?.mime_type ?? null,
+      kind: artifactReviewString(record.kind) ?? artifact?.kind ?? null,
+      artifact,
+    });
+  }
+  return items;
+}
+
 function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): ArtifactReviewApproval | null {
   if (!run || run.status !== "waiting_approval") return null;
   const requested = [...run.events]
@@ -990,6 +1059,7 @@ function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): Artifa
     run.artifacts.find((candidate) => candidate.id === artifactId) ??
     run.events.find((event) => event.artifact?.id === artifactId)?.artifact ??
     null;
+  const reviewItems = artifactReviewItemsFromPayload(requested.payload, artifacts);
   return {
     runId: run.id,
     approvalId: requested.approval_id,
@@ -999,6 +1069,7 @@ function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): Artifa
     producer: payloadText(requested.payload, "producer") ?? requested.actor ?? null,
     artifact,
     artifacts: artifact ? [artifact, ...artifacts.filter((candidate) => candidate.id !== artifact.id)] : artifacts,
+    reviewItems,
   };
 }
 
@@ -1172,7 +1243,9 @@ function conversationListEntries(items: RunListItem[]): ConversationListEntry[] 
 }
 
 function conversationMessages(runs: RunDetail[]) {
-  return runs.flatMap((run) =>
+  const dedupedRunsById = new Map(runs.map((run) => [run.id, run]));
+  const dedupedRuns = Array.from(dedupedRunsById.values());
+  return dedupedRuns.flatMap((run) =>
     detailMessages(run).map((message) => ({
       ...message,
       id: `${run.id}-${message.id}`,
@@ -2652,11 +2725,31 @@ function ArtifactReviewApprovalCard({
   feedback: string;
   onFeedbackChange: (value: string) => void;
   onApprove: () => void;
-  onReject: () => void;
+  onReject: (payload?: ArtifactReviewRejectPayload) => void;
   disabled?: boolean;
 }) {
   const title = approval.artifact?.title || approval.stageId;
   const artifacts = approval.artifacts.length > 0 ? approval.artifacts : approval.artifact ? [approval.artifact] : [];
+  const hasReviewItems = approval.reviewItems.length > 0;
+  const [itemDecisions, setItemDecisions] = useState<Record<string, "approved" | "rejected">>({});
+  const [itemFeedback, setItemFeedback] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setItemDecisions({});
+    setItemFeedback({});
+  }, [approval.approvalId, approval.runId, approval.version]);
+
+  const rejectSelectedItems = () => {
+    const rejectedItems = approval.reviewItems
+      .filter((item) => itemDecisions[item.id] === "rejected")
+      .map((item) => ({ id: item.id, feedback: (itemFeedback[item.id] ?? "").trim() }));
+    if (rejectedItems.length === 0) {
+      onReject({ rejectedItems: [] });
+      return;
+    }
+    onReject({ rejectedItems });
+  };
+
   return (
     <article className="artifact-review-card" aria-label="中间产物审核">
       <span className="eyebrow">中间产物审核</span>
@@ -2681,26 +2774,100 @@ function ArtifactReviewApprovalCard({
         ) : null}
       </dl>
       <p>确认后进入下一步；退回时会把反馈交给对应阶段重新生成，并再次等待审核。</p>
-      {artifacts.length > 1 ? <p>本阶段共 {artifacts.length} 个文件，请按整组产物审核。</p> : null}
-      {artifacts.map((artifact) =>
-        hasArtifactDownload(artifact) ? <ArtifactFileCard key={artifact.id} artifact={artifact} compact /> : null,
+      {hasReviewItems ? (
+        <>
+          <p>本阶段共 {approval.reviewItems.length} 个文件，可逐个确认或退回。</p>
+          <div className="artifact-review-item-list">
+            {approval.reviewItems.map((item) => {
+              const itemTitle = item.title || item.filename || item.id;
+              const decision = itemDecisions[item.id];
+              const itemArtifact = item.artifact;
+              const meta = [item.kind, item.mimeType, item.sha256 ? `SHA-256 ${shortHash(item.sha256)}` : ""].filter(Boolean);
+              return (
+                <section key={item.id} className="artifact-review-item" aria-label={`审核 ${itemTitle}`}>
+                  <div className="artifact-review-item-head">
+                    <div>
+                      <strong>{itemTitle}</strong>
+                      <small>{item.filename || item.id}</small>
+                    </div>
+                    <div className="artifact-review-item-actions">
+                      <button
+                        type="button"
+                        className={decision === "approved" ? "" : "secondary-action"}
+                        onClick={() => setItemDecisions((current) => ({ ...current, [item.id]: "approved" }))}
+                        disabled={disabled}
+                      >
+                        通过
+                      </button>
+                      <button
+                        type="button"
+                        className={decision === "rejected" ? "" : "secondary-action"}
+                        onClick={() => setItemDecisions((current) => ({ ...current, [item.id]: "rejected" }))}
+                        disabled={disabled}
+                      >
+                        退回
+                      </button>
+                    </div>
+                  </div>
+                  {meta.length > 0 ? (
+                    <small className="artifact-review-item-meta">
+                      {meta.map((value) => (
+                        <span key={value}>{value}</span>
+                      ))}
+                    </small>
+                  ) : null}
+                  {itemArtifact && hasArtifactDownload(itemArtifact) ? (
+                    <ArtifactFileCard artifact={itemArtifact} compact />
+                  ) : null}
+                  {decision === "rejected" ? (
+                    <label className="artifact-review-feedback">
+                      <span>该文件退回意见</span>
+                      <textarea
+                        value={itemFeedback[item.id] ?? ""}
+                        rows={3}
+                        placeholder="说明这个文件哪里不合格，例如：女主没有按设定生成单人参考表。"
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setItemFeedback((current) => ({ ...current, [item.id]: value }));
+                        }}
+                        disabled={disabled}
+                      />
+                    </label>
+                  ) : null}
+                </section>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <>
+          {artifacts.length > 1 ? <p>本阶段共 {artifacts.length} 个文件，请按整组产物审核。</p> : null}
+          {artifacts.map((artifact) =>
+            hasArtifactDownload(artifact) ? <ArtifactFileCard key={artifact.id} artifact={artifact} compact /> : null,
+          )}
+          <label className="artifact-review-feedback">
+            <span>退回意见</span>
+            <textarea
+              value={feedback}
+              rows={3}
+              placeholder="说明哪里不合格，例如：角色脸型和服装不一致，重新生成完整 Character Model Sheet。"
+              onChange={(event) => onFeedbackChange(event.currentTarget.value)}
+              disabled={disabled}
+            />
+          </label>
+        </>
       )}
-      <label className="artifact-review-feedback">
-        <span>退回意见</span>
-        <textarea
-          value={feedback}
-          rows={3}
-          placeholder="说明哪里不合格，例如：角色脸型和服装不一致，重新生成完整 Character Model Sheet。"
-          onChange={(event) => onFeedbackChange(event.currentTarget.value)}
-          disabled={disabled}
-        />
-      </label>
       <div className="artifact-review-actions">
         <button type="button" onClick={onApprove} disabled={disabled}>
           确认放行
         </button>
-        <button type="button" className="secondary-action" onClick={onReject} disabled={disabled}>
-          退回重做
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={hasReviewItems ? rejectSelectedItems : () => onReject()}
+          disabled={disabled}
+        >
+          {hasReviewItems ? "退回选中文件" : "退回重做"}
         </button>
       </div>
     </article>
@@ -3277,10 +3444,19 @@ export function RunsPage() {
   });
 
   const rejectArtifactReview = useMutation({
-    mutationFn: ({ approval, feedback }: { approval: ArtifactReviewApproval; feedback: string }) =>
+    mutationFn: ({
+      approval,
+      feedback,
+      rejectedItems,
+    }: {
+      approval: ArtifactReviewApproval;
+      feedback?: string;
+      rejectedItems?: ArtifactReviewRejectedItem[];
+    }) =>
       api.rejectArtifactReview(approval.runId, approval.approvalId, {
         version: approval.version,
-        feedback,
+        ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+        ...(rejectedItems && rejectedItems.length > 0 ? { rejected_items: rejectedItems } : {}),
       }),
     onSuccess: async (run) => {
       setArtifactReviewFeedback("");
@@ -3298,7 +3474,24 @@ export function RunsPage() {
     approveArtifactReview.mutate(approval);
   };
 
-  const rejectArtifactReviewFromCard = (approval: ArtifactReviewApproval) => {
+  const rejectArtifactReviewFromCard = (
+    approval: ArtifactReviewApproval,
+    payload?: ArtifactReviewRejectPayload,
+  ) => {
+    if (approval.reviewItems.length > 0) {
+      const rejectedItems = payload?.rejectedItems ?? [];
+      if (rejectedItems.length === 0) {
+        setSubmitNotice("请先在需要重做的文件上选择“退回”，并填写对应原因。");
+        return;
+      }
+      if (rejectedItems.some((item) => !item.feedback.trim())) {
+        setSubmitNotice("逐文件退回时，每个被退回文件都需要单独填写问题。");
+        return;
+      }
+      setSubmitNotice("已选择退回指定文件，正在提交反馈。");
+      rejectArtifactReview.mutate({ approval, rejectedItems });
+      return;
+    }
     const feedback = artifactReviewFeedback.trim();
     if (!feedback) {
       setSubmitNotice("退回中间产物时需要写明问题，主 Agent 会用这段反馈重新生成。");
@@ -4130,7 +4323,7 @@ export function RunsPage() {
                 feedback={artifactReviewFeedback}
                 onFeedbackChange={setArtifactReviewFeedback}
                 onApprove={() => approveArtifactReviewFromCard(selectedArtifactReviewApproval)}
-                onReject={() => rejectArtifactReviewFromCard(selectedArtifactReviewApproval)}
+                onReject={(payload) => rejectArtifactReviewFromCard(selectedArtifactReviewApproval, payload)}
                 disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
               />
             ) : null}
@@ -4170,7 +4363,9 @@ export function RunsPage() {
                       feedback={artifactReviewFeedback}
                       onFeedbackChange={setArtifactReviewFeedback}
                       onApprove={() => approveArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval)}
-                      onReject={() => rejectArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval)}
+                      onReject={(payload) =>
+                        rejectArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval, payload)
+                      }
                       disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
                     />
                   ) : item.temporaryAgentProposal ? (

@@ -666,6 +666,31 @@ def _artifact_review_packet_payload(
     return {"artifact_review_packet": packet}
 
 
+def _artifact_review_items_payload(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
+    items: list[Mapping[str, JsonValue]] = []
+    seen: set[str] = set()
+    for file_metadata in _file_metadata_values(artifact.content):
+        storage_key = file_metadata.get("storage_key")
+        mime_type = file_metadata.get("mime_type")
+        if type(storage_key) is not str or type(mime_type) is not str:
+            continue
+        key = f"{storage_key}\0{mime_type}"
+        if key in seen:
+            continue
+        seen.add(key)
+        item: dict[str, JsonValue] = {
+            "id": f"{artifact.id}:{len(items) + 1}",
+            "artifact_id": str(artifact.id),
+            "mime_type": mime_type,
+        }
+        for field_name in ("filename", "sha256", "kind", "title"):
+            value = file_metadata.get(field_name)
+            if type(value) is str and value.strip():
+                item[field_name] = value.strip()
+        items.append(item)
+    return tuple(items)
+
+
 def _usable_file_artifacts_payload(artifacts: tuple[Artifact, ...]) -> tuple[Mapping[str, JsonValue], ...]:
     usable: list[Mapping[str, JsonValue]] = []
     seen: set[str] = set()
@@ -1934,7 +1959,46 @@ def _artifact_review_feedback_from_routing(
         stage_id=stage_id,
         artifact_id=artifact_id,
         feedback=feedback.strip(),
+        review_items=_review_feedback_items(raw.get("review_items")),
     )
+
+
+def _review_feedback_items(value: object) -> tuple[Mapping[str, str], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    items: list[Mapping[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id.strip() or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned: dict[str, str] = {"id": item_id.strip()}
+        for field_name in ("artifact_id", "filename", "sha256", "mime_type", "kind", "title", "feedback"):
+            field_value = item.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                cleaned[field_name] = field_value.strip()
+        items.append(cleaned)
+    return tuple(items)
+
+
+def _artifact_review_feedback_text(feedback: _UserArtifactReviewFeedback) -> str:
+    if not feedback.review_items:
+        return feedback.feedback
+    lines = [feedback.feedback, "被退回的具体文件："]
+    for item in feedback.review_items:
+        label = item.get("filename") or item.get("title") or item.get("id") or "review_item"
+        detail_parts = [f"id={item.get('id', '')}"]
+        sha256 = item.get("sha256")
+        if sha256:
+            detail_parts.append(f"sha256={sha256}")
+        item_feedback = item.get("feedback")
+        if item_feedback:
+            detail_parts.append(f"问题={item_feedback}")
+        lines.append(f"- {label}（{'；'.join(detail_parts)}）")
+    return "\n".join(lines)
 
 
 def _step_ids_invalidated_by_review_feedback(
@@ -2360,6 +2424,7 @@ class _UserArtifactReviewFeedback:
     stage_id: str
     artifact_id: str
     feedback: str
+    review_items: tuple[Mapping[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2622,7 +2687,7 @@ class CrewDispatchRuntime:
                         )
                         review_feedback_applied = True
                         user_feedback_by_step[user_feedback.stage_id] = (
-                            user_feedback.feedback
+                            _artifact_review_feedback_text(user_feedback)
                         )
                         for step_id in invalidated:
                             artifact = completed.pop(step_id, None)
@@ -3174,6 +3239,12 @@ class CrewDispatchRuntime:
                                             "producer": result.step.agent,
                                             "requires_user_review": True,
                                             "next_action": "approve_or_revise_artifact",
+                                            "review_items": [
+                                                dict(item)
+                                                for item in _artifact_review_items_payload(
+                                                    result.artifact
+                                                )
+                                            ],
                                         },
                                     )
                                     terminal_item = _Terminal()

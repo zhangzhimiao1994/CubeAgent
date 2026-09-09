@@ -29,6 +29,9 @@ from agent_hub.runtime.crew.adapter import (
     RuntimeExecutionError,
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
+    _artifact_review_feedback_from_routing,
+    _artifact_review_feedback_text,
+    _artifact_review_items_payload,
     _artifact_review_packet_payload,
     _direct_compose_video_arguments,
     _direct_multimedia_generation_prompt,
@@ -2724,6 +2727,84 @@ def test_artifact_review_packet_payload_uses_bounded_preview_without_full_text()
     assert packet["preview"] != original_text
     assert "[truncated:" in packet["preview"]
     assert artifact.content["text"] == original_text
+
+
+def test_artifact_review_items_payload_exposes_each_generated_file_for_review() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="character_designer",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "storage_key": "tenant/run/artifact/male.png",
+                        "mime_type": "image/png",
+                        "filename": "male-lead-model-sheet.png",
+                        "sha256": "a" * 64,
+                        "title": "男主角色参考设定表",
+                    },
+                    {
+                        "storage_key": "tenant/run/artifact/female.png",
+                        "mime_type": "image/png",
+                        "filename": "female-lead-model-sheet.png",
+                        "sha256": "b" * 64,
+                        "title": "女主角色参考设定表",
+                    },
+                ),
+            },
+        },
+    )
+
+    payload = _artifact_review_items_payload(artifact)
+
+    assert payload == (
+        {
+            "id": f"{artifact.id}:1",
+            "artifact_id": str(artifact.id),
+            "mime_type": "image/png",
+            "filename": "male-lead-model-sheet.png",
+            "sha256": "a" * 64,
+            "title": "男主角色参考设定表",
+        },
+        {
+            "id": f"{artifact.id}:2",
+            "artifact_id": str(artifact.id),
+            "mime_type": "image/png",
+            "filename": "female-lead-model-sheet.png",
+            "sha256": "b" * 64,
+            "title": "女主角色参考设定表",
+        },
+    )
+
+
+def test_artifact_review_feedback_text_includes_rejected_file_items() -> None:
+    artifact_id = uuid4()
+    feedback = _artifact_review_feedback_from_routing(
+        {
+            "artifact_review_feedback": {
+                "stage_id": "character_model_sheet",
+                "artifact_id": str(artifact_id),
+                "feedback": "部分角色设定图需要重做。",
+                "review_items": (
+                    {
+                        "id": f"{artifact_id}:2",
+                        "artifact_id": str(artifact_id),
+                        "filename": "female-lead-model-sheet.png",
+                        "sha256": "b" * 64,
+                        "title": "女主角色参考设定表",
+                        "feedback": "女主没有按设定生成单人参考表。",
+                    },
+                ),
+            },
+        }
+    )
+
+    assert feedback is not None
+    text = _artifact_review_feedback_text(feedback)
+    assert "部分角色设定图需要重做" in text
+    assert "female-lead-model-sheet.png" in text
+    assert "女主没有按设定生成单人参考表" in text
 
 
 def test_usable_file_artifacts_payload_exposes_generated_file_handles() -> None:

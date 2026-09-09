@@ -1693,7 +1693,7 @@ export const api = {
   rejectArtifactReview(
     id: string,
     approvalId: string,
-    payload: { version: number; feedback: string },
+    payload: { version: number; feedback?: string; rejected_items?: Array<{ id: string; feedback: string }> },
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/artifact-reviews/${encodeURIComponent(approvalId)}/reject`,

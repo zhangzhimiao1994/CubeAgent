@@ -923,20 +923,25 @@ class RunService:
         approval_id: str,
         version: int,
         feedback: str,
+        review_items: tuple[Mapping[str, str], ...] = (),
     ) -> SubmittedRun:
         del actor_id
         cleaned_approval_id = approval_id.strip()
         if not cleaned_approval_id:
             raise ValueError("artifact review approval id must not be blank")
         cleaned_feedback = feedback.strip()
-        if not cleaned_feedback:
+        cleaned_review_items = _clean_artifact_review_items(review_items)
+        if not cleaned_feedback and not cleaned_review_items:
             raise ValueError("artifact review feedback must not be blank")
+        if not cleaned_feedback:
+            cleaned_feedback = _artifact_review_items_feedback_summary(cleaned_review_items)
         record = await self._repository.reject_artifact_review_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
             approval_id=cleaned_approval_id[:128],
             version=version,
             feedback=cleaned_feedback[:2000],
+            review_items=cleaned_review_items,
         )
         return _submitted(record)
 
@@ -1208,6 +1213,7 @@ class RunService:
                                 "approval_action": event.action,
                                 "approval_stage_id": event.payload.get("stage_id"),
                                 "approval_artifact_id": event.payload.get("artifact_id"),
+                                "approval_review_items": event.payload.get("review_items"),
                             }
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
@@ -1699,6 +1705,32 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         if isinstance(openclaw_proposal, dict)
         else None,
     )
+
+
+def _clean_artifact_review_items(
+    review_items: tuple[Mapping[str, str], ...],
+) -> tuple[dict[str, str], ...]:
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in review_items:
+        item_id = item.get("id", "").strip()
+        feedback = item.get("feedback", "").strip()
+        if not item_id or not feedback or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned.append({"id": item_id[:160], "feedback": feedback[:2000]})
+    return tuple(cleaned)
+
+
+def _artifact_review_items_feedback_summary(
+    review_items: tuple[Mapping[str, str], ...],
+) -> str:
+    parts = [
+        f"{item.get('id', '').strip()}: {item.get('feedback', '').strip()}"
+        for item in review_items
+        if item.get("id", "").strip() and item.get("feedback", "").strip()
+    ]
+    return "；".join(parts)[:2000]
 
 
 def _dedupe_artifacts(*groups: tuple[Artifact, ...]) -> tuple[Artifact, ...]:

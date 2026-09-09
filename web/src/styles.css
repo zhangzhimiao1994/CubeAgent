@@ -2423,6 +2423,56 @@ button.agent-cluster-status:focus-visible {
   margin: 0;
 }
 
+.artifact-review-item-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.artifact-review-item {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.85rem;
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.7rem;
+}
+
+.artifact-review-item-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 0.65rem;
+  justify-content: space-between;
+}
+
+.artifact-review-item-head strong,
+.artifact-review-item-head small {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.artifact-review-item-head small,
+.artifact-review-item-meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.artifact-review-item-actions,
+.artifact-review-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.artifact-review-item-actions {
+  flex: 0 0 auto;
+}
+
+.artifact-review-item-actions button {
+  border-radius: 999px;
+  padding: 0.38rem 0.68rem;
+}
+
 .artifact-review-feedback {
   display: grid;
   gap: 0.4rem;

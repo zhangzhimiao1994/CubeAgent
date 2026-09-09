@@ -4398,6 +4398,103 @@ describe("operational management pages", () => {
     );
   });
 
+  it("lets the user reject selected artifact review files with item feedback", async () => {
+    const user = userEvent.setup();
+    visibleRunListItem = { ...runListItem, status: "waiting_approval" };
+    visibleRunListItems = [visibleRunListItem];
+    visibleRunDetail = {
+      ...runDetail,
+      version: 6,
+      status: "waiting_approval",
+      explicit_details: { ...runDetail.explicit_details, version: "6" },
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 5,
+          kind: "approval.requested",
+          message: "user review required for intermediate artifact files",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "character_designer",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: "artifact_review",
+          decision: null,
+          approval_id: "artifact-review-test",
+          payload: {
+            approval_kind: "runtime_artifact_review",
+            stage_id: "character_model_sheet",
+            artifact_id: "artifact-sheet",
+            producer: "character_designer",
+            review_items: [
+              {
+                id: "artifact-sheet:1",
+                artifact_id: "artifact-sheet",
+                filename: "male-lead-model-sheet.png",
+                title: "男主角色参考设定表",
+                mime_type: "image/png",
+              },
+              {
+                id: "artifact-sheet:2",
+                artifact_id: "artifact-sheet",
+                filename: "female-lead-model-sheet.png",
+                title: "女主角色参考设定表",
+                mime_type: "image/png",
+              },
+            ],
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-sheet:1",
+          kind: "image",
+          title: "男主角色参考设定表",
+          filename: "male-lead-model-sheet.png",
+          mime_type: "image/png",
+          download_url: "/files/male-lead-model-sheet.png",
+        },
+        {
+          id: "artifact-sheet:2",
+          kind: "image",
+          title: "女主角色参考设定表",
+          filename: "female-lead-model-sheet.png",
+          mime_type: "image/png",
+          download_url: "/files/female-lead-model-sheet.png",
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
+
+    const reviewCard = screen.getByLabelText("中间产物审核");
+    const maleItem = within(reviewCard).getByLabelText("审核 男主角色参考设定表");
+    const femaleItem = within(reviewCard).getByLabelText("审核 女主角色参考设定表");
+    expect(within(maleItem).getAllByText("male-lead-model-sheet.png").length).toBeGreaterThan(0);
+    expect(within(femaleItem).getAllByText("female-lead-model-sheet.png").length).toBeGreaterThan(0);
+
+    await user.click(within(femaleItem).getByRole("button", { name: "退回" }));
+    await user.type(within(femaleItem).getByPlaceholderText(/说明这个文件哪里不合格/), "女主没有按设定生成单人参考表。");
+    await user.click(within(reviewCard).getByRole("button", { name: "退回选中文件" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/artifact-reviews/artifact-review-test/reject`)).toMatchObject({
+        method: "POST",
+        body: {
+          version: 6,
+          rejected_items: [
+            {
+              id: "artifact-sheet:2",
+              feedback: "女主没有按设定生成单人参考表。",
+            },
+          ],
+        },
+      }),
+    );
+  });
+
   it("does not open the temporary-agent detail when keyboard-activating card actions", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);

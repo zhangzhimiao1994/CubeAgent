@@ -490,6 +490,7 @@ class RunRepository:
                         "approval_action",
                         "approval_stage_id",
                         "approval_artifact_id",
+                        "approval_review_items",
                         "approved_artifacts",
                         "artifact_review_feedback",
                     }
@@ -537,6 +538,7 @@ class RunRepository:
         approval_id: str,
         version: int,
         feedback: str,
+        review_items: tuple[Mapping[str, str], ...] = (),
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -562,11 +564,17 @@ class RunRepository:
                 raw_plan_rejected,
                 routing_decision.get("rejected_artifacts"),
             )
-            review_feedback = {
+            rejected_review_items = _artifact_review_item_rejections(
+                review_items,
+                routing_decision.get("approval_review_items"),
+            )
+            review_feedback: dict[str, object] = {
                 "stage_id": stage_id,
                 "artifact_id": artifact_id,
                 "feedback": feedback,
             }
+            if rejected_review_items:
+                review_feedback["review_items"] = rejected_review_items
             rejected_artifacts.append(review_feedback)
             rejected_artifacts = _merged_rejected_artifact_review_entries(rejected_artifacts)
             updated_routing = {
@@ -581,6 +589,7 @@ class RunRepository:
                         "approval_action",
                         "approval_stage_id",
                         "approval_artifact_id",
+                        "approval_review_items",
                         "rejected_artifacts",
                     }
                 },
@@ -1246,9 +1255,9 @@ def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
     return entries
 
 
-def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, tuple[tuple[tuple[str, str], ...], ...]]] = set()
     for value in values:
         if not isinstance(value, list):
             continue
@@ -1264,12 +1273,78 @@ def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, 
                 or not isinstance(feedback, str)
             ):
                 continue
-            key = (stage_id, artifact_id, feedback)
+            review_items = _artifact_review_items(item.get("review_items"))
+            key = (
+                stage_id,
+                artifact_id,
+                feedback,
+                tuple(
+                    tuple(sorted(review_item.items()))
+                    for review_item in review_items
+                ),
+            )
             if key in seen:
                 continue
             seen.add(key)
-            entries.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
+            entry: dict[str, object] = {
+                "stage_id": stage_id,
+                "artifact_id": artifact_id,
+                "feedback": feedback,
+            }
+            if review_items:
+                entry["review_items"] = review_items
+            entries.append(entry)
     return entries
+
+
+def _artifact_review_item_rejections(
+    review_items: tuple[Mapping[str, str], ...],
+    allowed_items: object,
+) -> list[dict[str, str]]:
+    if not review_items:
+        return []
+    allowed = {item["id"]: item for item in _artifact_review_items(allowed_items)}
+    if not allowed:
+        raise RunConflict("artifact review item payload is unavailable")
+    rejected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in review_items:
+        item_id = item.get("id")
+        feedback = item.get("feedback")
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise RunConflict("artifact review item id is invalid")
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise RunConflict("artifact review item feedback is invalid")
+        item_id = item_id.strip()
+        if item_id in seen:
+            continue
+        allowed_item = allowed.get(item_id)
+        if allowed_item is None:
+            raise RunConflict("artifact review item is not part of this approval")
+        seen.add(item_id)
+        rejected.append({**allowed_item, "feedback": feedback.strip()})
+    return rejected
+
+
+def _artifact_review_items(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list | tuple):
+        return []
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id.strip() or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned: dict[str, str] = {"id": item_id.strip()}
+        for field_name in ("artifact_id", "filename", "sha256", "mime_type", "kind", "title", "feedback"):
+            field_value = item.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                cleaned[field_name] = field_value.strip()
+        items.append(cleaned)
+    return items
 
 
 def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:

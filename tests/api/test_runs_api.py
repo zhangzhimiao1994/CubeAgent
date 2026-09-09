@@ -313,8 +313,9 @@ class StubRunService:
         approval_id: str,
         version: int,
         feedback: str,
+        review_items: tuple[dict[str, str], ...] = (),
     ) -> SubmittedRun:
-        del actor_id, approval_id, version, feedback
+        del actor_id, approval_id, version, feedback, review_items
         return SubmittedRun(
             id=run_id,
             tenant_id=tenant_id,
@@ -1003,6 +1004,27 @@ def test_reject_artifact_review_accepts_feedback_and_queues_waiting_run() -> Non
         f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/reject",
         headers=bearer(),
         json={"version": 3, "feedback": "角色形象不一致，退回重新生成。"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_reject_artifact_review_accepts_file_level_feedback() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/reject",
+        headers=bearer(),
+        json={
+            "version": 3,
+            "rejected_items": [
+                {"id": "artifact-sheet:1", "feedback": "男主定妆图和角色设定不一致。"},
+                {"id": "artifact-sheet:2", "feedback": "女主需要单独生成参考设定表。"},
+            ],
+        },
     )
 
     assert response.status_code == 202

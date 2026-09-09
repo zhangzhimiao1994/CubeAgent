@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -249,6 +250,7 @@ class FakeRepository:
         approval_id: str,
         version: int,
         feedback: str,
+        review_items: tuple[dict[str, str], ...] = (),
     ) -> RunRecord:
         record = self.records.get(run_id)
         if record is None or record.tenant_id != tenant_id:
@@ -272,7 +274,18 @@ class FakeRepository:
             plan.get("rejected_artifacts") if plan is not None else None,
             decision.get("rejected_artifacts"),
         )
-        rejected.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
+        review_feedback: dict[str, object] = {
+            "stage_id": stage_id,
+            "artifact_id": artifact_id,
+            "feedback": feedback,
+        }
+        if review_items:
+            allowed_items = _fake_artifact_review_items(decision.get("approval_review_items"))
+            review_feedback["review_items"] = [
+                {**allowed_items.get(item["id"], {}), **item}
+                for item in review_items
+            ]
+        rejected.append(review_feedback)
         updated_decision = {
             key: value
             for key, value in decision.items()
@@ -287,11 +300,7 @@ class FakeRepository:
                 "rejected_artifacts",
             }
         }
-        updated_decision["artifact_review_feedback"] = {
-            "stage_id": stage_id,
-            "artifact_id": artifact_id,
-            "feedback": feedback,
-        }
+        updated_decision["artifact_review_feedback"] = review_feedback
         if plan is None:
             updated_decision["rejected_artifacts"] = rejected
         else:
@@ -336,8 +345,8 @@ def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
     return entries
 
 
-def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
+def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
     seen: set[tuple[str, str, str]] = set()
     for value in values:
         if not isinstance(value, list):
@@ -360,6 +369,25 @@ def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, 
             seen.add(key)
             entries.append({"stage_id": stage_id, "artifact_id": artifact_id, "feedback": feedback})
     return entries
+
+
+def _fake_artifact_review_items(value: object) -> dict[str, dict[str, str]]:
+    if not isinstance(value, list | tuple):
+        return {}
+    items: dict[str, dict[str, str]] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id.strip():
+            continue
+        cleaned: dict[str, str] = {"id": item_id.strip()}
+        for field_name in ("artifact_id", "filename", "sha256", "mime_type", "kind", "title"):
+            value = item.get(field_name)
+            if isinstance(value, str) and value.strip():
+                cleaned[field_name] = value.strip()
+        items[cleaned["id"]] = cleaned
+    return items
 
 
 class FakeTemporaryAgentPolicy:
@@ -1350,6 +1378,88 @@ async def test_user_can_reject_runtime_artifact_review_with_feedback_and_continu
     }
     assert "approval_id" not in routing
     assert "approval_kind" not in routing
+
+
+@pytest.mark.asyncio
+async def test_user_can_reject_specific_artifact_review_items_with_feedback() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    run_id = uuid4()
+    repository.records[run_id] = RunRecord(
+        id=run_id,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="生成男女主角色参考设定表",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.WAITING_APPROVAL,
+        version=4,
+        created_at=datetime.now(UTC),
+        routing_decision={
+            "reason": "runtime_artifact_review_required",
+            "approval_kind": "runtime_artifact_review",
+            "approval_id": "artifact-review-test",
+            "approval_action": "artifact_review",
+            "approval_stage_id": "character_model_sheet",
+            "approval_artifact_id": "artifact-001",
+            "approval_review_items": [
+                {
+                    "id": "artifact-001:1",
+                    "artifact_id": "artifact-001",
+                    "filename": "female-lead.png",
+                    "sha256": "a" * 64,
+                },
+                {
+                    "id": "artifact-001:2",
+                    "artifact_id": "artifact-001",
+                    "filename": "male-lead.png",
+                    "sha256": "b" * 64,
+                },
+            ],
+        },
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    rejected = await service.reject_artifact_review(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        run_id=run_id,
+        approval_id="artifact-review-test",
+        version=4,
+        feedback="男主参考图不合格，重新生成男主。",
+        review_items=(
+            {
+                "id": "artifact-001:2",
+                "artifact_id": "artifact-001",
+                "filename": "male-lead.png",
+                "sha256": "b" * 64,
+                "feedback": "主图和表情不像同一个人。",
+            },
+        ),
+    )
+
+    assert rejected.status is RunStatus.QUEUED
+    routing = repository.records[run_id].routing_decision
+    assert routing is not None
+    assert routing["artifact_review_feedback"] == {
+        "stage_id": "character_model_sheet",
+        "artifact_id": "artifact-001",
+        "feedback": "男主参考图不合格，重新生成男主。",
+        "review_items": [
+            {
+                "id": "artifact-001:2",
+                "artifact_id": "artifact-001",
+                "filename": "male-lead.png",
+                "sha256": "b" * 64,
+                "feedback": "主图和表情不像同一个人。",
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,7 @@ from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.api.dependencies import require_permission
@@ -132,6 +132,7 @@ class RunServiceProtocol(Protocol):
         approval_id: str,
         version: int,
         feedback: str,
+        review_items: tuple[dict[str, str], ...] = (),
     ) -> SubmittedRun: ...
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
@@ -202,9 +203,29 @@ class ApproveArtifactReviewRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class RejectArtifactReviewItemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=160)
+    feedback: str = Field(min_length=1, max_length=2000)
+
+    def to_payload(self) -> dict[str, str]:
+        return {"id": self.id, "feedback": self.feedback}
+
+
 class RejectArtifactReviewRequest(BaseModel):
     version: int = Field(ge=1)
-    feedback: str = Field(min_length=1, max_length=2000)
+    feedback: str | None = Field(default=None, min_length=1, max_length=2000)
+    rejected_items: tuple[RejectArtifactReviewItemRequest, ...] = Field(
+        default=(),
+        max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def feedback_or_items(self) -> RejectArtifactReviewRequest:
+        if self.feedback is None and not self.rejected_items:
+            raise ValueError("artifact review rejection requires feedback or rejected_items")
+        return self
 
 
 class SubmittedRunResponse(BaseModel):
@@ -964,7 +985,8 @@ async def reject_artifact_review(
             run_id=run_id,
             approval_id=approval_id,
             version=body.version,
-            feedback=body.feedback,
+            feedback=body.feedback or "",
+            review_items=tuple(item.to_payload() for item in body.rejected_items),
         )
     except RunNotFound as error:
         raise _run_not_found() from error
