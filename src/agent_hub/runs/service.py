@@ -2710,6 +2710,10 @@ _ARTIFACT_DELIVERY_TERMS = (
     "封面",
     "设定板",
     "角色参考设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
     "角色设定表",
     "设定表",
     "概念图",
@@ -2799,6 +2803,28 @@ _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS = (
     "已有",
     "现有",
 )
+_MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS = (
+    "from the previous",
+    "previous script",
+    "existing script",
+    "above script",
+    "earlier script",
+    "the script above",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+    "这个剧本",
+    "这个脚本",
+    "这段剧本",
+    "这段脚本",
+    "该剧本",
+    "该脚本",
+    "本剧本",
+    "本脚本",
+    "本会话",
+)
 _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
     "character model sheet",
     "model sheet",
@@ -2809,6 +2835,10 @@ _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
     "final video",
     "角色参考设定表",
     "角色设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
     "设定板",
     "服装设定",
     "服装设定板",
@@ -2823,22 +2853,43 @@ _MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
 
 def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
     text = message.casefold()
-    if not _is_media_pipeline_script_authoring_request(text):
-        return None
     if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
         return None
-    plan_id = f"media-plan-{uuid4().hex}"
+    if _is_media_pipeline_script_authoring_request(text):
+        return _media_pipeline_plan(
+            source="script_request",
+            script_status="completed",
+            summary=(
+                "长期多媒体生产计划：剧本完成后，可按需继续生成角色参考设定表、服装设定板、"
+                "场景道具资产、分镜、单镜头视频、剪辑决策表和最终成片。"
+            ),
+        )
+    if _is_unresolved_media_pipeline_script_reference_request(text):
+        return _media_pipeline_plan(
+            source="unresolved_script_reference",
+            script_status="planned",
+            summary=(
+                "多媒体请求引用剧本但未指向可确认的已有剧本；先补齐剧本，再生成角色参考设定表、"
+                "定妆参考图、分镜或成片。"
+            ),
+        )
+    return None
+
+
+def _media_pipeline_plan(
+    *,
+    source: str,
+    script_status: str,
+    summary: str,
+) -> dict[str, object]:
     return {
-        "plan_id": plan_id,
+        "plan_id": f"media-plan-{uuid4().hex}",
         "status": "planned",
-        "source": "script_request",
-        "summary": (
-            "长期多媒体生产计划：剧本完成后，可按需继续生成角色参考设定表、服装设定板、"
-            "场景道具资产、分镜、单镜头视频、剪辑决策表和最终成片。"
-        ),
+        "source": source,
+        "summary": summary,
         "execution_slots": [],
         "stages": [
-            {"id": "script", "status": "completed", "requires_user_review": False},
+            {"id": "script", "status": script_status, "requires_user_review": False},
             {
                 "id": "character_model_sheet",
                 "status": "planned",
@@ -2865,6 +2916,20 @@ def _is_media_pipeline_script_authoring_request(text: str) -> bool:
             continue
         if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS):
             return True
+    return False
+
+
+def _is_unresolved_media_pipeline_script_reference_request(text: str) -> bool:
+    for clause in _split_media_pipeline_clauses(text):
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if not any(term in clause for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+            continue
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS):
+            continue
+        if any(term in clause for term in _MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS):
+            continue
+        return True
     return False
 
 

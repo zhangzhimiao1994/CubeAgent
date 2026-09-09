@@ -281,6 +281,39 @@ async def test_character_sheet_followup_from_script_context_does_not_create_medi
     assert "media_pipeline_plan" not in routing
 
 
+async def test_character_makeup_reference_without_concrete_script_records_script_first_plan() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="根据剧本为每个角色生成定妆参考图。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-character-makeup-reference",
+        idempotency_key="idem-character-makeup-reference",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    plan = routing.get("media_pipeline_plan")
+    assert isinstance(plan, dict)
+    assert plan["source"] == "unresolved_script_reference"
+    assert [stage["id"] for stage in plan["stages"][:2]] == ["script", "character_model_sheet"]
+    assert plan["stages"][0]["status"] == "planned"
+    assert plan["stages"][1]["status"] == "planned"
+
+
 async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()

@@ -397,6 +397,24 @@ def test_character_sheet_followup_with_negated_video_routes_to_media_generator_o
     assert [role.id for role in plan.roles] == ["multimedia_generator"]
 
 
+def test_unresolved_script_character_makeup_reference_generates_script_before_image() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="根据剧本为每个角色生成定妆参考图。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "video_compositor" not in role_ids
+
+
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

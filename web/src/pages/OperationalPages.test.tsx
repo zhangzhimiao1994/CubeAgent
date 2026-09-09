@@ -3820,6 +3820,94 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("artifact.created")).toBeNull();
   });
 
+  it("summarizes discussion speeches on the discussion activity card", async () => {
+    const user = userEvent.setup();
+    const discussionRunDetail: RunDetail = {
+      ...runDetail,
+      mode: "hybrid",
+      events: [
+        {
+          sequence: 1,
+          kind: "discussion.started",
+          message: "discussion.started",
+          created_at: "2026-08-07T00:00:00Z",
+          actor: "moderator",
+          participants: ["moderator", "domain_expert", "skeptic"],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {},
+        },
+        {
+          sequence: 2,
+          kind: "message.created",
+          message: "教程专家建议先写脚本，再为每个角色生成单人角色参考设定表。",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "domain_expert",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            role_message: "教程专家建议先写脚本，再为每个角色生成单人角色参考设定表。",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "message.created",
+          message: "质疑审查员指出缺少脚本时不能直接判失败，应先补齐脚本产物。",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "skeptic",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            role_message: "质疑审查员指出缺少脚本时不能直接判失败，应先补齐脚本产物。",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "discussion.completed",
+          message: "讨论完成。",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "moderator",
+          participants: ["moderator", "domain_expert", "skeptic"],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: "revise",
+          payload: {
+            summary: "需要先补脚本，再生成每个角色的单人角色参考设定表。",
+          },
+        },
+      ],
+      artifacts: [],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "moderator,domain_expert,skeptic",
+      },
+    };
+    visibleRunDetail = discussionRunDetail;
+    visibleConversationRuns = [discussionRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    await user.click(within(currentProcessArea()).getByRole("button", { name: /查看 Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+
+    expect(within(drawer).getAllByText(/发言摘要/).length).toBeGreaterThan(0);
+    await user.click(within(drawer).getByRole("button", { name: /^讨论主持人/ }));
+    expect(within(drawer).getAllByText(/领域专家：教程专家建议先写脚本/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/质疑审查员：质疑审查员指出缺少脚本/).length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("参与者")).toBeNull();
+  });
+
 
   it("opens conversation history as a right drawer", async () => {
     const user = userEvent.setup();

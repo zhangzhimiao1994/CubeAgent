@@ -216,6 +216,25 @@ class RolePlanner:
         else:
             role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
+        if request.mode is not TaskMode.DISCUSS and _is_script_first_media_generation_request(
+            request.task
+        ):
+            role_specs = tuple(
+                spec
+                for spec in catalog_specs
+                if spec[0]
+                in {
+                    "copywriter",
+                    "multimedia_generator",
+                }
+            )
+            roles = tuple(_assignment(spec, request) for spec in role_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
         if request.mode is not TaskMode.DISCUSS and _is_standalone_multimedia_generation_request(
             request.task
         ):
@@ -1251,6 +1270,10 @@ _MULTIMEDIA_MEDIA_TERMS = (
     "设定图",
     "设定板",
     "角色参考设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
     "角色定妆照",
     "角色设定表",
     "角色设定",
@@ -1862,6 +1885,10 @@ _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
     "角色参考设定表",
     "角色定妆照",
     "角色设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
     "定妆照",
     "设定板",
     "服装设定",
@@ -1882,6 +1909,53 @@ def _is_deferred_media_pipeline_request(task: str) -> bool:
         and any(marker in normalized for marker in _DEFERRED_MEDIA_PIPELINE_MARKERS)
         and any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS)
     )
+
+
+_SCRIPT_MEDIA_REFERENCE_TERMS = (
+    "based on",
+    "from",
+    "基于",
+    "根据",
+)
+_CONCRETE_SCRIPT_CONTEXT_TERMS = (
+    "from the previous",
+    "previous script",
+    "existing script",
+    "above script",
+    "earlier script",
+    "the script above",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+    "这个剧本",
+    "这个脚本",
+    "这段剧本",
+    "这段脚本",
+    "该剧本",
+    "该脚本",
+    "本剧本",
+    "本脚本",
+    "本会话",
+)
+
+
+def _is_script_first_media_generation_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _has_generation_negation(normalized):
+        return False
+    for clause in _split_semantic_clauses(normalized):
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+            continue
+        if not any(term in clause for term in _SCRIPT_MEDIA_REFERENCE_TERMS):
+            continue
+        if any(term in clause for term in _CONCRETE_SCRIPT_CONTEXT_TERMS):
+            continue
+        return True
+    return False
 
 
 def _is_video_composition_request(task: str) -> bool:

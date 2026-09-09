@@ -183,6 +183,8 @@ const FALLBACK_AGENT_NAMES: Record<string, string> = {
   final_synthesizer: "最终汇总员",
   decision_recorder: "裁决记录员",
   decision_maker: "裁决助手",
+  cost_estimator: "成本评估员",
+  user_advocate: "用户立场代表",
   researcher: "研究员",
   summarizer: "总结助手",
   operator: "执行员",
@@ -1396,6 +1398,68 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function eventParticipantIds(event: RunEvent) {
+  const payloadParticipants = event.payload.participants;
+  const ids = [...event.participants];
+  if (Array.isArray(payloadParticipants)) {
+    payloadParticipants.forEach((item) => {
+      if (typeof item === "string" && item.trim()) ids.push(item.trim());
+    });
+  }
+  return Array.from(new Set(ids));
+}
+
+function sameDiscussionParticipants(left: RunEvent, right: RunEvent) {
+  const leftIds = eventParticipantIds(left);
+  const rightIds = eventParticipantIds(right);
+  if (leftIds.length === 0 || rightIds.length === 0) return true;
+  return leftIds.some((id) => rightIds.includes(id));
+}
+
+function discussionWindowBounds(event: RunEvent, events: RunEvent[]) {
+  if (event.kind === "discussion.started") {
+    const completed = events.find(
+      (candidate) =>
+        candidate.kind === "discussion.completed" &&
+        candidate.sequence > event.sequence &&
+        sameDiscussionParticipants(event, candidate),
+    );
+    return { start: event.sequence, end: completed?.sequence ?? Number.POSITIVE_INFINITY };
+  }
+  if (event.kind === "discussion.completed") {
+    const started = [...events]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.kind === "discussion.started" &&
+          candidate.sequence < event.sequence &&
+          sameDiscussionParticipants(event, candidate),
+      );
+    return { start: started?.sequence ?? Number.NEGATIVE_INFINITY, end: event.sequence };
+  }
+  return null;
+}
+
+function discussionSpeechSummary(event: RunEvent, events: RunEvent[], agentNames: Map<string, string>) {
+  const bounds = discussionWindowBounds(event, events);
+  if (!bounds) return "";
+  const participants = new Set(eventParticipantIds(event));
+  const speeches = events
+    .filter((candidate) => candidate.kind === "message.created")
+    .filter((candidate) => candidate.sequence > bounds.start && candidate.sequence < bounds.end)
+    .filter((candidate) => !participants.size || (candidate.actor ? participants.has(candidate.actor) : false))
+    .map((candidate) => {
+      const actor = candidate.actor ? displayAgentName(candidate.actor, agentNames) : "参与者";
+      const value =
+        formatEventPayloadValue(candidate.payload.role_message) ||
+        (candidate.message && candidate.message !== candidate.kind ? candidate.message : "");
+      return value ? `${actor}：${conciseProcessText(value, "给出发言")}` : "";
+    })
+    .filter(Boolean);
+  if (speeches.length === 0) return "";
+  return `发言摘要：${speeches.slice(0, 4).join("；")}${speeches.length > 4 ? `；另有 ${speeches.length - 4} 条发言` : ""}`;
+}
+
 function discussionCompactSummary(event: RunEvent, agentNames: Map<string, string>) {
   const conclusionCount = formatEventPayloadValue(event.payload.result) || formatEventPayloadValue(event.payload.conclusion) ? 1 : 0;
   const decisionCount = eventDecisionSignal(event) ? 1 : 0;
@@ -1412,6 +1476,7 @@ function eventSummaryText(
   event: RunDetail["events"][number],
   agentNames: Map<string, string>,
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
+  events: RunDetail["events"] = [],
 ) {
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
@@ -1455,7 +1520,8 @@ function eventSummaryText(
     return `${subject} 输出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
   }
   if (event.kind === "discussion.started") {
-    return `${participants || "多角色"} 开始讨论`;
+    const speechSummary = discussionSpeechSummary(event, events, agentNames);
+    return speechSummary || `${participants || "多角色"} 开始讨论`;
   }
   if (event.kind === "discussion.completed") {
     return discussionCompactSummary(event, agentNames);
@@ -1547,7 +1613,7 @@ function processItemsForEvent(
   const baseItem: ProcessDetailTarget = {
     id: `${detail.id}-event-${event.sequence}-${index}`,
     title: displayEventTitle(event, agentNames),
-    message: eventSummaryText(event, agentNames, artifact),
+    message: eventSummaryText(event, agentNames, artifact, detail.events),
     badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,

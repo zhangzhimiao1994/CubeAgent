@@ -260,6 +260,7 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
             "根据这个剧情生成 Character Model Sheet 形式的角色参考设定表，"
             "只需要图片，不要生成视频成片。"
         ),
+        "根据剧本为每个角色生成定妆参考图。",
         "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
     ],
 )
