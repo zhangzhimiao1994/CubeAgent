@@ -1108,6 +1108,8 @@ _CHARACTER_MODEL_SHEET_PROMPT_TERMS = frozenset(
     (
         "character model sheet",
         "角色参考设定表",
+        "角色参考图",
+        "人物参考图",
         "角色设定表",
         "角色设定图",
         "角色设定板",
@@ -1323,11 +1325,29 @@ def _direct_multimedia_generation_prompt(
 
 
 def _is_character_model_sheet_prompt(request: str, task: str) -> bool:
-    text = f"{request} {task}".casefold()
-    return any(term in text for term in _CHARACTER_MODEL_SHEET_PROMPT_TERMS)
+    text = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    if any(term in text for term in _CHARACTER_MODEL_SHEET_PROMPT_TERMS):
+        return True
+    has_character_scope = any(
+        term in text
+        for term in (
+            "各个角色",
+            "每个角色",
+            "每个人物",
+            "各人物",
+            "角色",
+            "人物",
+        )
+    )
+    has_reference_image = any(term in text for term in ("参考图", "参考图片", "定妆图", "设定图"))
+    return has_character_scope and has_reference_image
 
 
-def _character_model_sheet_targets(request: str, task: str) -> tuple[str, ...]:
+def _character_model_sheet_targets(
+    request: str,
+    task: str,
+    sources: tuple[Artifact, ...] = (),
+) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
     if any(term in normalized for term in ("男女主", "男主女主", "male and female leads")):
         return ("男主", "女主")
@@ -1338,7 +1358,65 @@ def _character_model_sheet_targets(request: str, task: str) -> tuple[str, ...]:
     ):
         if any(term in normalized for term in terms):
             targets.append(target)
+    if _requests_each_character_reference(normalized):
+        targets.extend(_character_targets_from_sources(sources))
     return tuple(dict.fromkeys(targets))
+
+
+def _requests_each_character_reference(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "各个角色",
+            "每个角色",
+            "每一位角色",
+            "每个人物",
+            "各人物",
+            "全部角色",
+            "所有角色",
+        )
+    )
+
+
+_CHARACTER_SOURCE_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s*|[-*]\s*)?"
+    r"(?P<label>"
+    r"(?:男主|女主|男主人公|女主人公|男主角|女主角|男二|女二|反派|闺蜜|助攻|配角|主角)"
+    r"(?:$|[：:（(\s][^。\n]{0,48})"
+    r")"
+)
+
+
+def _character_targets_from_sources(sources: tuple[Artifact, ...]) -> tuple[str, ...]:
+    targets: list[str] = []
+    for artifact in sources[:8]:
+        preview = _artifact_text_preview(artifact, max_bytes=12_000)
+        if not preview:
+            continue
+        for line in preview.splitlines():
+            label = _character_target_label_from_source_line(line)
+            if label is None:
+                continue
+            targets.append(label)
+            if len(targets) >= 8:
+                return tuple(dict.fromkeys(targets))
+    return tuple(dict.fromkeys(targets))
+
+
+def _character_target_label_from_source_line(line: str) -> str | None:
+    cleaned = unicodedata.normalize("NFKC", line).strip()
+    cleaned = re.sub(r"^[>| \t]*", "", cleaned)
+    cleaned = re.sub(r"^\d+[.、]\s*", "", cleaned)
+    cleaned = cleaned.replace("**", "").strip()
+    match = _CHARACTER_SOURCE_HEADING.match(cleaned)
+    if match is None:
+        return None
+    label = match.group("label").strip(" ：:-—")
+    label = re.split(r"[（(]", label, maxsplit=1)[0].strip()
+    label = re.split(r"\s{2,}|[，,。；;]", label, maxsplit=1)[0].strip()
+    if not label or len(label) > 32:
+        return None
+    return label
 
 
 def _character_target_source_excerpt(target: str, sources: tuple[Artifact, ...]) -> str:
@@ -1461,7 +1539,7 @@ def _direct_multimedia_artifact_prompts(
         return ()
     if _is_multi_character_group_image_request(context.request, step.task):
         return ()
-    targets = _character_model_sheet_targets(context.request, step.task)
+    targets = _character_model_sheet_targets(context.request, step.task, sources)
     if len(targets) <= 1:
         return ()
     return tuple(

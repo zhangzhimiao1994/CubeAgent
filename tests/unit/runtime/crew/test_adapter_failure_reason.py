@@ -946,6 +946,72 @@ async def test_multimedia_generator_direct_character_design_splits_gender_lead_p
         assert "全写实" in prompt_text
 
 
+async def test_multimedia_generator_direct_person_reference_splits_each_script_role() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "### 主角人设构建\n\n"
+                "## 女主：苏念（26岁）\n"
+                "- 职业：广告公司资深文案\n"
+                "- 外貌：黑长直，浅粉针织衫，温柔但有边界感。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 职业：品牌公司创始人\n"
+                "- 外貌：短黑发，灰色西装，冷静克制。\n\n"
+                "## 闺蜜：林小鹿（25岁）\n"
+                "- 职业：咖啡店主理人\n"
+                "- 外貌：短发，牛仔外套，活泼机灵。"
+            )
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="根据剧本生成各个角色的人物参考图和分镜图",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 3
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 3
+    assert "唯一目标角色：女主" in cast(str, artifact_prompts[0])
+    assert "苏念" in cast(str, artifact_prompts[0])
+    assert "浅粉针织衫" in cast(str, artifact_prompts[0])
+    assert "唯一目标角色：男主" in cast(str, artifact_prompts[1])
+    assert "陆沉" in cast(str, artifact_prompts[1])
+    assert "灰色西装" in cast(str, artifact_prompts[1])
+    assert "唯一目标角色：闺蜜" in cast(str, artifact_prompts[2])
+    assert "林小鹿" in cast(str, artifact_prompts[2])
+    assert "牛仔外套" in cast(str, artifact_prompts[2])
+    for prompt in artifact_prompts:
+        prompt_text = cast(str, prompt)
+        assert "一张图只包含一个角色" in prompt_text
+        assert "不要混入其他角色设定" in prompt_text
+        assert "不要只输出头像或单张主图" in prompt_text
+
+
 async def test_multimedia_generator_direct_gender_lead_group_photo_keeps_single_artifact() -> None:
     class FailingTextGateway:
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
