@@ -216,6 +216,13 @@ class HybridRuntime:
                         and _has_later_synthesis_stage(stages, stage_index)
                         and not _is_negative_discussion_consensus_failure(failure_reason)
                     ):
+                        yield _discussion_fallback_summary_event(
+                            context,
+                            sequence,
+                            child=child,
+                            failure_reason=failure_reason,
+                        )
+                        sequence += 1
                         yield RunEvent(
                             kind=EventKind.STEP_FAILED,
                             sequence=sequence,
@@ -544,6 +551,8 @@ def _is_negative_discussion_consensus_failure(failure_reason: str) -> bool:
 
 
 def _is_forwardable_child_event(event: RunEvent) -> bool:
+    if event.kind == "discussion.completed":
+        return True
     return event.kind in {
         EventKind.STEP_STARTED,
         EventKind.STEP_COMPLETED,
@@ -571,6 +580,33 @@ def _renumber_child_event(
         if not event.inputs:
             updates["inputs"] = inputs
     return event.model_copy(update=updates)
+
+
+def _discussion_fallback_summary_event(
+    context: TaskContext,
+    sequence: int,
+    *,
+    child: ChildRuntime,
+    failure_reason: str,
+) -> RunEvent:
+    participants = getattr(child, "participant_ids", ("moderator", "reviewer"))
+    if not isinstance(participants, tuple) or not participants:
+        participants = ("moderator", "reviewer")
+    summary = (
+        "讨论阶段未能完成：讨论模型调用失败，未产生完整多方发言。"
+        "系统已保留前置执行产物，并继续进入后续综合/执行阶段。"
+    )
+    return RunEvent(
+        kind="discussion.completed",
+        sequence=sequence,
+        run_id=context.run_id,
+        payload={
+            "participants": tuple(str(participant) for participant in participants[:8]),
+            "summary": summary,
+            "reason": failure_reason,
+            "fallback_policy": "continue_to_synthesis",
+        },
+    )
 
 
 def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:

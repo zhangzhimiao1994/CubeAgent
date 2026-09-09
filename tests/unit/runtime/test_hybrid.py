@@ -156,6 +156,27 @@ class CompletedReasonRuntime(MultiArtifactRuntime):
         )
 
 
+class DiscussionSummaryRuntime(MultiArtifactRuntime):
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        yield RunEvent(
+            kind="discussion.completed",
+            sequence=1,
+            run_id=context.run_id,
+            payload={
+                "participants": ("moderator", "skeptic"),
+                "summary": "主持人摘要：保留短剧结构，补充角色动机。",
+                "reason": "sufficient_discussion",
+            },
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="explicit_completion",
+        )
+
+
 class SequencedCompletedReasonRuntime:
     def __init__(
         self,
@@ -396,6 +417,78 @@ async def test_hybrid_runtime_synthesizes_when_discussion_gateway_fails_after_di
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_emits_readable_discussion_summary_when_discussion_gateway_fails() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    final_output = artifact("main", "answer")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        FailingRuntime(
+            TaskMode.DISCUSS,
+            "model gateway failed: model transport failed (logical_models=deepseek; deployments=deepseek_1)",
+        ),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并讨论审查。",
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+
+    assert completed.actor is None
+    assert "讨论阶段未能完成" in cast(str, completed.payload["summary"])
+    assert completed.payload["reason"] == (
+        "hybrid discuss failed: model gateway failed: model transport failed "
+        "(logical_models=deepseek; deployments=deepseek_1)"
+    )
+    assert completed.payload["fallback_policy"] == "continue_to_synthesis"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_forwards_discussion_completed_summary() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    final_output = artifact("main", "answer")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        DiscussionSummaryRuntime(TaskMode.DISCUSS, ()),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并讨论审查。",
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+
+    assert completed.payload["summary"] == "主持人摘要：保留短剧结构，补充角色动机。"
+    assert completed.payload["participants"] == ("moderator", "skeptic")
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == final_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.asyncio

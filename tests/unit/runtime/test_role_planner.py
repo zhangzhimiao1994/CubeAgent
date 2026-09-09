@@ -306,6 +306,24 @@ def test_final_video_request_with_missing_shots_generates_then_composes() -> Non
     assert "video_editor" not in role_ids
 
 
+def test_reference_locked_video_comparison_generates_and_composes_two_versions() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成两种方式的视频对比：一版带参考图锁定人物，一版不带参考图，然后剪辑成可下载成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
+
+
 def test_generate_assets_then_edit_final_video_routes_to_compositor() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

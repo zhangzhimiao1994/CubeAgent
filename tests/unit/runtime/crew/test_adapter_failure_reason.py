@@ -907,6 +907,124 @@ async def test_multimedia_generator_direct_character_sheet_splits_gender_lead_pr
         assert "禁止写实主图+二次元表情+线稿三视图" in prompt_text
 
 
+async def test_multimedia_generator_direct_character_design_splits_gender_lead_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="根据这个剧本，生成男女主角的角色设定图，风格全是写实")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "multimedia_generator"
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 2
+    assert "男主" in cast(str, artifact_prompts[0])
+    assert "女主" in cast(str, artifact_prompts[1])
+    for prompt in artifact_prompts:
+        prompt_text = cast(str, prompt)
+        assert "本张角色参考设定表/角色设定图的唯一目标角色" in prompt_text
+        assert "一张图只包含一个角色" in prompt_text
+        assert "全写实" in prompt_text
+
+
+async def test_multimedia_generator_direct_gender_lead_group_photo_keeps_single_artifact() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="根据这个剧本，生成男女主角同框合照，风格全是写实")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert "artifact_count" not in arguments
+    assert "artifact_prompts" not in arguments
+
+
+async def test_multimedia_generator_direct_video_comparison_creates_reference_and_no_reference_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "filename": "male-lead-sheet.png",
+                        "mime_type": "image/png",
+                        "storage_key": "tenant/run/artifact/male-lead-sheet.png",
+                    },
+                ),
+            }
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="生成两版 5 秒视频对比：一版带参考图锁定人物，一版不带参考图。",
+                artifacts=(source,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "video"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert "带参考图" in cast(str, artifact_prompts[0])
+    assert "锁定人物" in cast(str, artifact_prompts[0])
+    assert "male-lead-sheet.png" in cast(str, artifact_prompts[0])
+    assert "不带参考图" in cast(str, artifact_prompts[1])
+
+
 async def test_video_compositor_directly_composes_upstream_file_handles_without_text_model() -> None:
     class FailingTextGateway:
         def __init__(self) -> None:

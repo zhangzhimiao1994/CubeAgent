@@ -1109,7 +1109,12 @@ _CHARACTER_MODEL_SHEET_PROMPT_TERMS = frozenset(
         "character model sheet",
         "角色参考设定表",
         "角色设定表",
+        "角色设定图",
+        "角色设定板",
         "角色定妆照",
+        "角色定妆图",
+        "定妆参考图",
+        "定妆设定图",
         "定妆照",
     )
 )
@@ -1282,8 +1287,10 @@ def _direct_multimedia_generation_prompt(
     character_target: str | None = None,
 ) -> str:
     source_previews: list[str] = []
+    is_character_reference = _is_character_model_sheet_prompt(context.request, step.task)
+    source_preview_bytes = 1_200 if is_character_reference else 512
     for artifact in sources[:6]:
-        preview = _artifact_text_preview(artifact, max_bytes=512)
+        preview = _artifact_text_preview(artifact, max_bytes=source_preview_bytes)
         if preview:
             source_previews.append(f"- {artifact.producer}: {preview}")
     parts = [context.request.strip(), f"执行任务：{step.task.strip()}"]
@@ -1291,9 +1298,16 @@ def _direct_multimedia_generation_prompt(
         parts.append("参考上游产物：\n" + "\n".join(source_previews))
     if feedback is not None:
         parts.append(f"用户审核退回意见：{feedback}")
-    if _is_character_model_sheet_prompt(context.request, step.task):
+    if is_character_reference:
         if character_target is not None:
-            parts.append(f"本张角色参考设定表的唯一目标角色：{character_target}。不要生成其他角色。")
+            parts.append(
+                f"本张角色参考设定表/角色设定图的唯一目标角色：{character_target}。"
+                "只提取并使用该角色对应的人物小传、年龄、职业、外貌、发型、服装、"
+                "气质和剧情身份；不要混入其他角色设定，不要生成其他角色，不要同框。"
+            )
+            target_source = _character_target_source_excerpt(character_target, sources)
+            if target_source:
+                parts.append(f"{character_target} 上游设定摘录：\n{target_source}")
         parts.append(_CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT)
         style_lock = _character_model_sheet_style_lock(context.request, step.task)
         if style_lock is not None:
@@ -1327,6 +1341,105 @@ def _character_model_sheet_targets(request: str, task: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(targets))
 
 
+def _character_target_source_excerpt(target: str, sources: tuple[Artifact, ...]) -> str:
+    terms = {
+        "男主": ("男主", "男主人公", "男主角", "male lead"),
+        "女主": ("女主", "女主人公", "女主角", "female lead"),
+    }.get(target, (target,))
+    snippets: list[str] = []
+    for artifact in sources[:8]:
+        preview = _artifact_text_preview(artifact, max_bytes=4_096)
+        if not preview:
+            continue
+        lines = [line.strip() for line in preview.splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            normalized_line = unicodedata.normalize("NFKC", line).casefold()
+            if not any(term in normalized_line for term in terms):
+                continue
+            window = lines[index : min(len(lines), index + 7)]
+            snippets.append("\n".join(window))
+            break
+    return _truncate_prompt_text("\n\n".join(snippets), max_bytes=1_600)
+
+
+def _is_multi_character_group_image_request(request: str, task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    return any(
+        term in normalized
+        for term in (
+            "合照",
+            "同框",
+            "同屏",
+            "一起出镜",
+            "双人照",
+            "情侣照",
+            "group photo",
+            "together",
+            "same frame",
+        )
+    )
+
+
+def _is_video_reference_comparison_prompt(request: str, task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    has_video = any(term in normalized for term in ("视频", "短片", "成片", "video", "clip"))
+    has_comparison = any(term in normalized for term in ("对比", "比较", "两版", "两种", "compare"))
+    has_reference_split = any(
+        term in normalized
+        for term in (
+            "带参考图",
+            "不带参考图",
+            "参考图",
+            "参考设定表",
+            "锁定人物",
+            "reference image",
+            "without reference",
+            "with reference",
+        )
+    )
+    return has_video and has_comparison and has_reference_split
+
+
+def _direct_video_reference_comparison_prompts(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    feedback: str | None,
+) -> tuple[str, str]:
+    base_prompt = _direct_multimedia_generation_prompt(context, step, sources, feedback)
+    reference_files = tuple(
+        file
+        for file in _usable_file_artifacts_payload(sources)
+        if isinstance(file.get("mime_type"), str)
+        and cast(str, file["mime_type"]).startswith("image/")
+    )
+    reference_names = tuple(
+        cast(str, file.get("filename") or file.get("artifact_id") or file.get("storage_key"))
+        for file in reference_files[:6]
+        if file.get("filename") or file.get("artifact_id") or file.get("storage_key")
+    )
+    reference_note = (
+        "可用参考图：" + "、".join(reference_names)
+        if reference_names
+        else "如上游产物中存在角色参考图/定妆图/设定表，优先使用这些参考图锁定人物。"
+    )
+    with_reference = (
+        f"{base_prompt}\n\n"
+        "对比版本 A：带参考图生成视频。必须依据上游角色参考图锁定人物身份、发型、"
+        "服装和画风，尽量保持角色一致性。\n"
+        f"{reference_note}"
+    )
+    without_reference = (
+        f"{base_prompt}\n\n"
+        "对比版本 B：不带参考图生成视频。不要使用上游图片作为人物锁定依据，"
+        "只根据文字剧本/分镜/提示词生成，用于和带参考图版本比较角色一致性差异。"
+    )
+    return (
+        _truncate_prompt_text(with_reference, max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES),
+        _truncate_prompt_text(without_reference, max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES),
+    )
+
+
 def _character_model_sheet_style_lock(request: str, task: str) -> str | None:
     normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
     if any(term in normalized for term in ("二次元", "动漫", "动画风", "anime", "manga")):
@@ -1342,7 +1455,11 @@ def _direct_multimedia_artifact_prompts(
     sources: tuple[Artifact, ...],
     feedback: str | None,
 ) -> tuple[str, ...]:
+    if _is_video_reference_comparison_prompt(context.request, step.task):
+        return _direct_video_reference_comparison_prompts(context, step, sources, feedback)
     if not _is_character_model_sheet_prompt(context.request, step.task):
+        return ()
+    if _is_multi_character_group_image_request(context.request, step.task):
         return ()
     targets = _character_model_sheet_targets(context.request, step.task)
     if len(targets) <= 1:
