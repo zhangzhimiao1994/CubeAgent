@@ -1258,6 +1258,26 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
     assert response.payload["nested"] == {"token": "[redacted]", "result": "ok"}
 
 
+def test_admin_run_event_exposes_artifact_review_approval_id() -> None:
+    response = _admin_run_event(
+        {
+            "sequence": 8,
+            "kind": "approval.requested",
+            "message": "artifact review requested",
+            "actor": "multimedia_generator",
+            "action": "artifact_review",
+            "approval_id": "artifact-review-1",
+            "payload": {
+                "approval_kind": "runtime_artifact_review",
+                "stage_id": "character_model_sheet",
+                "artifact_id": "artifact-1",
+            },
+        }
+    )
+
+    assert response.approval_id == "artifact-review-1"
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [

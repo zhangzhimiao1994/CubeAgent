@@ -992,10 +992,10 @@ async def test_multimedia_generator_direct_person_reference_splits_each_script_r
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     _actor, _name, arguments = capabilities.calls[0]
     assert arguments["kind"] == "image"
-    assert arguments["artifact_count"] == 3
+    assert arguments["artifact_count"] == 4
     artifact_prompts = arguments["artifact_prompts"]
     assert isinstance(artifact_prompts, tuple)
-    assert len(artifact_prompts) == 3
+    assert len(artifact_prompts) == 4
     assert "唯一目标角色：女主" in cast(str, artifact_prompts[0])
     assert "苏念" in cast(str, artifact_prompts[0])
     assert "浅粉针织衫" in cast(str, artifact_prompts[0])
@@ -1005,11 +1005,117 @@ async def test_multimedia_generator_direct_person_reference_splits_each_script_r
     assert "唯一目标角色：闺蜜" in cast(str, artifact_prompts[2])
     assert "林小鹿" in cast(str, artifact_prompts[2])
     assert "牛仔外套" in cast(str, artifact_prompts[2])
-    for prompt in artifact_prompts:
+    assert "分镜图" in cast(str, artifact_prompts[3])
+    assert "不要生成角色定妆照" in cast(str, artifact_prompts[3])
+    for prompt in artifact_prompts[:3]:
         prompt_text = cast(str, prompt)
         assert "一张图只包含一个角色" in prompt_text
         assert "不要混入其他角色设定" in prompt_text
         assert "不要只输出头像或单张主图" in prompt_text
+
+
+async def test_multimedia_generator_direct_person_reference_keeps_split_when_group_is_negated() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "## 女主：苏念（26岁）\n"
+                "- 外貌：黑长直，浅粉针织衫。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 外貌：短黑发，灰色西装。"
+            )
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="为每个角色单独生成角色设定图，不要同框合照",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    artifact_prompts = cast(tuple[str, ...], arguments["artifact_prompts"])
+    assert len(artifact_prompts) == 2
+    assert "唯一目标角色：女主" in artifact_prompts[0]
+    assert "唯一目标角色：男主" in artifact_prompts[1]
+
+
+async def test_multimedia_generator_direct_person_reference_reads_structured_script_roles() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "result": {
+                "script": {
+                    "characters": (
+                        {
+                            "role": "女主",
+                            "name": "苏念",
+                            "age": "26岁",
+                            "occupation": "广告公司资深文案",
+                            "appearance": "黑长直，浅粉针织衫",
+                        },
+                        {
+                            "role": "男主",
+                            "name": "陆沉",
+                            "age": "29岁",
+                            "occupation": "品牌公司创始人",
+                            "appearance": "短黑发，灰色西装",
+                        },
+                    )
+                }
+            }
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="给所有人物做人设图",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    artifact_prompts = cast(tuple[str, ...], arguments["artifact_prompts"])
+    assert len(artifact_prompts) == 2
+    assert "苏念" in artifact_prompts[0]
+    assert "陆沉" in artifact_prompts[1]
 
 
 async def test_multimedia_generator_direct_gender_lead_group_photo_keeps_single_artifact() -> None:
@@ -1852,6 +1958,9 @@ def test_direct_multimedia_generation_prompt_constrains_character_model_sheet() 
             "image",
         ),
         ("生成角色设定表。", "image"),
+        ("根据剧本为每个角色生成角色参考图。", "image"),
+        ("根据剧本为每个人物生成定妆图。", "image"),
+        ("根据剧本生成男女主角同框合照。", "image"),
         ("出一张赛博朋克产品概念图。", "image"),
         ("生成三张可下载表情包贴纸。", "image"),
         ("做一张商品 3D 渲染图。", "image"),
@@ -2328,11 +2437,74 @@ async def test_reviewer_prompt_adds_character_sheet_acceptance_criteria() -> Non
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     reviewer_prompt = next(prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt)
     assert "角色参考设定表审核标准" in reviewer_prompt
-    assert "男女主至少应有 2 张独立图片" in reviewer_prompt
+    assert "至少应有 2 张独立角色图片" in reviewer_prompt
     assert "一张图片只允许一个角色" in reviewer_prompt
     assert "同一人物身份必须一致" in reviewer_prompt
     assert "同一画风" in reviewer_prompt
     assert "全写实" in reviewer_prompt
+
+
+async def test_reviewer_prompt_adds_source_character_targets_to_acceptance_criteria() -> None:
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "## 女主：苏念（26岁）\n"
+                "- 外貌：黑长直，浅粉针织衫。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 外貌：短黑发，灰色西装。\n\n"
+                "## 闺蜜：林小鹿（25岁）\n"
+                "- 外貌：短发，牛仔外套。"
+            )
+        },
+    )
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+            ),
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                reviewer="critic",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    factory = CapturingFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=factory,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="为每个角色生成角色参考设定表，风格全是写实",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reviewer_prompt = next(prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt)
+    assert "至少应有 3 张独立角色图片" in reviewer_prompt
+    assert "女主" in reviewer_prompt
+    assert "男主" in reviewer_prompt
+    assert "闺蜜" in reviewer_prompt
     assert "中等复杂度" in reviewer_prompt
 
 

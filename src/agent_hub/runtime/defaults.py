@@ -125,9 +125,21 @@ _INTERMEDIATE_MEDIA_REVIEW_TERMS = (
     "costume sheet",
     "storyboard",
     "角色参考设定表",
+    "角色参考图",
+    "人物参考图",
     "角色定妆照",
+    "角色定妆图",
+    "定妆参考图",
+    "定妆图",
     "角色设定表",
     "角色设定",
+    "角色设定图",
+    "人设图",
+    "角色立绘",
+    "人物立绘",
+    "形象设定图",
+    "造型设定图",
+    "三视图",
     "定妆照",
     "设定表",
     "设定板",
@@ -835,7 +847,12 @@ def _dispatch_plan(
                 f"{memory_guidance}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
-            depends_on=_dispatch_role_dependencies(role, selected_roles, producer_step_ids),
+            depends_on=_dispatch_role_dependencies(
+                role,
+                selected_roles,
+                producer_step_ids,
+                context.request,
+            ),
             tools=_role_allowed_tools(
                 role,
                 context,
@@ -896,9 +913,16 @@ def _dispatch_role_dependencies(
     role: RoleAssignment,
     selected_roles: tuple[RoleAssignment, ...],
     producer_step_ids: tuple[str, ...],
+    request: str,
 ) -> tuple[str, ...]:
     if _is_post_product_role(role):
         return producer_step_ids
+    if _requires_script_artifact_before_media(role, selected_roles, request):
+        return tuple(
+            f"{candidate.id}_step"
+            for candidate in selected_roles
+            if candidate.id == "copywriter"
+        )
     if role.id == "video_compositor" and "compose_video" in role.allowed_tools:
         return tuple(
             f"{candidate.id}_step"
@@ -906,6 +930,39 @@ def _dispatch_role_dependencies(
             if candidate.id != role.id and not _is_post_product_role(candidate)
         )
     return ()
+
+
+def _requires_script_artifact_before_media(
+    role: RoleAssignment,
+    selected_roles: tuple[RoleAssignment, ...],
+    request: str,
+) -> bool:
+    if role.id != "multimedia_generator" or "generate_multimedia" not in role.allowed_tools:
+        return False
+    if not any(candidate.id == "copywriter" for candidate in selected_roles):
+        return False
+    normalized = request.casefold()
+    has_script = any(term in normalized for term in ("script", "screenplay", "剧本", "脚本"))
+    has_reference = any(term in normalized for term in ("based on", "from", "基于", "根据"))
+    has_media = any(
+        term in normalized
+        for term in (
+            "image",
+            "video",
+            "storyboard",
+            "图片",
+            "图像",
+            "参考图",
+            "定妆图",
+            "定妆照",
+            "人设图",
+            "立绘",
+            "分镜图",
+            "分镜",
+            "视频",
+        )
+    )
+    return has_script and has_reference and has_media
 
 
 def _is_post_product_role(role: RoleAssignment) -> bool:

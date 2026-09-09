@@ -55,6 +55,7 @@ type ArtifactReviewApproval = {
   artifactId: string;
   producer: string | null;
   artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null;
+  artifacts: Array<RunArtifact | NonNullable<RunEvent["artifact"]>>;
 };
 type RunSubmissionOverride = {
   message?: string;
@@ -971,6 +972,24 @@ function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): Artifa
   const artifactId = payloadText(requested.payload, "artifact_id");
   if (!stageId || !artifactId) return null;
   const parsedVersion = Number(run.explicit_details.version ?? "0");
+  const expandedArtifacts = run.artifacts.filter(
+    (artifact) => artifact.id === artifactId || artifact.id.startsWith(`${artifactId}:`),
+  );
+  const eventArtifacts = [...run.events]
+    .filter((event) => event.artifact?.id === artifactId || event.artifact?.id.startsWith(`${artifactId}:`))
+    .map((event) => event.artifact)
+    .filter((artifact): artifact is NonNullable<RunEvent["artifact"]> => Boolean(artifact));
+  const eventExpandedArtifacts = (requested.artifacts ?? []).filter(
+    (artifact) => artifact.id === artifactId || artifact.id.startsWith(`${artifactId}:`),
+  );
+  const artifacts = [...expandedArtifacts, ...eventExpandedArtifacts, ...eventArtifacts].filter(
+    (artifact, index, all) => all.findIndex((candidate) => candidate.id === artifact.id) === index,
+  );
+  const artifact =
+    artifacts[0] ??
+    run.artifacts.find((candidate) => candidate.id === artifactId) ??
+    run.events.find((event) => event.artifact?.id === artifactId)?.artifact ??
+    null;
   return {
     runId: run.id,
     approvalId: requested.approval_id,
@@ -978,10 +997,8 @@ function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): Artifa
     stageId,
     artifactId,
     producer: payloadText(requested.payload, "producer") ?? requested.actor ?? null,
-    artifact:
-      run.artifacts.find((artifact) => artifact.id === artifactId) ??
-      run.events.find((event) => event.artifact?.id === artifactId)?.artifact ??
-      null,
+    artifact,
+    artifacts: artifact ? [artifact, ...artifacts.filter((candidate) => candidate.id !== artifact.id)] : artifacts,
   };
 }
 
@@ -2639,6 +2656,7 @@ function ArtifactReviewApprovalCard({
   disabled?: boolean;
 }) {
   const title = approval.artifact?.title || approval.stageId;
+  const artifacts = approval.artifacts.length > 0 ? approval.artifacts : approval.artifact ? [approval.artifact] : [];
   return (
     <article className="artifact-review-card" aria-label="中间产物审核">
       <span className="eyebrow">中间产物审核</span>
@@ -2663,7 +2681,10 @@ function ArtifactReviewApprovalCard({
         ) : null}
       </dl>
       <p>确认后进入下一步；退回时会把反馈交给对应阶段重新生成，并再次等待审核。</p>
-      {hasArtifactDownload(approval.artifact) ? <ArtifactFileCard artifact={approval.artifact} compact /> : null}
+      {artifacts.length > 1 ? <p>本阶段共 {artifacts.length} 个文件，请按整组产物审核。</p> : null}
+      {artifacts.map((artifact) =>
+        hasArtifactDownload(artifact) ? <ArtifactFileCard key={artifact.id} artifact={artifact} compact /> : null,
+      )}
       <label className="artifact-review-feedback">
         <span>退回意见</span>
         <textarea

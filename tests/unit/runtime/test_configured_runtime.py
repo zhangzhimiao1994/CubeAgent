@@ -1855,6 +1855,51 @@ def test_dispatch_plan_composes_after_generated_media_step() -> None:
     assert "compose_video" in compositor_step.tools
 
 
+def test_dispatch_plan_generates_character_media_after_script_step() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the short drama script.",
+            must_answer=("What script was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="multimedia_generator",
+            role="Multimedia Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate character reference images.",
+            must_answer=("What images were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not claim approval without review.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="根据剧本为每个角色生成定妆参考图。",
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    media_step = next(step for step in plan.steps if step.agent == "multimedia_generator")
+
+    assert media_step.depends_on == ("copywriter_step",)
+
+
 def test_deferred_media_script_plan_copywriter_does_not_use_read_context_tool() -> None:
     roles = (
         RoleAssignment(

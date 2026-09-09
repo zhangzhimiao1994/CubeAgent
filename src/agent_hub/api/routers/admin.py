@@ -332,8 +332,10 @@ class RunEventResponse(BaseModel):
     step_id: str | None = None
     action: str | None = None
     decision: str | None = None
+    approval_id: str | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
     artifact: RunArtifactResponse | None = None
+    artifacts: list[RunArtifactResponse] = Field(default_factory=list)
 
 
 class RunDetailResponse(RunListItem):
@@ -8206,6 +8208,11 @@ def _admin_run_event(
     message = event.get("reason") or event.get("message") or kind
     payload = event.get("payload")
     artifact = event.get("artifact")
+    artifacts = (
+        _admin_run_artifacts_response((artifact,), run_id=run_id)
+        if isinstance(artifact, dict) and run_id is not None
+        else []
+    )
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind if type(kind) is str else "event",
@@ -8217,8 +8224,10 @@ def _admin_run_event(
         step_id=_optional_event_string(event.get("step_id")),
         action=_optional_event_string(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
+        approval_id=_optional_event_string(event.get("approval_id")),
         payload=_event_payload(payload),
         artifact=_admin_run_artifact(artifact, run_id=run_id) if isinstance(artifact, dict) else None,
+        artifacts=artifacts,
     )
 
 

@@ -617,6 +617,7 @@ const RunEventSchema = z.object({
   approval_id: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
   artifact: RunArtifactSchema.nullable().optional(),
+  artifacts: z.array(RunArtifactSchema).optional(),
 });
 
 const HermesInjectedMemorySchema = z.object({

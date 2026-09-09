@@ -778,13 +778,85 @@ def _file_metadata_values(value: JsonValue) -> tuple[Mapping[str, JsonValue], ..
 
 
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
-    text = artifact.content.get("text")
-    if type(text) is not str:
+    text = _first_artifact_text_value(artifact.content)
+    if text is None:
         return None
     stripped = text.strip()
     if not stripped:
         return None
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
+
+
+def _first_artifact_text_value(content: Mapping[str, JsonValue]) -> str | None:
+    direct = content.get("text")
+    if type(direct) is str:
+        return direct
+    for key in (
+        "script",
+        "screenplay",
+        "markdown",
+        "body",
+        "summary",
+        "result",
+        "output",
+        "content",
+    ):
+        found = _nested_artifact_text_value(content.get(key), depth=0)
+        if found is not None:
+            return found
+    return None
+
+
+def _nested_artifact_text_value(value: JsonValue | None, *, depth: int) -> str | None:
+    if depth > 4:
+        return None
+    if type(value) is str:
+        return value
+    if isinstance(value, Mapping):
+        for key in (
+            "text",
+            "script",
+            "screenplay",
+            "markdown",
+            "body",
+            "summary",
+            "content",
+            "description",
+        ):
+            found = _nested_artifact_text_value(value.get(key), depth=depth + 1)
+            if found is not None:
+                return found
+        characters = value.get("characters")
+        if isinstance(characters, tuple):
+            lines: list[str] = []
+            for character in characters:
+                if not isinstance(character, Mapping):
+                    continue
+                label = character.get("label") or character.get("role") or character.get("name")
+                if type(label) is not str or not label.strip():
+                    continue
+                details = [
+                    item
+                    for item in (
+                        character.get("name"),
+                        character.get("age"),
+                        character.get("job"),
+                        character.get("occupation"),
+                        character.get("appearance"),
+                        character.get("costume"),
+                    )
+                    if type(item) is str and item.strip()
+                ]
+                suffix = "，".join(details)
+                lines.append(f"## {label.strip()}：{suffix}" if suffix else f"## {label.strip()}")
+            if lines:
+                return "\n".join(lines)
+    if isinstance(value, tuple):
+        for item in value:
+            found = _nested_artifact_text_value(item, depth=depth + 1)
+            if found is not None:
+                return found
+    return None
 
 
 def _fallback_review_response_from_text(text: str) -> tuple[str, str | None] | None:
@@ -1024,7 +1096,24 @@ _IMAGE_GENERATION_HINTS = frozenset(
         "设定图",
         "设定板",
         "角色参考设定表",
+        "角色参考图",
+        "人物参考图",
         "角色设定表",
+        "角色设定图",
+        "角色定妆图",
+        "角色定妆照",
+        "定妆参考图",
+        "定妆图",
+        "定妆照",
+        "人设图",
+        "角色立绘",
+        "人物立绘",
+        "形象设定图",
+        "造型设定图",
+        "三视图",
+        "合照",
+        "同框",
+        "双人照",
         "设定表",
         "图片版",
         "分镜图",
@@ -1051,9 +1140,26 @@ _IMAGE_DELIVERABLE_PRIORITY_HINTS = frozenset(
         "character model sheet",
         "model sheet",
         "角色参考设定表",
+        "角色参考图",
+        "人物参考图",
         "角色设定表",
+        "角色设定图",
+        "角色定妆图",
+        "角色定妆照",
+        "定妆参考图",
+        "定妆图",
+        "定妆照",
+        "人设图",
+        "角色立绘",
+        "人物立绘",
+        "形象设定图",
+        "造型设定图",
+        "三视图",
         "设定表",
         "设定板",
+        "合照",
+        "同框",
+        "双人照",
         "图片版",
         "分镜图",
     )
@@ -1115,9 +1221,16 @@ _CHARACTER_MODEL_SHEET_PROMPT_TERMS = frozenset(
         "角色设定板",
         "角色定妆照",
         "角色定妆图",
+        "定妆图",
         "定妆参考图",
         "定妆设定图",
         "定妆照",
+        "人设图",
+        "角色立绘",
+        "人物立绘",
+        "形象设定图",
+        "造型设定图",
+        "三视图",
     )
 )
 _CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT = (
@@ -1337,9 +1450,25 @@ def _is_character_model_sheet_prompt(request: str, task: str) -> bool:
             "各人物",
             "角色",
             "人物",
+            "主角",
+            "主角团",
+            "出场人物",
         )
     )
-    has_reference_image = any(term in text for term in ("参考图", "参考图片", "定妆图", "设定图"))
+    has_reference_image = any(
+        term in text
+        for term in (
+            "参考图",
+            "参考图片",
+            "定妆图",
+            "设定图",
+            "人设图",
+            "立绘",
+            "形象设定",
+            "造型设定",
+            "三视图",
+        )
+    )
     return has_character_scope and has_reference_image
 
 
@@ -1355,11 +1484,21 @@ def _character_model_sheet_targets(
     for target, terms in (
         ("男主", ("男主", "男主人公", "男主角", "male lead")),
         ("女主", ("女主", "女主人公", "女主角", "female lead")),
+        ("男二", ("男二", "男二号", "second male lead")),
+        ("女二", ("女二", "女二号", "second female lead")),
+        ("反派", ("反派", "villain", "antagonist")),
+        ("闺蜜", ("闺蜜",)),
+        ("配角", ("配角", "supporting character")),
     ):
         if any(term in normalized for term in terms):
             targets.append(target)
-    if _requests_each_character_reference(normalized):
-        targets.extend(_character_targets_from_sources(sources))
+    source_targets = _character_targets_from_sources(sources)
+    if _requests_each_character_reference(normalized) or (
+        source_targets
+        and _requests_script_character_reference(normalized)
+        and not _requests_single_character_reference(normalized)
+    ):
+        targets.extend(source_targets)
     return tuple(dict.fromkeys(targets))
 
 
@@ -1369,11 +1508,66 @@ def _requests_each_character_reference(normalized: str) -> bool:
         for term in (
             "各个角色",
             "每个角色",
+            "每位角色",
+            "每一个角色",
             "每一位角色",
             "每个人物",
+            "每个出场人物",
+            "每一位出场人物",
+            "各角色",
             "各人物",
             "全部角色",
             "所有角色",
+            "全部人物",
+            "所有人物",
+            "主要角色",
+            "主要人物",
+            "核心角色",
+            "主角团",
+            "全员",
+            "each character",
+            "every character",
+            "all characters",
+            "each cast member",
+            "every cast member",
+            "main cast",
+            "cast model sheets",
+        )
+    )
+
+
+def _requests_script_character_reference(normalized: str) -> bool:
+    return any(term in normalized for term in ("剧本", "脚本", "script", "screenplay")) and any(
+        term in normalized
+        for term in (
+            "角色参考",
+            "人物参考",
+            "角色设定",
+            "人物设定",
+            "定妆",
+            "人设图",
+            "立绘",
+            "形象设定",
+            "造型设定",
+            "character model sheet",
+            "model sheet",
+        )
+    )
+
+
+def _requests_single_character_reference(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "一个角色",
+            "单个角色",
+            "某个角色",
+            "任意一个角色",
+            "一位角色",
+            "一个人物",
+            "单个人物",
+            "one character",
+            "single character",
         )
     )
 
@@ -1382,7 +1576,7 @@ _CHARACTER_SOURCE_HEADING = re.compile(
     r"^\s*(?:#{1,6}\s*|[-*]\s*)?"
     r"(?P<label>"
     r"(?:男主|女主|男主人公|女主人公|男主角|女主角|男二|女二|反派|闺蜜|助攻|配角|主角)"
-    r"(?:$|[：:（(\s][^。\n]{0,48})"
+    r"(?:$|[：:（(][^。\n]{0,48})"
     r")"
 )
 
@@ -1442,20 +1636,65 @@ def _character_target_source_excerpt(target: str, sources: tuple[Artifact, ...])
 
 def _is_multi_character_group_image_request(request: str, task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
-    return any(
-        term in normalized
-        for term in (
-            "合照",
-            "同框",
-            "同屏",
-            "一起出镜",
-            "双人照",
-            "情侣照",
-            "group photo",
-            "together",
-            "same frame",
-        )
+    group_terms = (
+        "合照",
+        "同框",
+        "同屏",
+        "一起出镜",
+        "双人照",
+        "情侣照",
+        "group photo",
+        "together",
+        "same frame",
     )
+    for clause in _split_multimedia_kind_clauses(normalized):
+        if any(term in clause for term in ("不要", "不需要", "避免", "禁止", "不得", "without", "no ")):
+            continue
+        if any(term in clause for term in group_terms):
+            return True
+    return False
+
+
+def _is_storyboard_image_prompt(request: str, task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    return _has_unnegated_multimedia_kind_hint(
+        normalized,
+        frozenset(("分镜图", "故事板", "storyboard")),
+    )
+
+
+def _direct_storyboard_generation_prompt(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    feedback: str | None,
+) -> str:
+    source_previews: list[str] = []
+    for artifact in sources[:6]:
+        preview = _artifact_text_preview(artifact, max_bytes=1_200)
+        if preview:
+            source_previews.append(f"- {artifact.producer}: {preview}")
+    parts = [
+        context.request.strip(),
+        f"执行任务：{step.task.strip()}",
+        (
+            "分镜图产物约束：本张产物是短剧/视频分镜图，按剧本拆成关键镜头画面格；"
+            "标注镜头顺序、场景、景别、角色动作、情绪和画面重点。"
+            "不要生成角色定妆照、角色参考设定表、单人写真、合照或海报。"
+        ),
+    ]
+    if source_previews:
+        parts.append("参考上游产物：\n" + "\n".join(source_previews))
+    if feedback is not None:
+        parts.append(f"用户审核退回意见：{feedback}")
+    prompt = "\n\n".join(part for part in parts if part)
+    prompt = unicodedata.normalize("NFC", prompt)
+    prompt = "".join(
+        " " if unicodedata.category(character) == "Cf" else character
+        for character in prompt
+    )
+    prompt = _CONTROL_CHARS.sub(" ", prompt)
+    return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
 
 
 def _is_video_reference_comparison_prompt(request: str, task: str) -> bool:
@@ -1535,29 +1774,42 @@ def _direct_multimedia_artifact_prompts(
 ) -> tuple[str, ...]:
     if _is_video_reference_comparison_prompt(context.request, step.task):
         return _direct_video_reference_comparison_prompts(context, step, sources, feedback)
-    if not _is_character_model_sheet_prompt(context.request, step.task):
-        return ()
-    if _is_multi_character_group_image_request(context.request, step.task):
-        return ()
-    targets = _character_model_sheet_targets(context.request, step.task, sources)
-    if len(targets) <= 1:
-        return ()
-    return tuple(
-        _direct_multimedia_generation_prompt(
-            context,
-            step,
-            sources,
-            feedback,
-            character_target=target,
+    prompts: list[str] = []
+    if _is_character_model_sheet_prompt(
+        context.request, step.task
+    ) and not _is_multi_character_group_image_request(context.request, step.task):
+        targets = _character_model_sheet_targets(context.request, step.task, sources)
+        if len(targets) > 1:
+            prompts.extend(
+                _direct_multimedia_generation_prompt(
+                    context,
+                    step,
+                    sources,
+                    feedback,
+                    character_target=target,
+                )
+                for target in targets[:8]
+            )
+    if _is_storyboard_image_prompt(context.request, step.task):
+        prompts.append(
+            _direct_storyboard_generation_prompt(
+                context,
+                step,
+                sources,
+                feedback,
+            )
         )
-        for target in targets[:8]
-    )
+    return tuple(prompts)
 
 
-def _character_model_sheet_review_criteria(request: str, task: str) -> dict[str, object] | None:
+def _character_model_sheet_review_criteria(
+    request: str,
+    task: str,
+    sources: tuple[Artifact, ...] = (),
+) -> dict[str, object] | None:
     if not _is_character_model_sheet_prompt(request, task):
         return None
-    targets = _character_model_sheet_targets(request, task)
+    targets = _character_model_sheet_targets(request, task, sources)
     criteria: dict[str, object] = {
         "title": "角色参考设定表审核标准",
         "reject_if": (
@@ -1572,7 +1824,7 @@ def _character_model_sheet_review_criteria(request: str, task: str) -> dict[str,
         "style": "同一画风；不得混合写实、二次元和线稿。",
     }
     if len(targets) >= 2:
-        criteria["required_outputs"] = f"男女主至少应有 {len(targets)} 张独立图片。"
+        criteria["required_outputs"] = f"至少应有 {len(targets)} 张独立角色图片。"
         criteria["targets"] = targets
     style_lock = _character_model_sheet_style_lock(request, task)
     if style_lock is not None:
@@ -3776,8 +4028,9 @@ class CrewDispatchRuntime:
             if selected_model is None:
                 _fail(f"capability failed: no configured {kind} generation model")
             logical_model = selected_model
+            multimedia_sources = _lineage_expanded_artifacts(sources, available_artifacts)
             generation_prompt = _direct_multimedia_generation_prompt(
-                context, step, sources, feedback
+                context, step, multimedia_sources, feedback
             )
             if not generation_prompt:
                 _fail("capability failed: multimedia generation prompt is empty")
@@ -3789,7 +4042,7 @@ class CrewDispatchRuntime:
             artifact_prompts = _direct_multimedia_artifact_prompts(
                 context,
                 step,
-                sources,
+                multimedia_sources,
                 feedback,
             )
             if artifact_prompts:
@@ -4728,9 +4981,14 @@ class CrewDispatchRuntime:
             artifact,
             max_preview_bytes=review_preview_bytes,
         )
+        review_sources = _lineage_expanded_artifacts(
+            (artifact,),
+            (*context.artifacts, *tuple(self._current_artifact_registry.values())),
+        )
         character_sheet_criteria = _character_model_sheet_review_criteria(
             context.request,
             step.task,
+            review_sources,
         )
         if character_sheet_criteria is not None:
             review_payload["acceptance_criteria"] = character_sheet_criteria
