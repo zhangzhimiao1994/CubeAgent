@@ -496,7 +496,6 @@ deploy_native_release() {
 
   ln -sfn "$release" "$INSTALL_ROOT/current"
   fix_native_web_permissions "$release"
-  prune_native_releases
 }
 
 fix_native_web_permissions() {
@@ -763,5 +762,6 @@ install_native_mode() {
   require_native_service_active agent-hub-litellm.service
   require_native_http_ready "LiteLLM proxy" "http://127.0.0.1:4000/health/liveliness" agent-hub-litellm.service
   require_native_http_ready "Agent Hub API readiness" "http://127.0.0.1:8000/health/ready" agent-hub-api.service
+  prune_native_releases
   mark_stage "native-up"
 }

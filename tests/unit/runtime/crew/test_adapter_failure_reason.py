@@ -32,6 +32,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_review_packet_payload,
     _direct_compose_video_arguments,
     _direct_multimedia_generation_prompt,
+    _fallback_review_response_from_text,
     _normalize_compose_video_arguments_with_sources,
     _normalize_tool_call_arguments,
     _usable_file_artifacts_payload,
@@ -2606,6 +2607,52 @@ async def test_reviewer_chinese_consensus_rejection_requests_step_revision() -> 
     )
     assert retry.payload["attempt"] == 2
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_reviewer_plain_chinese_rejection_requests_step_revision() -> None:
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                "未通过，需要重新生成角色参考图。主定妆照和表情图不像同一个人。",
+                '{"verdict":"approve"}',
+            )
+        ),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    revisions = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("verdict") == "revise"
+    ]
+    assert len(revisions) == 1
+    assert "不像同一个人" in str(revisions[0].payload["feedback"])
+    skipped = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("review_status") == "skipped"
+    ]
+    assert skipped == []
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_plain_chinese_review_rejection_fallback_does_not_require_marker() -> None:
+    fallback = _fallback_review_response_from_text(
+        "未通过，需要重新生成角色参考图。主定妆照和表情图不像同一个人。"
+    )
+
+    assert fallback is not None
+    verdict, feedback = fallback
+    assert verdict == "revise"
+    assert feedback is not None
+    assert "不像同一个人" in feedback
 
 
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:

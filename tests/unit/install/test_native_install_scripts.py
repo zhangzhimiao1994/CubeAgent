@@ -76,9 +76,16 @@ def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:
     assert '"$INSTALL_ROOT/releases/"*)' in script
     assert 'rm -rf -- "$resolved_release"' in script
 
-    link_current = script.index('ln -sfn "$release" "$INSTALL_ROOT/current"')
-    prune = script.index("prune_native_releases")
-    assert link_current < prune
+    deploy_function = script.split("deploy_native_release() {", maxsplit=1)[1].split(
+        "\n}\n\nfix_native_web_permissions",
+        maxsplit=1,
+    )[0]
+    install_function = script.split("install_native_mode() {", maxsplit=1)[1]
+    assert 'ln -sfn "$release" "$INSTALL_ROOT/current"' in deploy_function
+    assert "prune_native_releases" not in deploy_function
+    api_ready = install_function.index('require_native_http_ready "Agent Hub API readiness"')
+    prune = install_function.index("prune_native_releases")
+    assert api_ready < prune
 
 
 def test_native_release_pruning_keeps_current_and_current_venv_dependencies() -> None:
@@ -158,6 +165,14 @@ def test_install_verification_uses_public_url_for_docker_mode() -> None:
     assert "litellm.proxy.proxy_server" in verify
     assert 'verify_url "$base_url/health/live"' in verify
     assert 'verify_url "$base_url/health/ready"' in verify
+
+
+def test_compose_api_healthcheck_has_startup_grace_period() -> None:
+    compose = read("deploy/compose/docker-compose.yml")
+    api_service = compose.split("\n  api:", maxsplit=1)[1].split("\n  worker:", maxsplit=1)[0]
+
+    assert "healthcheck:" in api_service
+    assert "start_period: 60s" in api_service
 
 
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:

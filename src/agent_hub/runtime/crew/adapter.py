@@ -864,6 +864,25 @@ def _fallback_review_response_from_text(text: str) -> tuple[str, str | None] | N
     if not stripped:
         return None
     lowered = stripped.casefold()
+    rejection_markers = (
+        "不通过",
+        "未通过",
+        "审查不合格",
+        "拒绝放行",
+        "不能放行",
+        "退回",
+        "返工",
+        "需要重新生成",
+        "需重新生成",
+        "需要重写",
+        "需重写",
+        "revision required",
+        "rejected",
+        "do not approve",
+        "not approved",
+    )
+    if any(marker in lowered for marker in rejection_markers):
+        return "revise", _truncate_prompt_text(stripped, max_bytes=8192)
     has_review_marker = any(
         marker in lowered
         for marker in (
