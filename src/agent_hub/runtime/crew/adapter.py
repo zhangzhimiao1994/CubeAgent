@@ -437,6 +437,25 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                     "description": "The final generation prompt for the media provider.",
                     "minLength": 1,
                 },
+                "artifact_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "description": "Number of independent media artifacts to generate.",
+                },
+                "artifact_prompts": {
+                    "type": "array",
+                    "description": (
+                        "Optional per-artifact prompts. Use one prompt per independent "
+                        "character, shot, or asset when the requested output count matters."
+                    ),
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                },
             },
         }
     if internal_name == "compose_video":
@@ -1097,8 +1116,15 @@ _CHARACTER_MODEL_SHEET_PROMPT_TERMS = frozenset(
 _CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT = (
     "角色参考设定表格式约束：这是一张角色定妆照/角色参考设定表，"
     "一张图只包含一个角色；不要把多个角色放在同一张设定表。"
-    "画面以主定妆照为核心，可包含简化三视图、少量表情和服装要点；"
-    "不要过度堆叠小物件、文字说明或复杂资产格。"
+    "如果用户要求男女主或多个角色，必须为每个角色分别输出独立图片文件，"
+    "男女主至少输出两张：男主一张、女主一张。"
+    "保持同一人物身份一致：主定妆照、三视图、表情和服装细节必须像同一个人。"
+    "保持同一画风，不得混用写实照片、二次元头像和线稿三视图；"
+    "用户指定二次元时全二次元，指定写实时全写实。"
+    "采用中等复杂度：画面以主定妆照为核心，包含简化三视图、3-5 个表情/头部变化、"
+    "服装整体展示和 3-6 个关键服装/道具细节；不要过度堆叠小物件、文字说明或复杂资产格，"
+    "也不要只输出头像或单张主图。"
+    "禁止写实主图+二次元表情+线稿三视图的混合拼贴。"
 )
 
 
@@ -1253,6 +1279,7 @@ def _direct_multimedia_generation_prompt(
     step: DispatchStep,
     sources: tuple[Artifact, ...],
     feedback: str | None = None,
+    character_target: str | None = None,
 ) -> str:
     source_previews: list[str] = []
     for artifact in sources[:6]:
@@ -1265,7 +1292,12 @@ def _direct_multimedia_generation_prompt(
     if feedback is not None:
         parts.append(f"用户审核退回意见：{feedback}")
     if _is_character_model_sheet_prompt(context.request, step.task):
+        if character_target is not None:
+            parts.append(f"本张角色参考设定表的唯一目标角色：{character_target}。不要生成其他角色。")
         parts.append(_CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT)
+        style_lock = _character_model_sheet_style_lock(context.request, step.task)
+        if style_lock is not None:
+            parts.append(style_lock)
     prompt = "\n\n".join(part for part in parts if part)
     prompt = unicodedata.normalize("NFC", prompt)
     prompt = "".join(
@@ -1279,6 +1311,78 @@ def _direct_multimedia_generation_prompt(
 def _is_character_model_sheet_prompt(request: str, task: str) -> bool:
     text = f"{request} {task}".casefold()
     return any(term in text for term in _CHARACTER_MODEL_SHEET_PROMPT_TERMS)
+
+
+def _character_model_sheet_targets(request: str, task: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    if any(term in normalized for term in ("男女主", "男主女主", "male and female leads")):
+        return ("男主", "女主")
+    targets: list[str] = []
+    for target, terms in (
+        ("男主", ("男主", "男主人公", "男主角", "male lead")),
+        ("女主", ("女主", "女主人公", "女主角", "female lead")),
+    ):
+        if any(term in normalized for term in terms):
+            targets.append(target)
+    return tuple(dict.fromkeys(targets))
+
+
+def _character_model_sheet_style_lock(request: str, task: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    if any(term in normalized for term in ("二次元", "动漫", "动画风", "anime", "manga")):
+        return "画风锁定：全二次元，同一张设定表内所有视图、表情和细节都使用同一画风。"
+    if any(term in normalized for term in ("写实", "真人", "真实照片", "realistic", "photoreal")):
+        return "画风锁定：全写实，同一张设定表内所有视图、表情和细节都使用同一画风。"
+    return None
+
+
+def _direct_multimedia_artifact_prompts(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    feedback: str | None,
+) -> tuple[str, ...]:
+    if not _is_character_model_sheet_prompt(context.request, step.task):
+        return ()
+    targets = _character_model_sheet_targets(context.request, step.task)
+    if len(targets) <= 1:
+        return ()
+    return tuple(
+        _direct_multimedia_generation_prompt(
+            context,
+            step,
+            sources,
+            feedback,
+            character_target=target,
+        )
+        for target in targets[:8]
+    )
+
+
+def _character_model_sheet_review_criteria(request: str, task: str) -> dict[str, object] | None:
+    if not _is_character_model_sheet_prompt(request, task):
+        return None
+    targets = _character_model_sheet_targets(request, task)
+    criteria: dict[str, object] = {
+        "title": "角色参考设定表审核标准",
+        "reject_if": (
+            "图片数量少于明确要求的角色数量",
+            "一张图片包含多个角色或把多个角色放在同一张设定表",
+            "主定妆照、三视图、表情或服装细节不像同一人物",
+            "同一设定表混用写实照片、二次元头像或线稿三视图",
+            "过度简化为头像/单张主图，或过度堆叠复杂资产格和小物件",
+        ),
+        "layout": "每个角色一张独立图片；一张图片只允许一个角色；采用中等复杂度。",
+        "identity": "同一人物身份必须一致。",
+        "style": "同一画风；不得混合写实、二次元和线稿。",
+    }
+    if len(targets) >= 2:
+        criteria["required_outputs"] = f"男女主至少应有 {len(targets)} 张独立图片。"
+        criteria["targets"] = targets
+    style_lock = _character_model_sheet_style_lock(request, task)
+    if style_lock is not None:
+        criteria["style_lock"] = style_lock
+    return criteria
 
 
 def _direct_runtime_completion(
@@ -3487,6 +3591,15 @@ class CrewDispatchRuntime:
                 "logical_model": logical_model,
                 "generation_prompt": generation_prompt,
             }
+            artifact_prompts = _direct_multimedia_artifact_prompts(
+                context,
+                step,
+                sources,
+                feedback,
+            )
+            if artifact_prompts:
+                arguments["artifact_count"] = len(artifact_prompts)
+                arguments["artifact_prompts"] = artifact_prompts
             started_payload = {
                 "kind": kind,
                 "logical_model": logical_model,
@@ -4416,8 +4529,18 @@ class CrewDispatchRuntime:
         previous_failure: str | None = None,
     ) -> tuple[str, str | None, tuple[Artifact, ...]]:
         review_preview_bytes = 1_200 if review_attempt == 0 else 480
+        review_payload = _artifact_review_packet_payload(
+            artifact,
+            max_preview_bytes=review_preview_bytes,
+        )
+        character_sheet_criteria = _character_model_sheet_review_criteria(
+            context.request,
+            step.task,
+        )
+        if character_sheet_criteria is not None:
+            review_payload["acceptance_criteria"] = character_sheet_criteria
         payload = json.dumps(
-            _artifact_review_packet_payload(artifact, max_preview_bytes=review_preview_bytes),
+            review_payload,
             ensure_ascii=False,
             sort_keys=True,
         )

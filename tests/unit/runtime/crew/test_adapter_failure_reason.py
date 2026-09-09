@@ -865,6 +865,48 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     assert completed.payload["logical_model"] == "media_primary"
 
 
+async def test_multimedia_generator_direct_character_sheet_splits_gender_lead_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="为男女主生成角色参考设定表，风格全是二次元，不要太细节也不要太简化")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "multimedia_generator"
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 2
+    assert "男主" in cast(str, artifact_prompts[0])
+    assert "女主" in cast(str, artifact_prompts[1])
+    for prompt in artifact_prompts:
+        prompt_text = cast(str, prompt)
+        assert "一张图只包含一个角色" in prompt_text
+        assert "同一画风" in prompt_text
+        assert "全二次元" in prompt_text
+        assert "中等复杂度" in prompt_text
+        assert "不要只输出头像或单张主图" in prompt_text
+        assert "禁止写实主图+二次元表情+线稿三视图" in prompt_text
+
+
 async def test_video_compositor_directly_composes_upstream_file_handles_without_text_model() -> None:
     class FailingTextGateway:
         def __init__(self) -> None:
@@ -2060,6 +2102,54 @@ async def test_reviewer_prompt_uses_review_packet_for_candidate_artifact() -> No
     assert "review candidate body review candidate body" in reviewer_prompt
     assert gateway.large_text not in reviewer_prompt
     assert '"content"' not in reviewer_prompt
+
+
+async def test_reviewer_prompt_adds_character_sheet_acceptance_criteria() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+            ),
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                reviewer="critic",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    factory = CapturingFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=factory,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="为男女主生成角色参考设定表，风格全是写实，不要太细节也不要太简化")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reviewer_prompt = next(prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt)
+    assert "角色参考设定表审核标准" in reviewer_prompt
+    assert "男女主至少应有 2 张独立图片" in reviewer_prompt
+    assert "一张图片只允许一个角色" in reviewer_prompt
+    assert "同一人物身份必须一致" in reviewer_prompt
+    assert "同一画风" in reviewer_prompt
+    assert "全写实" in reviewer_prompt
+    assert "中等复杂度" in reviewer_prompt
 
 
 async def test_reviewer_timeout_is_recorded_and_dispatch_continues() -> None:

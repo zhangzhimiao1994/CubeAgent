@@ -352,6 +352,16 @@ def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None
     assert isinstance(prompt, Mapping)
     assert prompt["type"] == "string"
     assert prompt["minLength"] == 1
+    artifact_count = properties["artifact_count"]
+    assert isinstance(artifact_count, Mapping)
+    assert artifact_count["type"] == "integer"
+    assert artifact_count["minimum"] == 1
+    assert artifact_count["maximum"] == 8
+    artifact_prompts = properties["artifact_prompts"]
+    assert isinstance(artifact_prompts, Mapping)
+    assert artifact_prompts["type"] == "array"
+    assert artifact_prompts["minItems"] == 1
+    assert artifact_prompts["maxItems"] == 8
 
 
 def test_compose_video_tool_definition_exposes_strict_clip_contract() -> None:

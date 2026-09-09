@@ -59,6 +59,7 @@ class FakeMultimediaExecutor:
         self.expires_at = self.created_at + timedelta(hours=24)
         self.submitted: list[tuple[MultimediaGenerationKind, str, str]] = []
         self.run_requests: list[tuple[str, str]] = []
+        self._jobs: dict[str, MultimediaGenerationJob] = {}
 
     async def default_logical_model_for_multimedia(
         self,
@@ -75,8 +76,10 @@ class FakeMultimediaExecutor:
         prompt: str,
     ) -> MultimediaGenerationJob:
         self.submitted.append((kind, logical_model, prompt))
-        return MultimediaGenerationJob(
-            id="media_test",
+        index = len(self.submitted)
+        job_id = "media_test" if index == 1 else f"media_test_{index}"
+        job = MultimediaGenerationJob(
+            id=job_id,
             kind=kind,
             logical_model=logical_model,
             prompt=prompt,
@@ -84,6 +87,8 @@ class FakeMultimediaExecutor:
             created_at=self.created_at,
             expires_at=self.expires_at,
         )
+        self._jobs[job_id] = job
+        return job
 
     async def run_job(
         self,
@@ -92,25 +97,38 @@ class FakeMultimediaExecutor:
         executor_id: str,
     ) -> MultimediaGenerationJob:
         self.run_requests.append((job_id, executor_id))
+        job = self._jobs[job_id]
         return MultimediaGenerationJob(
             id=job_id,
-            kind=MultimediaGenerationKind.VIDEO,
-            logical_model="video_primary",
-            prompt="生成 5 秒产品视频",
+            kind=job.kind,
+            logical_model=job.logical_model,
+            prompt=job.prompt,
             status=MultimediaGenerationJobStatus.SUCCEEDED,
             executor_id=executor_id,
             created_at=self.created_at,
             expires_at=self.expires_at,
             artifacts=(
                 MultimediaArtifact(
-                    kind=MultimediaGenerationKind.VIDEO,
-                    uri="artifact://generated-video",
-                    text="artifact://generated-video",
-                    logical_model="video_primary",
-                    deployment_id="video_primary_1",
+                    kind=job.kind,
+                    uri=(
+                        "artifact://generated-video"
+                        if job.kind is MultimediaGenerationKind.VIDEO
+                        else f"artifact://{job_id}"
+                    ),
+                    text=(
+                        "artifact://generated-video"
+                        if job.kind is MultimediaGenerationKind.VIDEO
+                        else f"artifact://{job_id}"
+                    ),
+                    logical_model=job.logical_model,
+                    deployment_id=f"{job.logical_model}_1",
                     file_path=self.media_path,
-                    filename="generated-video.mp4",
-                    mime_type="video/mp4",
+                    filename=self.media_path.name,
+                    mime_type=(
+                        "video/mp4"
+                        if job.kind is MultimediaGenerationKind.VIDEO
+                        else "image/png"
+                    ),
                 ),
             ),
         )
@@ -429,6 +447,52 @@ async def test_runtime_gateway_multimedia_generation_tool_keeps_legacy_prompt_co
     assert media_executor.submitted == [
         (MultimediaGenerationKind.VIDEO, "video_primary", "生成 5 秒产品视频")
     ]
+
+
+async def test_runtime_gateway_multimedia_generation_tool_runs_each_artifact_prompt(
+    tmp_path: Path,
+) -> None:
+    media_path = tmp_path / "character-sheet.png"
+    media_path.write_bytes(b"image")
+    media_executor = FakeMultimediaExecutor(media_path)
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+        multimedia_generation_executor=media_executor,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="multimedia_generator",
+        name="generate_multimedia",
+        arguments={
+            "kind": "image",
+            "logical_model": "image_primary",
+            "generation_prompt": "为男女主生成角色参考设定表",
+            "artifact_count": 2,
+            "artifact_prompts": (
+                "为男主单独生成一张角色参考设定表",
+                "为女主单独生成一张角色参考设定表",
+            ),
+        },
+        idempotency_key="media_multi_character_sheet",
+    )
+
+    assert media_executor.submitted == [
+        (MultimediaGenerationKind.IMAGE, "image_primary", "为男主单独生成一张角色参考设定表"),
+        (MultimediaGenerationKind.IMAGE, "image_primary", "为女主单独生成一张角色参考设定表"),
+    ]
+    assert media_executor.run_requests == [
+        ("media_test", "multimedia_generator"),
+        ("media_test_2", "multimedia_generator"),
+    ]
+    assert result["job_id"] == "media_test"
+    assert result["job_ids"] == ("media_test", "media_test_2")
+    assert result["summary"] == "Generated 2 image artifacts with image_primary."
+    artifacts = result["artifacts"]
+    assert isinstance(artifacts, tuple)
+    assert len(artifacts) == 2
 
 
 async def test_runtime_gateway_multimedia_tool_requires_executor(tmp_path: Path) -> None:

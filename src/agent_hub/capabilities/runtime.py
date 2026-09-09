@@ -57,6 +57,7 @@ _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
 _MAX_VIDEO_CLIPS = 32
+_MAX_MULTIMEDIA_ARTIFACT_COUNT = 8
 _VIDEO_CLIP_EXTENSIONS = {
     MP4_MIME_TYPE: (".mp4",),
     PNG_MIME_TYPE: (".png",),
@@ -369,42 +370,55 @@ class RuntimeCapabilityGateway:
         logical_model = _required_string(arguments, "logical_model").strip()
         prompt_field = "generation_prompt" if "generation_prompt" in arguments else "prompt"
         prompt = _required_string(arguments, prompt_field).strip()
-        job = executor.submit(kind=kind, logical_model=logical_model, prompt=prompt)
-        completed = await executor.run_job(job.id, executor_id=actor)
+        prompts = _multimedia_generation_prompts(arguments, fallback_prompt=prompt)
         media_results: list[Mapping[str, JsonValue]] = []
         first_file_metadata: dict[str, JsonValue] | None = None
-        expires_at = (
-            completed.expires_at.isoformat() if completed.expires_at is not None else None
-        )
-        for index, artifact in enumerate(completed.artifacts):
-            file_metadata = _stored_multimedia_file_metadata(
-                self._generated_file_store,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                artifact=artifact,
-                expires_at=expires_at,
+        completed_jobs: list[MultimediaGenerationJob] = []
+        for item_prompt in prompts:
+            job = executor.submit(kind=kind, logical_model=logical_model, prompt=item_prompt)
+            completed = await executor.run_job(job.id, executor_id=actor)
+            completed_jobs.append(completed)
+            expires_at = (
+                completed.expires_at.isoformat() if completed.expires_at is not None else None
             )
-            if file_metadata is not None and first_file_metadata is None:
-                first_file_metadata = file_metadata
-            media_results.append(
-                _multimedia_artifact_result(
-                    artifact,
-                    job_id=completed.id,
-                    artifact_index=index,
+            for index, artifact in enumerate(completed.artifacts):
+                file_metadata = _stored_multimedia_file_metadata(
+                    self._generated_file_store,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    artifact=artifact,
                     expires_at=expires_at,
-                    file_metadata=file_metadata,
                 )
-            )
+                if file_metadata is not None and first_file_metadata is None:
+                    first_file_metadata = file_metadata
+                media_results.append(
+                    _multimedia_artifact_result(
+                        artifact,
+                        job_id=completed.id,
+                        artifact_index=index,
+                        expires_at=expires_at,
+                        file_metadata=file_metadata,
+                    )
+                )
+        first_completed = completed_jobs[0]
+        artifact_total = max(1, len(media_results))
+        summary = (
+            f"Generated {kind.value} artifact with {logical_model}."
+            if artifact_total == 1
+            else f"Generated {artifact_total} {kind.value} artifacts with {logical_model}."
+        )
         result: dict[str, JsonValue] = {
-            "job_id": completed.id,
-            "kind": completed.kind.value,
-            "logical_model": completed.logical_model,
-            "status": completed.status.value,
-            "executor_id": completed.executor_id,
-            "summary": f"Generated {completed.kind.value} artifact with {completed.logical_model}.",
+            "job_id": first_completed.id,
+            "kind": first_completed.kind.value,
+            "logical_model": first_completed.logical_model,
+            "status": first_completed.status.value,
+            "executor_id": first_completed.executor_id,
+            "summary": summary,
             "artifacts": tuple(media_results),
             "presentation": "final_attachment",
         }
+        if len(completed_jobs) > 1:
+            result["job_ids"] = tuple(job.id for job in completed_jobs)
         if first_file_metadata is not None:
             result["artifact_id"] = first_file_metadata["artifact_id"]
             result["file"] = first_file_metadata
@@ -693,6 +707,39 @@ def _clip_optional_int(arguments: Mapping[str, JsonValue], field_name: str) -> i
     if type(value) is not int:
         raise RuntimeCapabilityError(f"{field_name} must be an integer")
     return value
+
+
+def _multimedia_generation_prompts(
+    arguments: Mapping[str, JsonValue],
+    *,
+    fallback_prompt: str,
+) -> tuple[str, ...]:
+    raw_prompts = arguments.get("artifact_prompts")
+    raw_count = arguments.get("artifact_count")
+    if raw_prompts is not None:
+        if not isinstance(raw_prompts, list | tuple):
+            raise RuntimeCapabilityError("artifact_prompts must be a list")
+        prompts = tuple(_nonblank_prompt(item, "artifact_prompts item") for item in raw_prompts)
+        if not 1 <= len(prompts) <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+            raise RuntimeCapabilityError("artifact_prompts must contain 1 to 8 entries")
+        if raw_count is not None and raw_count != len(prompts):
+            raise RuntimeCapabilityError("artifact_count must match artifact_prompts length")
+        return prompts
+    count = _optional_int(arguments, "artifact_count", default=1)
+    if not 1 <= count <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+        raise RuntimeCapabilityError("artifact_count must be between 1 and 8")
+    if count == 1:
+        return (fallback_prompt,)
+    return tuple(
+        f"{fallback_prompt}\n\n输出第 {index}/{count} 个独立产物。"
+        for index in range(1, count + 1)
+    )
+
+
+def _nonblank_prompt(value: object, field_name: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
 
 
 def _multimedia_kind(arguments: Mapping[str, JsonValue]) -> MultimediaGenerationKind:
