@@ -859,13 +859,20 @@ describe("operational management pages", () => {
               { status: 409 },
             );
           }
+          const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+          const rawSkillFilename = headers.get("X-Agent-Hub-Skill-Filename") ?? "uploaded-skill.zip";
+          const skillFilename =
+            headers.get("X-Agent-Hub-Skill-Filename-Encoding") === "percent"
+              ? decodeURIComponent(rawSkillFilename)
+              : rawSkillFilename;
+          const skillSlug = skillFilename.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "_").toLowerCase();
           return jsonResponse({
-            filename: "uploaded-skill.zip",
+            filename: skillFilename,
             bundle: false,
             items: [
               {
-                id: "skill-uploaded-from-chat",
-                name: "uploaded_skill",
+                id: skillFilename === "uploaded-skill.zip" ? "skill-uploaded-from-chat" : `skill-${skillSlug}`,
+                name: skillFilename === "uploaded-skill.zip" ? "uploaded_skill" : skillSlug,
                 version: "1.0.0",
                 status: "scanned",
                 requested_permissions: ["tool:filesystem.read"],
@@ -1073,8 +1080,13 @@ describe("operational management pages", () => {
           const filename = headers.get("X-Agent-Hub-Filename-Encoding") === "percent" ? decodeURIComponent(rawFilename) : rawFilename;
           const contentType = headers.get("Content-Type") ?? "image/png";
           const archive = /\.(?:zip|tar|tgz|gz|bz2|xz|zst|rar|7z|cab|iso|jar|war|ear|apk|ipa)$/i.test(filename);
+          const attachmentId = filename.includes("second")
+            ? "att_22222222222222222222222222222222"
+            : filename.includes("first")
+              ? "att_11111111111111111111111111111111"
+              : "att_0123456789abcdef0123456789abcdef";
           return jsonResponse({
-            id: "att_0123456789abcdef0123456789abcdef",
+            id: attachmentId,
             filename,
             kind: archive ? "archive" : contentType.startsWith("image/") ? "image" : "context",
             content_type: contentType,
@@ -2313,7 +2325,7 @@ describe("operational management pages", () => {
     expect(input.value).toBe("");
 
     await user.upload(input, file);
-    expect(await screen.findByText("图片已上传。提交任务后会作为附件引用进入运行上下文。")).not.toBeNull();
+    expect(await screen.findByText("图片已添加到本轮消息。")).not.toBeNull();
     expect(screen.queryByText(/附件上传失败/)).toBeNull();
 
     const uploads = requests.filter((request) => request.path === "/api/v1/runs/attachments/upload");
@@ -4007,6 +4019,27 @@ describe("operational management pages", () => {
     });
   });
 
+  it("forwards @skill and $plugin mentions from a normal chat message", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @deep-research 和 $plugin:runway 生成调研方案");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "用 @deep-research 和 $plugin:runway 生成调研方案",
+        requested_skills: ["deep-research"],
+        requested_plugins: ["runway"],
+      },
+    });
+  });
+
   it("does not ask again when a manually selected mode is returned as backend clarification", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -4047,7 +4080,7 @@ describe("operational management pages", () => {
     });
     expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toBeUndefined();
 
-    await user.click(screen.getByRole("button", { name: "作为 Skill 安装" }));
+    await user.click(screen.getByRole("button", { name: "作为 Skill 扫描" }));
 
     expect(await screen.findByText("Skill 压缩包已扫描，等待确认")).not.toBeNull();
     expect(screen.getByText("uploaded_skill")).not.toBeNull();
@@ -4063,6 +4096,47 @@ describe("operational management pages", () => {
     });
   });
 
+  it("routes an uploaded archive with install intent to skill scanning instead of a normal run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+    expect(await screen.findByText("压缩包附件")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "自动安装这个 skill");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText("Skill 压缩包已扫描，等待确认")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toMatchObject({
+      method: "POST",
+    });
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toBeUndefined();
+  });
+
+  it("keeps multiple uploaded archives visible and scans all of them from install intent", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), [
+      new File(["PK\x03\x04first"], "first-skill.zip", { type: "application/zip" }),
+      new File(["PK\x03\x04second"], "second-skill.zip", { type: "application/zip" }),
+    ]);
+
+    expect(await screen.findByText("first-skill.zip")).not.toBeNull();
+    expect(await screen.findByText("second-skill.zip")).not.toBeNull();
+    expect(screen.getByText("2 个可扫描 Skill 压缩包")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "安装这些 skill 包");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText(/2 个 Skill 压缩包/)).not.toBeNull();
+    expect(requests.filter((request) => request.path === "/api/v1/admin/skills/upload")).toHaveLength(2);
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toBeUndefined();
+  });
+
   it("prompts for overwrite or new version when chat skill upload conflicts", async () => {
     skillUploadConflict = true;
     const user = userEvent.setup();
@@ -4071,7 +4145,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
     await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
-    await user.click(await screen.findByRole("button", { name: "作为 Skill 安装" }));
+    await user.click(await screen.findByRole("button", { name: "作为 Skill 扫描" }));
 
     expect(await screen.findByRole("alert", { name: "Skill 版本选择" })).not.toBeNull();
     expect(screen.getByText("uploaded_skill")).not.toBeNull();
@@ -4105,6 +4179,36 @@ describe("operational management pages", () => {
       body: {
         message: "请根据图片说明问题",
         attachment_ids: ["att_0123456789abcdef0123456789abcdef"],
+      },
+    });
+  });
+
+  it("submits every uploaded normal attachment id with a chat run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), [
+      new File(["first"], "first-note.txt", { type: "text/plain" }),
+      new File(["second"], "second-note.txt", { type: "text/plain" }),
+    ]);
+    expect(await screen.findByText("first-note.txt")).not.toBeNull();
+    expect(await screen.findByText("second-note.txt")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "请根据这些附件继续分析");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "请根据这些附件继续分析",
+        attachment_ids: [
+          "att_11111111111111111111111111111111",
+          "att_22222222222222222222222222222222",
+        ],
       },
     });
   });

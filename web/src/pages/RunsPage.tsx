@@ -32,12 +32,19 @@ type ChatAttachmentDraft = {
   fileName: string;
   size: number;
   kind: "archive" | "image" | "context";
+  file?: File;
   attachment?: AttachmentUpload;
 };
 type SkillUploadStrategy = "overwrite" | "new_version";
 type SkillUploadRequest = {
-  file: File;
+  file?: File;
+  files?: File[];
   strategy?: SkillUploadStrategy;
+};
+type SkillUploadBatchResult = {
+  files: File[];
+  skills: Skill[];
+  skipped: SkillArchiveUpload["skipped"];
 };
 type SkillUploadConflict = {
   file: File;
@@ -146,6 +153,60 @@ function skillUploadConflictFromError(error: unknown, file: File): SkillUploadCo
 function isArchiveFileName(fileName: string) {
   const lower = fileName.toLowerCase();
   return ARCHIVE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function uniqueAttachmentIds(drafts: ChatAttachmentDraft[]) {
+  const ids: string[] = [];
+  for (const draft of drafts) {
+    const id = draft.attachment?.id;
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function archiveDraftFiles(drafts: ChatAttachmentDraft[]) {
+  return drafts
+    .filter((draft) => draft.kind === "archive" && draft.file)
+    .map((draft) => draft.file as File);
+}
+
+function matchesDraftFile(draft: ChatAttachmentDraft, file: File) {
+  return draft.file === file || (draft.fileName === file.name && draft.size === file.size);
+}
+
+function hasSkillInstallIntent(text: string) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const installIntent = /(安装|装上|导入|加载|启用|接入|使用|install|enable|import|load)/i.test(normalized);
+  const skillTarget = /(skill|技能|插件|工具包|能力包|压缩包|zip|tar)/i.test(normalized);
+  return installIntent && skillTarget;
+}
+
+function referencedCapabilitiesFromText(text: string) {
+  const skills: string[] = [];
+  const plugins: string[] = [];
+  const mentionPattern = /[@$]([a-zA-Z0-9_\-:.\/\u4e00-\u9fff]{2,80})/g;
+  for (const match of text.matchAll(mentionPattern)) {
+    const raw = match[1]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
+    if (!raw) continue;
+    const normalized = raw.toLowerCase();
+    if (normalized.startsWith("plugin:")) {
+      const plugin = raw.slice("plugin:".length);
+      if (plugin && !plugins.includes(plugin)) plugins.push(plugin);
+      continue;
+    }
+    if (normalized.startsWith("skill:")) {
+      const skill = raw.slice("skill:".length);
+      if (skill && !skills.includes(skill)) skills.push(skill);
+      continue;
+    }
+    if (normalized.includes("plugin") || normalized.includes("插件")) {
+      if (!plugins.includes(raw)) plugins.push(raw);
+    } else if (!skills.includes(raw)) {
+      skills.push(raw);
+    }
+  }
+  return { skills, plugins };
 }
 
 function newConversationId() {
@@ -3103,8 +3164,8 @@ export function RunsPage() {
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [skillUploadConflict, setSkillUploadConflict] = useState<SkillUploadConflict | null>(null);
-  const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
-  const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
+  const [attachmentDrafts, setAttachmentDrafts] = useState<ChatAttachmentDraft[]>([]);
+  const [attachmentUploadCount, setAttachmentUploadCount] = useState(0);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
@@ -3300,6 +3361,7 @@ export function RunsPage() {
       const runMessage = (override?.message ?? message).trim();
       const runMode = override?.mode ?? mode;
       const selectedDirectModel = (override?.directModel ?? directModel).trim();
+      const referencedCapabilities = referencedCapabilitiesFromText(runMessage);
       return api.createRun({
         message: runMessage,
         mode: runMode,
@@ -3309,7 +3371,9 @@ export function RunsPage() {
         direct_model: runMode === "direct" ? selectedDirectModel : null,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
-        attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
+        attachment_ids: uniqueAttachmentIds(attachmentDrafts),
+        requested_skills: referencedCapabilities.skills,
+        requested_plugins: referencedCapabilities.plugins,
         skip_evolution_proposal: true,
       });
     },
@@ -3338,8 +3402,7 @@ export function RunsPage() {
           await queryClient.invalidateQueries({ queryKey: ["conversation", continued.conversation_id] });
         }
         setMessage("");
-        setAttachmentDraft(null);
-        setArchiveInstallFile(null);
+        setAttachmentDrafts([]);
         return;
       }
       if (run.openclaw_proposal) {
@@ -3382,8 +3445,7 @@ export function RunsPage() {
         setSubmitNotice(override?.successNotice ?? null);
       }
       setMessage("");
-      setAttachmentDraft(null);
-      setArchiveInstallFile(null);
+      setAttachmentDrafts([]);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
       if (run.conversation_id) {
@@ -3677,16 +3739,47 @@ export function RunsPage() {
   });
 
   const uploadSkillArchive = useMutation({
-    mutationFn: ({ file, strategy }: SkillUploadRequest) => api.uploadSkillArchive(file, strategy),
-    onSuccess: (result, { file }) => {
-      setArchiveInstallFile(null);
+    mutationFn: async ({ file, files, strategy }: SkillUploadRequest): Promise<SkillUploadBatchResult> => {
+      const uploadFiles = files?.length ? files : file ? [file] : [];
+      if (uploadFiles.length === 0) throw new Error("skill archive file is unavailable");
+      const uploads: SkillArchiveUpload[] = [];
+      for (const uploadFile of uploadFiles) {
+        try {
+          uploads.push(await api.uploadSkillArchive(uploadFile, strategy));
+        } catch (error) {
+          throw Object.assign(error instanceof Error ? error : new Error("Skill archive upload failed"), {
+            skillArchiveFile: uploadFile,
+          });
+        }
+      }
+      return {
+        files: uploadFiles,
+        skills: uploads.flatMap((upload) => upload.items),
+        skipped: uploads.flatMap((upload) => upload.skipped),
+      };
+    },
+    onSuccess: (result) => {
       setSkillUploadConflict(null);
-      setSkillInstallCandidate({ fileName: file.name, skills: result.items, skipped: result.skipped, status: "scanned" });
+      setAttachmentDrafts((current) =>
+        current.filter((draft) => !result.files.some((file) => matchesDraftFile(draft, file))),
+      );
+      setSkillInstallCandidate({
+        fileName: result.files.length === 1 ? result.files[0].name : `${result.files.length} 个 Skill 压缩包`,
+        skills: result.skills,
+        skipped: result.skipped,
+        status: "scanned",
+      });
       setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
-    onError: (error, { file }) => {
-      const conflict = skillUploadConflictFromError(error, file);
+    onError: (error, { file, files }) => {
+      const failedFile =
+        (error as { skillArchiveFile?: File }).skillArchiveFile ?? file ?? files?.[0];
+      if (!failedFile) {
+        setSubmitNotice("Skill 扫描失败。请重新上传压缩包后再试。");
+        return;
+      }
+      const conflict = skillUploadConflictFromError(error, failedFile);
       if (conflict) {
         setSkillInstallCandidate(null);
         setSkillUploadConflict(conflict);
@@ -3695,12 +3788,18 @@ export function RunsPage() {
       }
       setSkillUploadConflict(null);
       setSkillInstallCandidate(null);
-      setAttachmentDraft((current) =>
-        current ?? {
-          fileName: file.name,
-          size: file.size,
-          kind: isArchiveFileName(file.name) ? "archive" : "context",
-        },
+      setAttachmentDrafts((current) =>
+        current.some((draft) => matchesDraftFile(draft, failedFile))
+          ? current
+          : [
+              ...current,
+              {
+                fileName: failedFile.name,
+                size: failedFile.size,
+                kind: isArchiveFileName(failedFile.name) ? "archive" : "context",
+                file: failedFile,
+              },
+            ],
       );
       setSubmitNotice(
         error instanceof ApiError && error.code === "invalid_skill_package"
@@ -3732,29 +3831,33 @@ export function RunsPage() {
             ? "archive"
             : "context";
       setSkillInstallCandidate(null);
-      setAttachmentDraft({ fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, attachment });
-      setArchiveInstallFile(kind === "archive" ? file : null);
+      setAttachmentDrafts((current) => [
+        ...current.filter((draft) => !matchesDraftFile(draft, file)),
+        { fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, file, attachment },
+      ]);
       setSubmitNotice(
         kind === "archive"
-          ? "压缩包已上传。请在输入框说明它是 Skill、代码审查材料，还是普通任务附件。"
+          ? "压缩包已添加到本轮消息；输入安装意图会进入 Skill 扫描。"
           : kind === "image"
-            ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
-            : "附件已上传。提交任务后会作为附件引用进入运行上下文。",
+            ? "图片已添加到本轮消息。"
+            : "附件已添加到本轮消息。",
       );
     },
+    onSettled: () => setAttachmentUploadCount((current) => Math.max(0, current - 1)),
   });
 
   function handleAttachmentUpload(fileList: FileList | null) {
-    const file = fileList?.item(0);
-    if (!file) return;
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0) return;
     uploadAttachment.reset();
     uploadSkillArchive.reset();
     setSubmitNotice(null);
-    setAttachmentDraft(null);
     setSkillInstallCandidate(null);
     setSkillUploadConflict(null);
-    setArchiveInstallFile(isArchiveFileName(file.name) ? file : null);
-    uploadAttachment.mutate(file);
+    setAttachmentUploadCount((current) => current + files.length);
+    for (const file of files) {
+      uploadAttachment.mutate(file);
+    }
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -3873,6 +3976,17 @@ export function RunsPage() {
         return;
       }
     }
+    const skillArchiveFiles = archiveDraftFiles(attachmentDrafts);
+    if (skillArchiveFiles.length > 0 && hasSkillInstallIntent(effectiveMessage)) {
+      setMessage("");
+      setSubmitNotice(
+        skillArchiveFiles.length === 1
+          ? "已识别为 Skill 安装请求，正在扫描压缩包。"
+          : `已识别为 Skill 安装请求，正在扫描 ${skillArchiveFiles.length} 个压缩包。`,
+      );
+      uploadSkillArchive.mutate({ files: skillArchiveFiles });
+      return;
+    }
     if (effectiveMode === "direct") {
       if (savedModels.length === 0) {
         setSubmitNotice("还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。");
@@ -3922,6 +4036,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
+    setAttachmentDrafts([]);
+    setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setProcessDetailTarget(null);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
@@ -3943,6 +4060,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
+    setAttachmentDrafts([]);
+    setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setProcessDetailTarget(null);
     setSubmitNotice(`已按原思路新建分支：新对话会读取 ${trimmedSourceConversationId} 作为参考上下文。`);
   }
@@ -3994,6 +4114,8 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
+  const attachmentUploadBusy = attachmentUploadCount > 0 || uploadAttachment.isPending;
+  const skillScanBusy = uploadSkillArchive.isPending;
   const refreshedRunForProcessDetail = processDetailTarget
     ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
       (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
@@ -4081,7 +4203,7 @@ export function RunsPage() {
       observer.disconnect();
       window.removeEventListener("resize", updateFooterHeight);
     };
-  }, [activeProcessDockRun, attachmentDraft, showModeEntry, submitNotice, skillInstallCandidate, skillUploadConflict]);
+  }, [activeProcessDockRun, attachmentDrafts, showModeEntry, submitNotice, skillInstallCandidate, skillUploadConflict]);
 
   if (runs.isLoading) {
     return <p>正在加载对话...</p>;
@@ -4534,8 +4656,8 @@ export function RunsPage() {
                 {skillInstallCandidate.skills.some((skill) => skill.requested_permissions.length > 0) ? (
                   <ul>
                     {skillInstallCandidate.skills.flatMap((skill) =>
-                      skill.requested_permissions.map((permission) => (
-                        <li key={`${skill.id}-${permission}`}>
+                      skill.requested_permissions.map((permission, permissionIndex) => (
+                        <li key={`${skill.id}-${permission}-${permissionIndex}`}>
                           {skill.name}: {permission}
                         </li>
                       )),
@@ -4556,8 +4678,24 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
-            {attachmentDraft ? (
-              <aside className="composer-attachment-card" role="status" aria-label="附件草稿">
+            {attachmentDrafts.length > 1 && archiveDraftFiles(attachmentDrafts).length > 1 ? (
+              <aside className="composer-attachment-card" role="status" aria-label="批量 Skill 安装">
+                <div>
+                  <span className="eyebrow">多个压缩包</span>
+                  <strong>{archiveDraftFiles(attachmentDrafts).length} 个可扫描 Skill 压缩包</strong>
+                  <small>也可以直接输入“安装这些 skill”</small>
+                </div>
+                <button
+                  type="button"
+                  disabled={skillScanBusy}
+                  onClick={() => uploadSkillArchive.mutate({ files: archiveDraftFiles(attachmentDrafts) })}
+                >
+                  {skillScanBusy ? "扫描中..." : "全部作为 Skill 扫描"}
+                </button>
+              </aside>
+            ) : null}
+            {attachmentDrafts.map((attachmentDraft) => (
+              <aside className="composer-attachment-card" role="status" aria-label="附件草稿" key={`${attachmentDraft.fileName}-${attachmentDraft.size}`}>
                 <div>
                   <span className="eyebrow">
                     {attachmentDraft.kind === "archive"
@@ -4571,22 +4709,22 @@ export function RunsPage() {
                 </div>
                 <p>
                   {attachmentDraft.kind === "archive"
-                    ? "压缩包已作为附件保存。请在对话里说明它是 Skill、代码审查材料，还是普通任务文件。"
+                    ? "压缩包已作为附件保存。输入安装意图会转入 Skill 扫描；作为普通资料提交后，后续同会话也会保留附件清单上下文。"
                     : attachmentDraft.kind === "image"
-                      ? "图片已选中。当前先记录附件，启用多模态链路后可交给视觉模型识别。"
-                      : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
+                      ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
+                      : "附件已上传。提交任务后会作为附件引用进入运行上下文。"}
                 </p>
-                {attachmentDraft.kind === "archive" && archiveInstallFile ? (
+                {attachmentDraft.kind === "archive" && attachmentDraft.file ? (
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
-                    onClick={() => uploadSkillArchive.mutate({ file: archiveInstallFile })}
+                    disabled={skillScanBusy}
+                    onClick={() => uploadSkillArchive.mutate({ file: attachmentDraft.file })}
                   >
-                    {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
+                    {skillScanBusy ? "扫描中..." : "作为 Skill 扫描"}
                   </button>
                 ) : null}
               </aside>
-            ) : null}
+            ))}
             {skillUploadConflict ? (
               <aside className="composer-attachment-card" role="alert" aria-label="Skill 版本选择">
                 <div>
@@ -4598,7 +4736,7 @@ export function RunsPage() {
                 <div className="composer-card-actions">
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
+                    disabled={skillScanBusy}
                     onClick={() =>
                       uploadSkillArchive.mutate({
                         file: skillUploadConflict.file,
@@ -4610,7 +4748,7 @@ export function RunsPage() {
                   </button>
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
+                    disabled={skillScanBusy}
                     onClick={() =>
                       uploadSkillArchive.mutate({
                         file: skillUploadConflict.file,
@@ -4652,8 +4790,9 @@ export function RunsPage() {
                   <input
                     aria-label="上传文件或 Skill 压缩包"
                     type="file"
+                    multiple
                     accept={ATTACHMENT_ACCEPT}
-                    disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                    disabled={skillScanBusy || attachmentUploadBusy}
                     onChange={(event) => {
                       handleAttachmentUpload(event.currentTarget.files);
                       event.currentTarget.value = "";
@@ -4695,15 +4834,16 @@ export function RunsPage() {
                 <button
                   type="submit"
                   className="composer-send-button"
-                  aria-label={uploadAttachment.isPending ? "上传中..." : createRun.isPending ? "发送中..." : "发送"}
+                  aria-label={attachmentUploadBusy ? "上传中..." : skillScanBusy ? "扫描中..." : createRun.isPending ? "发送中..." : "发送"}
                   disabled={
                     createRun.isPending ||
-                    uploadAttachment.isPending ||
+                    attachmentUploadBusy ||
+                    skillScanBusy ||
                     message.trim().length === 0 ||
                     Boolean(directSendBlockedReason)
                   }
                 >
-                  {createRun.isPending || uploadAttachment.isPending ? "…" : "↑"}
+                  {createRun.isPending || attachmentUploadBusy || skillScanBusy ? "…" : "↑"}
                 </button>
               </div>
             </div>
@@ -4711,8 +4851,8 @@ export function RunsPage() {
               <p className="field-help" role="status">{directSendBlockedReason}</p>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
-            {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
-            {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
+            {skillScanBusy ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
+            {attachmentUploadBusy ? <p role="status">正在上传附件...</p> : null}
             {uploadSkillArchive.isError && !skillUploadConflict ? (
               <p className="field-help" role="status">
                 {formatApiError(uploadSkillArchive.error, "Skill 扫描失败")}

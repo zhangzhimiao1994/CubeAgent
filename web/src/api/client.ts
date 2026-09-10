@@ -1577,6 +1577,8 @@ export const api = {
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
     attachment_ids?: string[];
+    requested_skills?: string[];
+    requested_plugins?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;
   }): Promise<SubmittedRun> {

@@ -634,6 +634,65 @@ async def test_execute_loads_current_attachment_artifacts_into_runtime_context()
 
 
 @pytest.mark.asyncio
+async def test_execute_loads_previous_conversation_attachment_artifacts_into_runtime_context() -> None:
+    previous_attachment_id = "att_22222222222222222222222222222222"
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "conversation_id": "conv-with-file",
+            "attachment_ids": [],
+        },
+        conversation_context=(
+            ConversationContextItem(
+                run_id=uuid4(),
+                request="安装这个 skill 压缩包",
+                artifacts=(),
+                routing_decision={
+                    "conversation_id": "conv-with-file",
+                    "attachment_ids": [previous_attachment_id],
+                },
+            ),
+        ),
+    )
+    runtime = RuntimeCapturesArtifacts()
+    previous_attachment_artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="uploaded_attachment",
+        content={
+            "text": "用户本轮上传了附件，以下内容与当前对话消息直接关联。\n文件名：safe-skill.zip",
+            "attachment_id": previous_attachment_id,
+        },
+    )
+
+    async def load_attachments(
+        *,
+        tenant_id: UUID,
+        attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]:
+        assert tenant_id == TENANT_ID
+        assert attachment_ids == (previous_attachment_id,)
+        return (previous_attachment_artifact,)
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        attachment_artifact_loader=load_attachments,
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert len(runtime.artifacts) >= 1
+    restored_attachment = runtime.artifacts[0]
+    assert restored_attachment.producer == "conversation_uploaded_attachment"
+    assert restored_attachment.content["context_scope"] == "previous_conversation_attachment"
+    assert "前序交互上传过附件" in str(restored_attachment.content["text"])
+
+
+@pytest.mark.asyncio
 async def test_terminal_hook_failure_does_not_fail_completed_run() -> None:
     repository = ExecutableFakeRepository(
         routing_decision={"source": "evolution", "evolution_run_id": "evolution_1"}

@@ -64,6 +64,7 @@ class StubRunService:
             str | None,
             tuple[str, ...],
             bool,
+            dict[str, str] | None,
         ]
     ]
     enqueue_count: int = 0
@@ -86,6 +87,7 @@ class StubRunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
@@ -106,6 +108,7 @@ class StubRunService:
                 reference_conversation_id,
                 attachment_ids,
                 skip_evolution_proposal,
+                channel_context,
             )
         )
         if not skip_evolution_proposal and "进化 darwin-skill" in message:
@@ -423,6 +426,7 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
             None,
             (),
             False,
+            None,
         )
     ]
     assert service.enqueue_count == 0
@@ -494,6 +498,7 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             None,
             (),
             False,
+            None,
         )
     ]
 
@@ -527,6 +532,7 @@ def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
             None,
             (),
             True,
+            None,
         )
     ]
 
@@ -577,6 +583,7 @@ def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> 
             None,
             (),
             False,
+            None,
         )
     ]
 
@@ -702,6 +709,7 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             "conv-previous",
             (),
             False,
+            None,
         )
     ]
 
@@ -921,6 +929,43 @@ def test_submission_forwards_attachment_ids() -> None:
             None,
             ("att_0123456789abcdef0123456789abcdef",),
             False,
+            None,
+        )
+    ]
+
+
+def test_submission_forwards_requested_skill_and_plugin_mentions() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "用 @deep-research 和 $plugin:runway 处理这个任务",
+            "mode": "auto",
+            "requested_skills": ["deep-research"],
+            "requested_plugins": ["runway"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "用 @deep-research 和 $plugin:runway 处理这个任务",
+            TaskMode.AUTO,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+            False,
+            {
+                "requested_skills": "deep-research",
+                "requested_plugins": "runway",
+            },
         )
     ]
 

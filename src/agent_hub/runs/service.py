@@ -20,7 +20,12 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.rules import assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
-from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
+from agent_hub.runs.repository import (
+    ConversationContextItem,
+    RunAlreadyActive,
+    RunRecord,
+    RunRepository,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -1396,6 +1401,11 @@ class RunService:
                 conversation_id,
             )
             return attachment_artifacts
+        previous_attachment_artifacts = await self._previous_attachment_artifacts(
+            tenant_id=tenant_id,
+            context_items=context_items,
+            current_attachment_ids=_attachment_ids_from_routing(routing_decision),
+        )
         main_agent_context_window_tokens = await self._main_agent_context_window_tokens(
             routing_decision
         )
@@ -1414,7 +1424,7 @@ class RunService:
             history_artifacts: tuple[Artifact, ...] = ()
         else:
             history_artifacts = (artifact,)
-        return (*attachment_artifacts, *history_artifacts)
+        return (*attachment_artifacts, *previous_attachment_artifacts, *history_artifacts)
 
     async def _current_attachment_artifacts(
         self,
@@ -1439,6 +1449,35 @@ class RunService:
                 len(attachment_ids),
             )
             return ()
+
+    async def _previous_attachment_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        context_items: tuple[ConversationContextItem, ...],
+        current_attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]:
+        if self._attachment_artifact_loader is None:
+            return ()
+        attachment_ids = _conversation_attachment_ids(
+            context_items,
+            excluding=current_attachment_ids,
+        )
+        if not attachment_ids:
+            return ()
+        try:
+            artifacts = await self._attachment_artifact_loader(
+                tenant_id=tenant_id,
+                attachment_ids=attachment_ids,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "conversation_attachment_context_load_failed tenant_id=%s attachment_count=%s",
+                tenant_id,
+                len(attachment_ids),
+            )
+            return ()
+        return _mark_previous_attachment_artifacts(artifacts)
 
     async def _main_agent_context_window_tokens(
         self, routing_decision: Mapping[str, object]
@@ -3020,6 +3059,47 @@ def _attachment_ids_from_routing(routing_decision: Mapping[str, object]) -> tupl
         if item not in result:
             result.append(item)
     return tuple(result)
+
+
+def _conversation_attachment_ids(
+    items: tuple[ConversationContextItem, ...],
+    *,
+    excluding: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    excluded = set(excluding)
+    result: list[str] = []
+    for item in items:
+        routing_decision = getattr(item, "routing_decision", None)
+        if not isinstance(routing_decision, Mapping):
+            continue
+        for attachment_id in _attachment_ids_from_routing(routing_decision):
+            if attachment_id in excluded or attachment_id in result:
+                continue
+            result.append(attachment_id)
+    return tuple(result)
+
+
+def _mark_previous_attachment_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    marked: list[Artifact] = []
+    for artifact in artifacts:
+        content = dict(artifact.content)
+        text = content.get("text")
+        if isinstance(text, str):
+            content["text"] = text.replace(
+                "用户本轮上传了附件，以下内容与当前对话消息直接关联。",
+                "用户在本会话前序交互上传过附件，以下内容可作为连续对话上下文引用。",
+                1,
+            )
+        content["context_scope"] = "previous_conversation_attachment"
+        marked.append(
+            Artifact(
+                id=artifact.id,
+                type=artifact.type,
+                producer="conversation_uploaded_attachment",
+                content=cast(Mapping[str, JsonValue], content),
+            )
+        )
+    return tuple(marked)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

@@ -77,6 +77,7 @@ class RunServiceProtocol(Protocol):
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -160,6 +161,8 @@ class CreateRunRequest(BaseModel):
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_skills: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_plugins: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
 
@@ -169,6 +172,28 @@ class CreateRunRequest(BaseModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+    @field_validator("requested_skills", "requested_plugins", mode="before")
+    @classmethod
+    def coerce_requested_capabilities(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("requested_skills", "requested_plugins")
+    @classmethod
+    def validate_requested_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            cleaned = item.strip()
+            if not cleaned or cleaned in seen or len(cleaned) > 100:
+                continue
+            if re.fullmatch(r"[\w\-:.\/\u4e00-\u9fff]+", cleaned) is None:
+                raise ValueError("requested capabilities must be safe identifiers")
+            seen.add(cleaned)
+            result.append(cleaned)
+        return tuple(result)
 
     @field_validator("attachment_ids")
     @classmethod
@@ -392,6 +417,8 @@ async def _record_run_submit_audit(
         "direct_model": body.direct_model,
         "vibe_coding": body.vibe_coding,
         "attachment_count": len(body.attachment_ids),
+        "requested_skills": list(body.requested_skills),
+        "requested_plugins": list(body.requested_plugins),
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
     }
@@ -401,6 +428,15 @@ async def _record_run_submit_audit(
         resource=str(submitted.id),
         details=details,
     )
+
+
+def _requested_capability_payload(body: CreateRunRequest) -> dict[str, str] | None:
+    payload: dict[str, str] = {}
+    if body.requested_skills:
+        payload["requested_skills"] = ",".join(body.requested_skills)
+    if body.requested_plugins:
+        payload["requested_plugins"] = ",".join(body.requested_plugins)
+    return payload or None
 
 
 def _attachment_store_dir(request: Request) -> Path:
@@ -822,6 +858,7 @@ async def create_run(
         direct_model=body.direct_model,
         vibe_coding=body.vibe_coding,
         skip_evolution_proposal=body.skip_evolution_proposal,
+        channel_context=_requested_capability_payload(body),
         idempotency_key=idempotency_key,
     )
     await _record_run_submit_audit(request, principal, body, submitted)
