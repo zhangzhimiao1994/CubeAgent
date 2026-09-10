@@ -442,6 +442,37 @@ async def test_final_attachment_tool_result_completes_without_extra_tool_rounds(
     assert len(gateway.requests) == 1
 
 
+async def test_step_prompt_includes_requested_plugin_context() -> None:
+    gateway = TextOnlyGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=()),
+        crew_factory=FastFactory(),
+    )
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="Compare $plugin:runway and local video generation.",
+        token_budget=1000,
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 1
+    serialized = "\n".join(
+        str(message.content)
+        for request in gateway.requests
+        for message in request.messages
+    )
+    assert "requested_plugin_context" in serialized
+    assert "runway" in serialized
+    assert "higgsfield" in serialized
+    assert "not proof" in serialized
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ("document.generate_docx", "presentation.generate_pptx", "project.generate_zip"),

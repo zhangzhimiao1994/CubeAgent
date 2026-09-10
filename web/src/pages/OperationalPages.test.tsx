@@ -4068,6 +4068,28 @@ describe("operational management pages", () => {
     });
   });
 
+  it("forwards full plugin ids with source suffixes from a normal chat message", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+    const pluginId = "app-6a05e3b201788191be12b590b43e6ce3@openai-curated-remote";
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), `用 $plugin:${pluginId} 生成视频`);
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: `用 $plugin:${pluginId} 生成视频`,
+        requested_skills: [],
+        requested_plugins: [pluginId],
+      },
+    });
+  });
+
   it("shows selected skill and plugin references before sending a chat message", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

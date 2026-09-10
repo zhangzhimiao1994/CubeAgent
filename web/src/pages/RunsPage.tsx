@@ -224,12 +224,12 @@ function skillUploadConflictStrategyFromText(text: string): SkillUploadStrategy 
 function referencedCapabilitiesFromText(text: string) {
   const skills: string[] = [];
   const plugins: string[] = [];
-  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/]{2,80})/g;
+  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/@]{2,100})/g;
   for (const match of text.matchAll(mentionPattern)) {
     const marker = match[2];
     const raw = match[3]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
     if (!raw) continue;
-    if (/^\d+(?:\.\d+)?$/.test(raw) || raw.includes("@")) continue;
+    if (/^\d+(?:\.\d+)?$/.test(raw) || (marker === "@" && raw.includes("@"))) continue;
     const normalized = raw.toLowerCase();
     if (normalized.startsWith("plugin:")) {
       const plugin = raw.slice("plugin:".length);
@@ -251,7 +251,7 @@ function referencedCapabilitiesFromText(text: string) {
 }
 
 function capabilityMentionTriggerFromText(text: string): CapabilityMentionTrigger | null {
-  const match = /(^|\s)([@$])([a-zA-Z0-9_\-:.\/\u4e00-\u9fff]*)$/u.exec(text);
+  const match = /(^|\s)([@$])([a-zA-Z0-9_\-:.\/@\u4e00-\u9fff]*)$/u.exec(text);
   if (!match) return null;
   return {
     start: (match.index ?? 0) + match[1].length,

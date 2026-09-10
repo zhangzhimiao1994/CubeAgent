@@ -33,6 +33,7 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _PlannedRuntime,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
     _should_use_standalone_multimedia_roles,
@@ -124,6 +125,26 @@ class FakeCapabilityAvailability:
     ) -> Mapping[str, JsonValue]:
         del tenant_id, run_id, actor, name, arguments, idempotency_key
         return {}
+
+
+class CompletingRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise RuntimeError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        return None
 
 
 class ImmediateCapacity:
@@ -1549,6 +1570,65 @@ def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
 
     assert any("HERMES_MEMORY_CONTEXT" in step.task for step in plan.steps)
     assert any("reviewer 超时时先压缩上下文再分块审查" in step.task for step in plan.steps)
+
+
+def test_dispatch_plan_includes_requested_plugin_context_in_steps() -> None:
+    role = RoleAssignment(
+        id="video_director",
+        role="Video Director",
+        purpose=RolePurpose.EXECUTE,
+        mission="Prepare video generation guidance.",
+        must_answer=("Which video workflow should run?",),
+        allowed_tools=(),
+        forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="main",
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="用 $plugin:runway 对比生成视频",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    plan = _dispatch_plan((role,), context, max_parallelism=1)
+
+    assert any("REQUESTED_PLUGIN_CONTEXT" in step.task for step in plan.steps)
+    assert any("runway" in step.task for step in plan.steps)
+    assert any("higgsfield" in step.task for step in plan.steps)
+    assert any("not proof" in step.task for step in plan.steps)
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_plan_event_includes_requested_plugin_context() -> None:
+    runtime = _PlannedRuntime(
+        CompletingRuntime(),
+        mode=TaskMode.DISPATCH,
+        main_agent_model="main",
+        roles=(),
+        steps=(),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="用 $plugin:runway 生成视频",
+        routing_decision={"requested_plugins": "runway"},
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    plan_event = events[0]
+    assert plan_event.kind is EventKind.STEP_STARTED
+    plugin_context = plan_event.payload["requested_plugin_context"]
+    assert isinstance(plugin_context, Mapping)
+    assert plugin_context["requested_plugins"] == ("runway",)
+    assert "not proof" in str(plugin_context["policy"])
 
 
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:

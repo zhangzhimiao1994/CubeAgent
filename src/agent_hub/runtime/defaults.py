@@ -42,6 +42,10 @@ from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.plugin_context import (
+    requested_plugin_context_payload,
+    requested_plugin_context_text,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
@@ -245,6 +249,7 @@ class _PlannedRuntime:
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         sequence_offset = 1
         if context.checkpoint is None:
+            plugin_context = requested_plugin_context_payload(context.routing_decision)
             yield RunEvent(
                 kind=EventKind.STEP_STARTED,
                 sequence=1,
@@ -259,6 +264,7 @@ class _PlannedRuntime:
                     "summary": "Main Agent selected the runtime mode, roles, and models.",
                     "roles": self._roles,
                     "steps": self._steps,
+                    **({"requested_plugin_context": plugin_context} if plugin_context else {}),
                 },
             )
         async for event in self._child.run(context):
@@ -824,6 +830,12 @@ def _dispatch_plan(
         if hermes_context
         else ""
     )
+    plugin_context = requested_plugin_context_text(context.routing_decision)
+    plugin_guidance = (
+        f"\nRequested plugin guidance:\n{plugin_context}\n"
+        if plugin_context
+        else ""
+    )
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
@@ -845,6 +857,7 @@ def _dispatch_plan(
                 f"Role mission: {role.mission}\n"
                 f"User task: {request_text}\n"
                 f"{memory_guidance}"
+                f"{plugin_guidance}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
             depends_on=_dispatch_role_dependencies(
@@ -889,6 +902,7 @@ def _dispatch_plan(
         task=(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
+            f"{plugin_guidance}"
             "Resolve conflicts explicitly and state any user decision required."
         ),
         depends_on=final_dependencies,

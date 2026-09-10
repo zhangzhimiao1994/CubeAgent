@@ -189,7 +189,7 @@ class CreateRunRequest(BaseModel):
             cleaned = item.strip()
             if not cleaned or cleaned in seen or len(cleaned) > 100:
                 continue
-            if re.fullmatch(r"[\w\-:.\/\u4e00-\u9fff]+", cleaned) is None:
+            if re.fullmatch(r"[\w\-:.\/@\u4e00-\u9fff]+", cleaned) is None:
                 raise ValueError("requested capabilities must be safe identifiers")
             seen.add(cleaned)
             result.append(cleaned)

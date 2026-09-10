@@ -60,6 +60,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.plugin_context import requested_plugin_context_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -3896,6 +3897,9 @@ class CrewDispatchRuntime:
             hermes_context = hermes_memory_context_text(context.routing_decision)
             if hermes_context:
                 user["hermes_memory_context"] = hermes_context
+            plugin_context = requested_plugin_context_payload(context.routing_decision)
+            if plugin_context:
+                user["requested_plugin_context"] = plugin_context
             if feedback is not None:
                 user["untrusted_reviewer_feedback"] = feedback
             if compact_retry:

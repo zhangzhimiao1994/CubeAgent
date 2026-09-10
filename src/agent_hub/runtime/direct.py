@@ -29,6 +29,10 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.plugin_context import (
+    requested_plugin_context_payload,
+    requested_plugin_context_text,
+)
 
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
@@ -257,6 +261,7 @@ class DirectRuntime:
             request = request_outcome.request
             included_source_ids = request_outcome.included_source_ids
             prompt_estimate = request_outcome.prompt_estimate
+            plugin_context = requested_plugin_context_payload(context.routing_decision)
             del request_outcome
             gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
             if self._active_token is not token:  # pragma: no cover - defensive
@@ -274,6 +279,7 @@ class DirectRuntime:
                     "model": self._logical_model,
                     "task": _event_text_preview(context.request),
                     "instruction": _event_text_preview(context.request),
+                    **({"requested_plugin_context": plugin_context} if plugin_context else {}),
                 },
             )
             gateway_failed = False
@@ -529,9 +535,11 @@ class DirectRuntime:
                 separators=(",", ":"),
             ).replace("<", "\\u003c").replace(">", "\\u003e")
             hermes_context = hermes_memory_context_text(context.routing_decision)
+            plugin_context = requested_plugin_context_text(context.routing_decision)
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
                 f"{hermes_context}\n"
+                f"{plugin_context}\n"
                 f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
             )
             if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:

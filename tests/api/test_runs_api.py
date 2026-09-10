@@ -970,6 +970,41 @@ def test_submission_forwards_requested_skill_and_plugin_mentions() -> None:
     ]
 
 
+def test_submission_accepts_full_requested_plugin_id() -> None:
+    client, service, principal = _client()
+    plugin_id = "app-6a05e3b201788191be12b590b43e6ce3@openai-curated-remote"
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": f"用 $plugin:{plugin_id} 处理这个任务",
+            "mode": "auto",
+            "requested_plugins": [plugin_id],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            f"用 $plugin:{plugin_id} 处理这个任务",
+            TaskMode.AUTO,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+            False,
+            {
+                "requested_plugins": plugin_id,
+            },
+        )
+    ]
+
+
 def test_choose_mode_enqueues_waiting_run_safely() -> None:
     client, _, _ = _client()
     run_id = uuid4()

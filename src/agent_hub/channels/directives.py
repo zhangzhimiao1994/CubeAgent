@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from agent_hub.domain.runs import TaskMode
 
-_DIRECTIVE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_DIRECTIVE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$")
 _LEGACY_MODES = {
     "/auto": TaskMode.AUTO,
     "/direct": TaskMode.DIRECT,
@@ -279,7 +279,7 @@ def _reason_text(reason: str) -> str:
     if reason == "invalid_directive":
         return (
             "资源选择器格式不正确。请在消息开头使用 #name 指定 MCP、&name 指定 Skill、"
-            "@name 指定插件；名称可以包含字母、数字、点、下划线和短横线。"
+            "@name 指定插件；名称可以包含字母、数字、点、下划线、短横线和 @。"
         )
     return reason
 
