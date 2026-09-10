@@ -472,6 +472,20 @@ describe("operational management pages", () => {
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
   let visibleCognitiveExperiences = [cognitiveExperience];
+  let visibleSkills = [
+    {
+      id: "skill-deep-research",
+      name: "deep-research",
+      status: "enabled",
+      requested_permissions: [],
+      scan_diff: [],
+      source_filename: "deep-research.zip",
+      package_version_id: "skill-version-deep-research",
+      content_sha256: "b".repeat(64),
+      current_version_id: "skill-version-deep-research",
+      versions: [],
+    },
+  ];
   let failCognitiveExperiences = false;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
@@ -495,6 +509,20 @@ describe("operational management pages", () => {
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
     visibleCognitiveExperiences = [cognitiveExperience];
+    visibleSkills = [
+      {
+        id: "skill-deep-research",
+        name: "deep-research",
+        status: "enabled",
+        requested_permissions: [],
+        scan_diff: [],
+        source_filename: "deep-research.zip",
+        package_version_id: "skill-version-deep-research",
+        content_sha256: "b".repeat(64),
+        current_version_id: "skill-version-deep-research",
+        versions: [],
+      },
+    ];
     failCognitiveExperiences = false;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
@@ -1063,7 +1091,7 @@ describe("operational management pages", () => {
           return jsonResponse({ id: "custom_webhook", saved: [], status: visibleChannels.find((channel) => channel.id === "custom_webhook") });
         }
         if (path === "/api/v1/admin/skills") {
-          return jsonResponse([]);
+          return jsonResponse(visibleSkills);
         }
         if (path === "/api/v1/runs/attachments/upload" && method === "POST") {
           if (failNextAttachmentUpload) {
@@ -4038,6 +4066,102 @@ describe("operational management pages", () => {
         requested_plugins: ["runway"],
       },
     });
+  });
+
+  it("shows selected skill and plugin references before sending a chat message", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @skill:deep-research 和 $plugin:runway 做方案");
+
+    const references = await screen.findByLabelText("已引用能力");
+    expect(within(references).getByText("Skill deep-research")).not.toBeNull();
+    expect(within(references).getByText("插件 runway")).not.toBeNull();
+  });
+
+  it("offers clickable @skill and $plugin mention suggestions in the chat composer", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const input = screen.getByPlaceholderText(/输入消息/);
+
+    await user.type(input, "@");
+    await user.click(await screen.findByRole("button", { name: "引用 Skill deep-research" }));
+    expect((input as HTMLTextAreaElement).value).toBe("@skill:deep-research ");
+
+    await user.clear(input);
+    await user.type(input, "$plugin:r");
+    await user.click(await screen.findByRole("button", { name: "引用插件 runway" }));
+    expect((input as HTMLTextAreaElement).value).toBe("$plugin:runway ");
+  });
+
+  it("does not treat prices or email addresses as skill or plugin references", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "预算 $100，联系 a@b.com，不要启用额外能力");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "预算 $100，联系 a@b.com，不要启用额外能力",
+        requested_skills: [],
+        requested_plugins: [],
+      },
+    });
+  });
+
+  it("approves a scanned skill from a plain chat confirmation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+    expect(await screen.findByText("压缩包附件")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "作为 Skill 扫描" }));
+    expect(await screen.findByText("Skill 压缩包已扫描，等待确认")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "确认安装这个 skill");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText("Skill 已安装并启用")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/skills/skill-uploaded-from-chat/approve")).toMatchObject({
+      method: "POST",
+    });
+    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
+  });
+
+  it("chooses a skill conflict strategy from a plain chat reply", async () => {
+    skillUploadConflict = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+    expect(await screen.findByText("压缩包附件")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "作为 Skill 扫描" }));
+    expect(await screen.findByText("Skill 已存在")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "2 保存为新版本");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload?strategy=new_version")).toMatchObject({
+        method: "POST",
+      }),
+    );
+    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
   });
 
   it("does not ask again when a manually selected mode is returned as backend clarification", async () => {

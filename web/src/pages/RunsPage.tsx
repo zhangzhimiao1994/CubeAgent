@@ -51,6 +51,18 @@ type SkillUploadConflict = {
   skillName: string;
   newContentSha256?: string;
 };
+type CapabilityMentionTrigger = {
+  start: number;
+  end: number;
+  marker: "@" | "$";
+  query: string;
+};
+type CapabilityReferenceSuggestion = {
+  kind: "skill" | "plugin";
+  name: string;
+  token: string;
+  detail: string;
+};
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
@@ -131,6 +143,12 @@ const ATTACHMENT_ACCEPT = [
   ".xlsx",
   "image/*",
 ].join(",");
+const PLUGIN_REFERENCE_SUGGESTIONS: CapabilityReferenceSuggestion[] = [
+  { kind: "plugin", name: "runway", token: "$plugin:runway", detail: "视频生成与剪辑对比" },
+  { kind: "plugin", name: "higgsfield", token: "$plugin:higgsfield", detail: "视频与视觉生成" },
+  { kind: "plugin", name: "github", token: "$plugin:github", detail: "仓库、Issue 和 PR" },
+  { kind: "plugin", name: "canva", token: "$plugin:canva", detail: "设计素材与成片资产" },
+];
 
 function shortHash(value?: string | null) {
   if (!value) return "未记录";
@@ -182,13 +200,36 @@ function hasSkillInstallIntent(text: string) {
   return installIntent && skillTarget;
 }
 
+function hasSkillInstallApprovalIntent(text: string) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const approvalIntent = /^(确认|同意|可以|安装|启用|批准|approve|install|enable|yes|ok)/i.test(normalized);
+  const skillTarget = /(安装|启用|skill|技能|插件|工具包|能力包|install|enable)/i.test(normalized);
+  return approvalIntent && skillTarget;
+}
+
+function skillUploadConflictStrategyFromText(text: string): SkillUploadStrategy | null {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return null;
+  const newVersion = parseChoiceText(normalized, [
+    { value: "new_version", label: "保存为新版本", aliases: ["2", "新版本", "另存", "保留两个", "new version"] },
+  ]);
+  if (newVersion) return "new_version";
+  const overwrite = parseChoiceText(normalized, [
+    { value: "overwrite", label: "覆盖当前版本", aliases: ["1", "覆盖", "覆盖当前", "替换", "overwrite", "replace"] },
+  ]);
+  return overwrite ? "overwrite" : null;
+}
+
 function referencedCapabilitiesFromText(text: string) {
   const skills: string[] = [];
   const plugins: string[] = [];
-  const mentionPattern = /[@$]([a-zA-Z0-9_\-:.\/\u4e00-\u9fff]{2,80})/g;
+  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/]{2,80})/g;
   for (const match of text.matchAll(mentionPattern)) {
-    const raw = match[1]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
+    const marker = match[2];
+    const raw = match[3]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
     if (!raw) continue;
+    if (/^\d+(?:\.\d+)?$/.test(raw) || raw.includes("@")) continue;
     const normalized = raw.toLowerCase();
     if (normalized.startsWith("plugin:")) {
       const plugin = raw.slice("plugin:".length);
@@ -200,13 +241,67 @@ function referencedCapabilitiesFromText(text: string) {
       if (skill && !skills.includes(skill)) skills.push(skill);
       continue;
     }
-    if (normalized.includes("plugin") || normalized.includes("插件")) {
+    if (marker === "$" || normalized.includes("plugin")) {
       if (!plugins.includes(raw)) plugins.push(raw);
     } else if (!skills.includes(raw)) {
       skills.push(raw);
     }
   }
   return { skills, plugins };
+}
+
+function capabilityMentionTriggerFromText(text: string): CapabilityMentionTrigger | null {
+  const match = /(^|\s)([@$])([a-zA-Z0-9_\-:.\/\u4e00-\u9fff]*)$/u.exec(text);
+  if (!match) return null;
+  return {
+    start: (match.index ?? 0) + match[1].length,
+    end: text.length,
+    marker: match[2] as "@" | "$",
+    query: match[3] ?? "",
+  };
+}
+
+function capabilitySuggestionKind(trigger: CapabilityMentionTrigger) {
+  const normalized = trigger.query.toLowerCase();
+  if (normalized.startsWith("plugin:")) return "plugin";
+  if (normalized.startsWith("skill:")) return "skill";
+  return trigger.marker === "$" ? "plugin" : "skill";
+}
+
+function capabilitySuggestionFilter(trigger: CapabilityMentionTrigger) {
+  return trigger.query.replace(/^(?:skill|plugin):/i, "").toLowerCase();
+}
+
+function capabilitySuggestionsForTrigger(
+  trigger: CapabilityMentionTrigger | null,
+  skills: Skill[] | undefined,
+): CapabilityReferenceSuggestion[] {
+  if (!trigger) return [];
+  const kind = capabilitySuggestionKind(trigger);
+  const filter = capabilitySuggestionFilter(trigger);
+  const suggestions =
+    kind === "skill"
+      ? (skills ?? [])
+          .filter((skill) => skill.status === "enabled")
+          .map((skill) => ({
+            kind: "skill" as const,
+            name: skill.name,
+            token: `@skill:${skill.name}`,
+            detail: skill.source_filename ? `来自 ${skill.source_filename}` : "已启用 Skill",
+          }))
+      : PLUGIN_REFERENCE_SUGGESTIONS;
+  return suggestions
+    .filter((suggestion) => !filter || suggestion.name.toLowerCase().includes(filter))
+    .slice(0, 6);
+}
+
+function insertCapabilityReferenceToken(
+  text: string,
+  trigger: CapabilityMentionTrigger | null,
+  token: string,
+) {
+  if (!trigger) return `${text}${text.endsWith(" ") || text.length === 0 ? "" : " "}${token} `;
+  return `${text.slice(0, trigger.start)}${token} ${text.slice(trigger.end).replace(/^\s+/u, "")}`;
 }
 
 function newConversationId() {
@@ -3148,6 +3243,7 @@ export function RunsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
+  const skillsCatalog = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
   const [agentIds, setAgentIds] = useState<string[]>([]);
@@ -3189,9 +3285,18 @@ export function RunsPage() {
   } | null>(null);
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
   const chatFooterRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
+  const referencedCapabilities = useMemo(() => referencedCapabilitiesFromText(message), [message]);
+  const capabilityMentionTrigger = useMemo(() => capabilityMentionTriggerFromText(message), [message]);
+  const capabilityReferenceSuggestions = useMemo(
+    () => capabilitySuggestionsForTrigger(capabilityMentionTrigger, skillsCatalog.data),
+    [capabilityMentionTrigger, skillsCatalog.data],
+  );
+  const hasCapabilityReferences =
+    referencedCapabilities.skills.length > 0 || referencedCapabilities.plugins.length > 0;
 
   const selectedRun = useQuery({
     queryKey: ["run", selectedRunId],
@@ -3361,7 +3466,7 @@ export function RunsPage() {
       const runMessage = (override?.message ?? message).trim();
       const runMode = override?.mode ?? mode;
       const selectedDirectModel = (override?.directModel ?? directModel).trim();
-      const referencedCapabilities = referencedCapabilitiesFromText(runMessage);
+      const runReferencedCapabilities = referencedCapabilitiesFromText(runMessage);
       return api.createRun({
         message: runMessage,
         mode: runMode,
@@ -3372,8 +3477,8 @@ export function RunsPage() {
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: uniqueAttachmentIds(attachmentDrafts),
-        requested_skills: referencedCapabilities.skills,
-        requested_plugins: referencedCapabilities.plugins,
+        requested_skills: runReferencedCapabilities.skills,
+        requested_plugins: runReferencedCapabilities.plugins,
         skip_evolution_proposal: true,
       });
     },
@@ -3860,11 +3965,36 @@ export function RunsPage() {
     }
   }
 
+  function insertCapabilitySuggestion(suggestion: CapabilityReferenceSuggestion) {
+    setMessage((current) => insertCapabilityReferenceToken(current, capabilityMentionTrigger, suggestion.token));
+    window.setTimeout(() => composerInputRef.current?.focus(), 0);
+  }
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    if (skillUploadConflict) {
+      const strategy = skillUploadConflictStrategyFromText(trimmed);
+      if (!strategy) {
+        setSubmitNotice("请回复 1/覆盖当前版本，或回复 2/保存为新版本。");
+        return;
+      }
+      setMessage("");
+      setSubmitNotice(strategy === "overwrite" ? "正在覆盖当前 Skill 版本。" : "正在保存为一个新的 Skill 版本。");
+      uploadSkillArchive.mutate({
+        file: skillUploadConflict.file,
+        strategy,
+      });
+      return;
+    }
+    if (skillInstallCandidate?.status === "scanned" && hasSkillInstallApprovalIntent(trimmed)) {
+      setMessage("");
+      setSubmitNotice("已收到 Skill 安装确认，正在启用扫描通过的 Skill。");
+      approveUploadedSkill.mutate();
+      return;
+    }
     if (selectedArtifactReviewApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "确认放行", aliases: ["同意", "确认", "通过", "放行", "approve", "yes"] },
@@ -4762,12 +4892,38 @@ export function RunsPage() {
               </aside>
             ) : null}
             <textarea
+              ref={composerInputRef}
               value={message}
               onChange={(event) => setMessage(event.target.value)}
               placeholder="输入消息..."
               rows={1}
               required
             />
+            {capabilityReferenceSuggestions.length > 0 ? (
+              <div className="composer-reference-suggestions" role="listbox" aria-label="能力引用建议">
+                {capabilityReferenceSuggestions.map((suggestion) => (
+                  <button
+                    type="button"
+                    key={`${suggestion.kind}-${suggestion.name}`}
+                    aria-label={`${suggestion.kind === "skill" ? "引用 Skill" : "引用插件"} ${suggestion.name}`}
+                    onClick={() => insertCapabilitySuggestion(suggestion)}
+                  >
+                    <strong>{suggestion.kind === "skill" ? `@skill:${suggestion.name}` : `$plugin:${suggestion.name}`}</strong>
+                    <small>{suggestion.detail}</small>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {hasCapabilityReferences ? (
+              <div className="composer-capability-references" role="status" aria-label="已引用能力">
+                {referencedCapabilities.skills.map((skill) => (
+                  <span key={`skill-${skill}`}>Skill {skill}</span>
+                ))}
+                {referencedCapabilities.plugins.map((plugin) => (
+                  <span key={`plugin-${plugin}`}>插件 {plugin}</span>
+                ))}
+              </div>
+            ) : null}
             <div className="composer-actions">
               <div className="composer-status-line" role="status">
                 <span>
