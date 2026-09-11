@@ -100,6 +100,7 @@ type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
   mode?: RunMode;
+  skipScheduleProposal?: boolean;
   successNotice?: string;
 };
 
@@ -3489,6 +3490,7 @@ export function RunsPage() {
         requested_plugins: runReferencedCapabilities.plugins,
         requested_files: runReferencedCapabilities.files,
         skip_evolution_proposal: true,
+        skip_schedule_proposal: override?.skipScheduleProposal === true,
       });
     },
     onSuccess: async (run, override) => {
@@ -3678,12 +3680,24 @@ export function RunsPage() {
   };
 
   const cancelScheduleApproval = () => {
-    if (!scheduleApproval) return;
+    const approval = scheduleApproval;
+    if (!approval) return;
     setDismissedScheduleApprovalRunIds((current) =>
-      current.includes(scheduleApproval.runId) ? current : [...current, scheduleApproval.runId],
+      current.includes(approval.runId) ? current : [...current, approval.runId],
     );
     setScheduleApproval(null);
-    setSubmitNotice("已取消计划任务创建，后续消息会继续作为普通对话处理。");
+    setSubmitNotice("已取消计划任务创建，正在按普通对话继续处理原消息。");
+    void api
+      .cancelRun(approval.runId)
+      .catch(() => undefined)
+      .then(() =>
+        createRun.mutate({
+          message: approval.proposal.message,
+          mode: approval.proposal.mode as RunMode,
+          skipScheduleProposal: true,
+          successNotice: "已取消计划任务创建，原消息已按普通对话继续处理。",
+        }),
+      );
   };
   const createScheduleFromProposal = useMutation({
     mutationFn: () => {
@@ -4768,7 +4782,12 @@ export function RunsPage() {
                     <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
                       {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
                     </button>
-                    <button type="button" className="secondary-action" disabled={createScheduleFromProposal.isPending} onClick={cancelScheduleApproval}>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      disabled={createScheduleFromProposal.isPending || createRun.isPending}
+                      onClick={cancelScheduleApproval}
+                    >
                       取消计划
                     </button>
                   </div>

@@ -77,6 +77,7 @@ class RunServiceProtocol(Protocol):
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
@@ -166,6 +167,7 @@ class CreateRunRequest(BaseModel):
     requested_files: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
+    skip_schedule_proposal: bool = False
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -441,6 +443,7 @@ async def _record_run_submit_audit(
         "requested_skills": list(body.requested_skills),
         "requested_plugins": list(body.requested_plugins),
         "requested_files": list(body.requested_files),
+        "skip_schedule_proposal": body.skip_schedule_proposal,
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
     }
@@ -460,6 +463,8 @@ def _requested_capability_payload(body: CreateRunRequest) -> dict[str, str] | No
         payload["requested_plugins"] = ",".join(body.requested_plugins)
     if body.requested_files:
         payload["requested_files"] = ",".join(body.requested_files)
+    if body.skip_schedule_proposal:
+        payload["skip_schedule_proposal"] = "true"
     return payload or None
 
 
@@ -882,6 +887,7 @@ async def create_run(
         direct_model=body.direct_model,
         vibe_coding=body.vibe_coding,
         skip_evolution_proposal=body.skip_evolution_proposal,
+        skip_schedule_proposal=body.skip_schedule_proposal,
         channel_context=_requested_capability_payload(body),
         idempotency_key=idempotency_key,
     )

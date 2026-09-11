@@ -1582,6 +1582,7 @@ export const api = {
     requested_files?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;
+    skip_schedule_proposal?: boolean;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",

@@ -698,7 +698,7 @@ describe("operational management pages", () => {
               },
             });
           }
-          if (message.includes("每天9点提醒")) {
+          if (message.includes("每天9点提醒") && body.skip_schedule_proposal !== true) {
             return jsonResponse({
               id: runId,
               tenant_id: "33333333-3333-4333-8333-333333333333",
@@ -2281,7 +2281,19 @@ describe("operational management pages", () => {
 
     await waitFor(() => expect(screen.queryByRole("status", { name: "计划任务确认" })).toBeNull());
     expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toBeUndefined();
-    expect(await screen.findByText("已取消计划任务创建，后续消息会继续作为普通对话处理。")).not.toBeNull();
+    expect(requests.find((request) => request.path === `/api/v1/admin/runs/${runId}/cancel`)).toMatchObject({
+      method: "POST",
+    });
+    await waitFor(() =>
+      expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(2),
+    );
+    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")[1]).toMatchObject({
+      body: {
+        message: "每天9点提醒我填写日报",
+        skip_schedule_proposal: true,
+      },
+    });
+    expect(await screen.findByText("已取消计划任务创建，原消息已按普通对话继续处理。")).not.toBeNull();
   });
   it("skips chat-detected evolution proposals so conversations are not interrupted", async () => {
     const user = userEvent.setup();

@@ -714,6 +714,11 @@ async def test_specific_date_action_returns_schedule_confirmation() -> None:
         "请给我一个每日学习计划，不要加入日程表",
         "计划任务存在问题，为什么普通问题也会被归类成任务？",
         "帮我看看计划任务功能应该怎么设计，不要直接创建。",
+        (
+            "用跨体系的方式，帮我研究一下这个情况该怎么办\n"
+            "2026年1月1日我出现严重反应，3月21日去医院检查，"
+            "后面还有通知、请假和工作安排冲突，请分析我接下来怎么处理。"
+        ),
     ],
 )
 async def test_normal_planning_request_does_not_become_schedule_task(message: str) -> None:

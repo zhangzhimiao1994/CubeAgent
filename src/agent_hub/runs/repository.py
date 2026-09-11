@@ -56,6 +56,23 @@ class ConversationContextItem:
     routing_decision: dict[str, object] | None = None
 
 
+def _status_can_seed_conversation_mode(status: RunStatus) -> bool:
+    return status in {
+        RunStatus.QUEUED,
+        RunStatus.PLANNING,
+        RunStatus.RUNNING,
+        RunStatus.RETRYING,
+        RunStatus.SYNTHESIZING,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+    }
+
+
+_CONVERSATION_MODE_SEED_STATUS_VALUES = tuple(
+    status.value for status in RunStatus if _status_can_seed_conversation_mode(status)
+)
+
+
 class RunNotFound(RuntimeError):
     """Stable missing-run error."""
 
@@ -221,7 +238,7 @@ class RunRepository:
                 .where(RunRow.actor_id == actor_id)
                 .where(RunRow.mode.is_not(None))
                 .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
-                .where(RunRow.status != RunStatus.WAITING_USER_MODE.value)
+                .where(RunRow.status.in_(_CONVERSATION_MODE_SEED_STATUS_VALUES))
                 .order_by(RunRow.created_at.desc(), RunRow.id.desc())
                 .limit(1)
             )

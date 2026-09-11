@@ -384,6 +384,7 @@ class RunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
@@ -409,6 +410,8 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if skip_evolution_proposal:
             operator_selection["skip_evolution_proposal"] = True
+        if skip_schedule_proposal:
+            operator_selection["skip_schedule_proposal"] = True
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         requested_files = requested_files_from_text(message)
@@ -434,11 +437,13 @@ class RunService:
                 idempotency_key=idempotency_key,
                 operator_selection=operator_selection,
             )
-        schedule_proposal = _local_schedule_proposal(
-            message=message,
-            mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
-            workflow_id=workflow_id,
-        )
+        schedule_proposal = None
+        if not skip_schedule_proposal:
+            schedule_proposal = _local_schedule_proposal(
+                message=message,
+                mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
+                workflow_id=workflow_id,
+            )
         if schedule_proposal is not None:
             return await self._create_schedule_approval_run(
                 tenant_id=tenant_id,
@@ -2146,7 +2151,11 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
         message, lowered
     )
+    has_explicit_schedule_cue = _SCHEDULE_TRIGGER_RE.search(message) is not None
+    has_reminder_action = _SCHEDULE_REMINDER_ACTION_RE.search(message) is not None
     has_specific_date = _SCHEDULE_DATE_RE.search(message) is not None
+    if not has_explicit_schedule_cue and not has_recurrence and _looks_like_background_request(message):
+        return False
     has_time_anchor = bool(
         has_recurrence
         or has_specific_date
@@ -2154,13 +2163,23 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         or any(token in message for token in ("今天", "明天", "后天"))
         or any(token in lowered for token in ("today", "tomorrow"))
     )
-    has_schedule_cue = (
-        _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence or has_specific_date
-    )
-    has_execution = bool(
-        _SCHEDULE_EXECUTION_RE.search(message) or _SCHEDULE_REMINDER_ACTION_RE.search(message)
-    )
+    has_schedule_cue = has_explicit_schedule_cue or has_recurrence or has_specific_date
+    has_execution = bool(_SCHEDULE_EXECUTION_RE.search(message) or has_reminder_action)
     return has_schedule_cue and has_time_anchor and has_execution
+
+
+def _looks_like_background_request(message: str) -> bool:
+    stripped = message.strip()
+    if "\n" in stripped and len(stripped) > 120:
+        return True
+    if len(stripped) > 360:
+        return True
+    return bool(
+        re.search(
+            r"(研究一下|分析一下|帮我看看|该怎么办|怎么办|怎么处理|给.*建议|解释|为什么|复盘|梳理)",
+            stripped,
+        )
+    )
 
 
 def _contains_daily_intent(message: str, lowered: str) -> bool:
@@ -3320,6 +3339,7 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
         "requested_mcp_servers",
         "requested_plugins",
         "requested_files",
+        "skip_schedule_proposal",
         "requested_channel_features",
     }
     result: dict[str, str] = {}

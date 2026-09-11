@@ -87,10 +87,12 @@ class StubRunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        del skip_schedule_proposal
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:

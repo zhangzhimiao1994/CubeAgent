@@ -1293,6 +1293,39 @@ async def test_auto_submission_reuses_recent_conversation_mode_for_continuation(
     assert router.calls == 0
 
 
+@pytest.mark.parametrize(
+    "ignored_status",
+    (RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED),
+)
+async def test_conversation_mode_lookup_ignores_pending_approval_and_cancelled_runs(
+    run_session_factory: async_sessionmaker[AsyncSession],
+    ignored_status: RunStatus,
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    conversation_id = f"conv-mode-{ignored_status.value}"
+    repository = RunRepository(run_session_factory)
+
+    await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="schedule proposal or cancelled interruption",
+        mode=TaskMode.DISPATCH,
+        status=ignored_status,
+        idempotency_key=f"client-request-{ignored_status.value}",
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+
+    mode = await repository.latest_resolved_mode_for_conversation(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        conversation_id=conversation_id,
+    )
+
+    assert mode is None
+
+
 async def test_outbox_is_not_marked_delivered_when_queue_enqueue_fails(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

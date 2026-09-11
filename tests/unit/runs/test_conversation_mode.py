@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import pytest
+
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
-from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.repository import RunRecord, _status_can_seed_conversation_mode
 from agent_hub.runs.service import (
     HermesMemoryInjection,
     HermesRunAdvice,
@@ -153,6 +155,26 @@ class SlowHermesAdvisor(RecordingHermesAdvisor):
     async def advise(self, **kwargs: object) -> HermesRunAdvice | None:
         await asyncio.sleep(2)
         return None
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (RunStatus.QUEUED, True),
+        (RunStatus.PLANNING, True),
+        (RunStatus.RUNNING, True),
+        (RunStatus.RETRYING, True),
+        (RunStatus.SYNTHESIZING, True),
+        (RunStatus.COMPLETED, True),
+        (RunStatus.FAILED, True),
+        (RunStatus.WAITING_USER_MODE, False),
+        (RunStatus.WAITING_APPROVAL, False),
+        (RunStatus.PAUSED, False),
+        (RunStatus.CANCELLED, False),
+    ),
+)
+def test_conversation_mode_seed_status_boundary(status: RunStatus, expected: bool) -> None:
+    assert _status_can_seed_conversation_mode(status) is expected
 
 
 async def test_auto_submission_reuses_previous_mode_for_same_conversation_without_reasking() -> None:
