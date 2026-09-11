@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import tarfile
+import unicodedata
 import zipfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -32,6 +33,8 @@ router = APIRouter(
     tags=["runs"],
     responses=error_responses(401, 403, 404, 405, 409, 413, 422, 500, 503),
 )
+
+MAX_RUN_MESSAGE_BYTES = 65_536
 
 ARCHIVE_EXTENSIONS = (
     ".tar.gz",
@@ -168,6 +171,21 @@ class CreateRunRequest(BaseModel):
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
     skip_schedule_proposal: bool = False
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message must be nonblank")
+        if len(value.encode("utf-8")) > MAX_RUN_MESSAGE_BYTES:
+            raise ValueError("message must be bounded")
+        if unicodedata.normalize("NFC", value) != value:
+            raise ValueError("message must use normalized Unicode")
+        for character in value:
+            category = unicodedata.category(character)
+            if category == "Cf" or (category == "Cc" and character not in "\n\t"):
+                raise ValueError("message contains unsafe control characters")
+        return value
 
     @field_validator("attachment_ids", mode="before")
     @classmethod

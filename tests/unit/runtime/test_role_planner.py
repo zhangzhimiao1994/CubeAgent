@@ -25,6 +25,39 @@ def test_role_planning_request_allows_shared_link_multiline_text() -> None:
     assert request.task == "标题\nhttps://example.com/a?x=1&y=2\t备注"
 
 
+def test_role_planning_request_normalizes_long_padded_user_text_for_planning() -> None:
+    tail_instruction = "只生成每个角色单独的角色参考设定表，不要生成视频。"
+    raw_task = "\n  " + ("用户长文材料。" * 500) + tail_instruction + "  \n"
+
+    request = RolePlanningRequest(
+        task=raw_task,
+        mode=TaskMode.DISCUSS,
+        profile=TaskProfile.GENERAL,
+        high_risk=False,
+        requested_skills=(),
+        default_model="main-agent",
+    )
+
+    assert request.task == request.task.strip()
+    assert len(request.task) <= 2_000
+    assert "[truncated for role planning; middle omitted]" in request.task
+    assert request.task.endswith(tail_instruction)
+
+
+def test_role_planning_request_rejects_hidden_control_even_beyond_planning_limit() -> None:
+    raw_task = ("正常长文" * 700) + "\u200b"
+
+    with pytest.raises(ValueError, match="control characters"):
+        RolePlanningRequest(
+            task=raw_task,
+            mode=TaskMode.DISCUSS,
+            profile=TaskProfile.GENERAL,
+            high_risk=False,
+            requested_skills=(),
+            default_model="main-agent",
+        )
+
+
 @pytest.mark.parametrize("hidden_character", ["\x00", "\x1b", "\u200b", "\u202e"])
 def test_role_planning_request_rejects_hidden_or_dangerous_control_text(
     hidden_character: str,
@@ -413,6 +446,51 @@ def test_character_sheet_followup_with_negated_video_routes_to_media_generator_o
     )
 
     assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
+def test_long_script_tail_character_sheet_instruction_still_routes_image_only() -> None:
+    task = (
+        ("都市短剧正文：两位主角在办公室和街角反复拉扯，人物关系逐步推进。\n" * 180)
+        + "基于上面的剧本，只生成男女主每个人单独一张 Character Model Sheet 角色参考设定表。"
+        + "全片风格统一为写实，不要生成视频，不要剪辑成片。"
+    )
+
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert role_ids == {"multimedia_generator"}
+
+
+def test_long_script_tail_final_video_comparison_still_routes_generation_and_composition() -> None:
+    task = (
+        ("都市短剧正文：男女主在多个场景中误会、靠近、反转，素材可能来自分镜图和镜头视频。\n" * 180)
+        + "现在明确要剪辑成片，并生成两种方式的视频对比："
+        + "一版带角色参考图锁定人物，一版不带参考图，然后输出可下载 MP4。"
+    )
+
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
 
 
 def test_unresolved_script_character_makeup_reference_generates_script_before_image() -> None:

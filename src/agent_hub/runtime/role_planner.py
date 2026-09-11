@@ -125,7 +125,7 @@ class RolePlanningRequest:
     model_overrides: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _require_text("task", self.task)
+        task = _normalize_task_text(self.task, label="role planning")
         if type(self.mode) is not TaskMode or self.mode is TaskMode.AUTO:
             raise ValueError("mode must be an executable task mode")
         if type(self.profile) is not TaskProfile:
@@ -144,6 +144,7 @@ class RolePlanningRequest:
                 for role_id, model in self.model_overrides.items()
             }
         )
+        object.__setattr__(self, "task", task)
         object.__setattr__(self, "requested_skills", requested_skills)
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "model_overrides", overrides)
@@ -2530,6 +2531,23 @@ def _require_text(name: str, value: str) -> None:
         raise ValueError(f"{name} must be nonblank, unpadded, and bounded")
     if any(_is_disallowed_control_character(character) for character in value):
         raise ValueError(f"{name} must not contain control characters")
+
+
+def _normalize_task_text(value: str, *, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    if any(_is_disallowed_control_character(character) for character in value):
+        raise ValueError("task must not contain control characters")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    if len(stripped) <= _MAX_TEXT:
+        return stripped
+    marker = f"\n[truncated for {label}; middle omitted]\n"
+    budget = _MAX_TEXT - len(marker)
+    head_length = budget // 2
+    tail_length = budget - head_length
+    return stripped[:head_length].rstrip() + marker + stripped[-tail_length:].lstrip()
 
 
 def _is_disallowed_control_character(character: str) -> bool:
