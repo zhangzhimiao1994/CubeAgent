@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -27,7 +27,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
+from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
+    safe_model_gateway_failure_reason,
+)
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.plugin_context import (
     requested_plugin_context_payload,
@@ -40,6 +43,12 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_CONTEXT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
+_EMPTY_RESPONSE_RECOVERY_RETRIES = 1
+_EMPTY_RESPONSE_RECOVERY_PROMPT = (
+    "The previous model response was empty. Return a non-empty, directly usable answer "
+    "for the task. If the task cannot be completed, state the concrete blocker in one "
+    "short paragraph."
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
@@ -78,6 +87,21 @@ def _raise_execution_error(message: str) -> Never:
 
 def _gateway_failure_reason(error: Exception) -> str:
     return safe_model_gateway_failure_reason(error) or "model gateway failed"
+
+
+def _is_empty_response_failure_reason(reason: str) -> bool:
+    lowered = reason.casefold()
+    return "model response text is empty" in lowered or "model response is empty" in lowered
+
+
+def _empty_response_retry_request(request: ModelRequest) -> ModelRequest:
+    return replace(
+        request,
+        messages=(
+            *request.messages,
+            ModelMessage(role="user", content=_EMPTY_RESPONSE_RECOVERY_PROMPT),
+        ),
+    )
 
 
 def _event_text_preview(value: object, *, max_chars: int = 240) -> str:
@@ -268,9 +292,10 @@ class DirectRuntime:
                 gateway_task.cancel()
                 raise RuntimeExecutionError("runtime ownership changed")
             self._active_task = gateway_task
+            sequence = 1
             yield RunEvent(
                 kind=EventKind.MODEL_STARTED,
-                sequence=1,
+                sequence=sequence,
                 run_id=context.run_id,
                 actor="main_agent",
                 message=f"主 Agent 调用模型 {self._logical_model} 处理直连请求。",
@@ -282,20 +307,55 @@ class DirectRuntime:
                     **({"requested_plugin_context": plugin_context} if plugin_context else {}),
                 },
             )
+            sequence += 1
             gateway_failed = False
             gateway_failure_reason = "model gateway failed"
             completion: GatewayCompletion | None = None
-            try:
-                completion = await gateway_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - redact the gateway boundary
-                gateway_failure_reason = _gateway_failure_reason(error)
-                error.__traceback__ = None
-                error.__context__ = None
-                error.__cause__ = None
-                del error
-                gateway_failed = True
+            empty_response_retries = 0
+            while True:
+                try:
+                    completion = await gateway_task
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - redact the gateway boundary
+                    gateway_failure_reason = _gateway_failure_reason(error)
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                    if (
+                        _is_empty_response_failure_reason(gateway_failure_reason)
+                        and empty_response_retries < _EMPTY_RESPONSE_RECOVERY_RETRIES
+                    ):
+                        await self._consume_task_terminal(gateway_task)
+                        self._active_task = None
+                        request = _empty_response_retry_request(request)
+                        gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
+                        if self._active_token is not token:  # pragma: no cover - defensive
+                            gateway_task.cancel()
+                            raise RuntimeExecutionError("runtime ownership changed")
+                        self._active_task = gateway_task
+                        empty_response_retries += 1
+                        yield RunEvent(
+                            kind=EventKind.STEP_RETRYING,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor="main_agent",
+                            step_id="direct_model_call",
+                            reason=gateway_failure_reason,
+                            payload={
+                                "strategy": "empty_response_retry",
+                                "fallback_policy": "retry_once_then_fail",
+                                "warning": "model response text is empty",
+                                "attempt": empty_response_retries,
+                                **runtime_failure_diagnostic_from_reason(gateway_failure_reason),
+                            },
+                        )
+                        sequence += 1
+                        continue
+                    gateway_failed = True
+                    break
             if gateway_failed or completion is None:
                 await self._consume_task_terminal(gateway_task)
                 self._active_task = None
@@ -381,7 +441,7 @@ class DirectRuntime:
             del text, response, completion, request
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
-                sequence=2,
+                sequence=sequence,
                 run_id=context.run_id,
                 actor="main_agent",
                 message="模型已返回直连回答。",
@@ -397,6 +457,7 @@ class DirectRuntime:
                 },
                 artifact=artifact,
             )
+            sequence += 1
             checkpoint = RuntimeCheckpoint(
                 id=uuid4(),
                 runtime_type=_RUNTIME_TYPE,
@@ -408,19 +469,20 @@ class DirectRuntime:
                     "completed": True,
                     "artifact_id": str(artifact.id),
                     "artifact_sha256": artifact.content_sha256,
-                    "next_sequence": 4,
+                    "next_sequence": sequence + 1,
                 },
             )
             self._last_checkpoint = checkpoint
             yield RunEvent(
                 kind=EventKind.CHECKPOINT_SAVED,
-                sequence=3,
+                sequence=sequence,
                 run_id=context.run_id,
                 checkpoint=checkpoint,
             )
+            sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_COMPLETED,
-                sequence=4,
+                sequence=sequence,
                 run_id=context.run_id,
                 actor="main_agent",
                 message="本次直连对话已完成。",
