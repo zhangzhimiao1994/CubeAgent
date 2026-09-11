@@ -344,7 +344,11 @@ class ConfigBackedDirectRuntime:
             fallbacks=_fallbacks(config),
             capacity_wait_timeout=60,
         )
-        return DirectRuntime(gateway, logical_model=logical_model)
+        return DirectRuntime(
+            gateway,
+            logical_model=logical_model,
+            fallback_logical_models=_fallback_chain(config, logical_model),
+        )
 
 
 class ConfigBackedDispatchRuntime:
@@ -1983,6 +1987,20 @@ def _fallbacks(config: PlatformConfig) -> dict[str, str]:
         for logical_model, definition in config.models.items()
         if definition.fallback_model is not None
     }
+
+
+def _fallback_chain(config: PlatformConfig, logical_model: str) -> tuple[str, ...]:
+    fallbacks = _fallbacks(config)
+    chain: list[str] = []
+    seen = {logical_model}
+    current = logical_model
+    while True:
+        fallback = fallbacks.get(current)
+        if fallback is None or fallback in seen:
+            return tuple(chain)
+        seen.add(fallback)
+        chain.append(fallback)
+        current = fallback
 
 
 def default_runtime_registry() -> RuntimeRegistry:

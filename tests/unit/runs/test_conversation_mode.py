@@ -4,12 +4,19 @@ import asyncio
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
+from agent_hub.routing.types import (
+    EXECUTABLE_MODES,
+    RiskLevel,
+    RouteAssessment,
+    RouteDecision,
+    RouteSource,
+)
 from agent_hub.runs.repository import RunRecord, _status_can_seed_conversation_mode
 from agent_hub.runs.service import (
     HermesMemoryInjection,
@@ -17,6 +24,8 @@ from agent_hub.runs.service import (
     HermesRunOutcome,
     HermesSkippedMemory,
     RunService,
+    _local_main_agent_auto_mode,
+    _local_schedule_proposal,
 )
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -64,6 +73,41 @@ class UserChoiceRouter:
             clarification_reason="routing_requires_user_choice",
             options=EXECUTABLE_MODES,
             decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=1,
+            risk=RiskLevel.LOW,
+            requires_approval=False,
+            permissions_still_apply=True,
+        )
+
+
+class ReadyDispatchRouter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        self.calls += 1
+        return RouteDecision(
+            mode=TaskMode.DISPATCH,
+            needs_user_choice=False,
+            status="ready",
+            assessments=(
+                RouteAssessment(
+                    mode=TaskMode.DISPATCH,
+                    confidence=0.91,
+                    reason="misclassified as executable planning",
+                    roles=("planner",),
+                    estimated_seconds=120,
+                    estimated_cost_usd=Decimal("0.10"),
+                    risk=RiskLevel.LOW,
+                    source=RouteSource.CLASSIFIER,
+                    logical_model="router",
+                    deployment_id="router-test",
+                    provider_id="test",
+                ),
+            ),
+            options=(),
+            decision_token=None,
             version=1,
             risk=RiskLevel.LOW,
             requires_approval=False,
@@ -166,7 +210,7 @@ class SlowHermesAdvisor(RecordingHermesAdvisor):
         (RunStatus.RETRYING, True),
         (RunStatus.SYNTHESIZING, True),
         (RunStatus.COMPLETED, True),
-        (RunStatus.FAILED, True),
+        (RunStatus.FAILED, False),
         (RunStatus.WAITING_USER_MODE, False),
         (RunStatus.WAITING_APPROVAL, False),
         (RunStatus.PAUSED, False),
@@ -592,6 +636,164 @@ async def test_auto_submission_queues_local_direct_when_router_cannot_classify()
     assert routing["router_clarification_reason"] == "classification_unavailable"
 
 
+async def test_submit_rejects_runtime_unbounded_message_before_creating_run() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    with pytest.raises(ValueError, match="at most 16000 characters"):
+        await service.submit(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            message="长文档" * 6000,
+            mode=TaskMode.AUTO,
+            conversation_id="conv-long-doc",
+            idempotency_key="idem-long-doc",
+        )
+
+    assert repository.created == []
+
+
+async def test_submit_strips_padding_before_routing_and_persistence() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=" \n 为什么刚才会失败 \t ",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-trim",
+        idempotency_key="idem-trim",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert repository.created[0]["request"] == "为什么刚才会失败"
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "是不是没办法看到这个 skill，然后 agent 是不是读不了内部文件？我想安装一些新的 skill，agent 能给我查找并下载安装吗？",
+        "我上传了几个 skill 压缩包，用自动模式想让它安装，根本没有安装，第二次交互又找不到压缩包里的内容，这是为什么？",
+        "为什么普通长文档里出现计划、提醒、执行这些词，就会被识别成计划任务？帮我分析一下原因。",
+        "这个交互有问题：取消以后没有退回普通对话，后续消息还是像计划流程一样卡住，怎么解决？",
+        "我想让你帮我分析一下这段经历。今天领导提醒我执行新的交接计划，但我实际想讨论沟通策略。",
+    ),
+)
+def test_interactive_support_requests_with_planning_words_stay_direct(message: str) -> None:
+    assert _local_main_agent_auto_mode(message, ()) is TaskMode.DIRECT
+
+
+async def test_router_unavailable_keeps_skill_file_visibility_question_as_normal_chat() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=(
+            "是不是没办法看到这个 skill，然后 agent 是不是读不了内部文件？"
+            "我想安装一些新的 skill，agent 能给我查找并下载安装吗？"
+        ),
+        mode=TaskMode.AUTO,
+        conversation_id="conv-skill-file-question",
+        idempotency_key="idem-skill-file-question",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "direct"
+
+
+async def test_router_ready_dispatch_is_overridden_for_interactive_support_question() -> None:
+    repository = ConversationModeRepository(None)
+    router = ReadyDispatchRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=(
+            "为什么普通交互里出现计划两个字就会创建计划？"
+            "这个有问题，取消后也没有回到正常对话。"
+        ),
+        mode=TaskMode.AUTO,
+        conversation_id="conv-router-misclass",
+        idempotency_key="idem-router-misclass",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert router.calls == 1
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["router_selected_mode"] == "dispatch"
+    assert routing["main_agent_selected_mode"] == "direct"
+    assert routing["main_agent_adjusted"] is True
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_mode", "expected_reason"),
+    (
+        ("请用讨论模式评审这个方案的优缺点", TaskMode.DISCUSS, "conversation_mode_switch"),
+        ("组织多角色讨论，对比两个技术方案", TaskMode.DISCUSS, "main_agent_local_resolution"),
+        ("生成男女主每人一张 Character Model Sheet 角色参考设定表图片", TaskMode.DISPATCH, "current_artifact_delivery_request"),
+        ("完整流程：先讨论剧本问题，再执行角色参考图生成", TaskMode.HYBRID, "main_agent_local_resolution"),
+    ),
+)
+async def test_auto_mode_keeps_explicit_non_direct_workflows(
+    message: str,
+    expected_mode: TaskMode,
+    expected_reason: str,
+) -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(expected_mode),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=message,
+        mode=TaskMode.AUTO,
+        conversation_id="conv-non-direct-boundary",
+        idempotency_key=f"idem-non-direct-{expected_mode.value}",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is expected_mode
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == expected_reason
+    assert routing["main_agent_selected_mode"] == expected_mode.value
+
+
 async def test_auto_submission_waits_when_router_requires_user_choice() -> None:
     repository = ConversationModeRepository(None)
     service = RunService(
@@ -772,3 +974,50 @@ async def test_declined_evolution_proposal_can_continue_through_auto_mode() -> N
     assert routing["reason"] == "main_agent_local_resolution"
     assert routing["main_agent_selected_mode"] == "direct"
     assert routing["skip_evolution_proposal"] is True
+
+
+def test_long_background_story_with_schedule_words_does_not_create_schedule_proposal() -> None:
+    message = (
+        "我想让你帮我分析一下这段经历。"
+        "2026年9月12日领导在群里通知大家执行新的排班提醒规则，"
+        "今天领导提醒我执行新的交接计划，"
+        "但我实际想讨论的是沟通策略、情绪压力和后续怎么处理。"
+        "下面是很长的背景材料：" + "工作沟通细节。" * 80
+    )
+
+    proposal = _local_schedule_proposal(
+        message=message,
+        mode=TaskMode.DIRECT,
+        workflow_id=None,
+    )
+
+    assert proposal is None
+
+
+def test_background_analysis_with_remind_me_phrase_does_not_create_schedule_proposal() -> None:
+    message = (
+        "我想让你帮我分析一下这段经历。"
+        "今天同事提醒我执行交接计划，但这只是背景，"
+        "我需要的是沟通建议和问题复盘。"
+        + "更多背景。" * 120
+    )
+
+    proposal = _local_schedule_proposal(
+        message=message,
+        mode=TaskMode.AUTO,
+        workflow_id=None,
+    )
+
+    assert proposal is None
+
+
+def test_explicit_reminder_request_still_creates_schedule_proposal() -> None:
+    proposal = _local_schedule_proposal(
+        message="明天8点提醒我填写日报",
+        mode=TaskMode.DIRECT,
+        workflow_id=None,
+    )
+
+    assert proposal is not None
+    assert proposal.kind == "one_time"
+    assert "08:00" in proposal.summary

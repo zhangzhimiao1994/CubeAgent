@@ -95,6 +95,12 @@ _MAX_MESSAGES = 128
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_PAYLOAD_BYTES = 65_536
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
+_EMPTY_RESPONSE_RECOVERY_RETRIES = 1
+_EMPTY_RESPONSE_FAILURE_REASON = "model gateway failed: model response text is empty"
+_EMPTY_RESPONSE_RETRY_PROMPT = (
+    "The previous model response was empty. Return a non-empty, directly usable "
+    "discussion message for the current role. Do not include hidden reasoning."
+)
 _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
 _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
@@ -145,6 +151,31 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     if not stripped:
         return None
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
+
+
+def _safe_response_text_is_empty(text: str) -> bool:
+    return not text.strip()
+
+
+def _is_empty_response_failure_reason(reason: str) -> bool:
+    lowered = reason.casefold()
+    return "model response text is empty" in lowered or "model response is empty" in lowered
+
+
+def _empty_response_retry_request(request: ModelRequest) -> ModelRequest:
+    return ModelRequest(
+        logical_model=request.logical_model,
+        messages=(
+            *request.messages,
+            ModelMessage(role="user", content=_EMPTY_RESPONSE_RETRY_PROMPT),
+        ),
+        required_capabilities=request.required_capabilities,
+        timeout_seconds=request.timeout_seconds,
+        allow_fallback=request.allow_fallback,
+        max_output_tokens=request.max_output_tokens,
+        response_schema=request.response_schema,
+        tools=request.tools,
+    )
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -294,6 +325,26 @@ class _DiscussionDurability:
         self._finalize(write_id)
         self._model_lock.release()
         return artifact
+
+    async def replace_running_model_request(
+        self,
+        current_request: ModelRequest,
+        next_request: ModelRequest,
+    ) -> None:
+        entry = self.model_entries[self._model_cursor]
+        if entry.get("status") != "running" or entry.get("request_hash") != self.request_hash(
+            current_request
+        ):
+            self.fail_model()
+            raise RuntimeExecutionError("durable model ledger mismatch")
+        previous_hash = entry["request_hash"]
+        entry["request_hash"] = self.request_hash(next_request)
+        try:
+            await self._checkpoint()
+        except BaseException:
+            entry["request_hash"] = previous_hash
+            self.fail_model()
+            raise
 
     def fail_model(self, reason: str | None = None) -> None:
         if reason and self.failure_reason is None:
@@ -581,6 +632,32 @@ class DiscussionPlan:
         ).hexdigest()
 
 
+def _discussion_failure_summary_event(
+    context: TaskContext,
+    sequence: int,
+    *,
+    plan: DiscussionPlan,
+    participant_models: Mapping[str, str],
+    failure_reason: str,
+) -> RunEvent:
+    if _is_empty_response_failure_reason(failure_reason):
+        summary = "讨论阶段未能完成：模型连续返回空内容，未产生可用的讨论发言摘要。"
+    else:
+        summary = "讨论阶段未能完成：模型或工具调用失败，未产生完整多方发言摘要。"
+    return RunEvent(
+        kind="discussion.completed",
+        sequence=sequence,
+        run_id=context.run_id,
+        payload={
+            "participants": tuple(participant.id for participant in plan.participants),
+            "participant_models": dict(participant_models),
+            "summary": summary,
+            "reason": failure_reason,
+            "fallback_policy": "surface_failure_summary",
+        },
+    )
+
+
 class _DynamicToolArguments(BaseModel):
     model_config = ConfigDict(extra="allow", strict=True)
 
@@ -792,25 +869,75 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             ),
             max_output_tokens=self._max_output_tokens,
         )
-        completion = (
-            await self._durability.before_model(request) if self._durability is not None else None
-        )
-        replayed = completion is not None
-        if completion is None:
-            task = asyncio.create_task(self._gateway.complete_with_context(request))
-            if cancellation_token is not None:
-                cancellation_token.link_future(task)
-            try:
-                completion = await task
-            except asyncio.CancelledError:
-                if self._durability is not None:
-                    self._durability.fail_model()
-                raise
-            except Exception as error:
-                if self._durability is not None:
-                    self._durability.fail_model(safe_model_gateway_failure_reason(error))
-                raise
-        response = completion.response
+        empty_response_retries = 0
+        retry_with_existing_ledger = False
+        while True:
+            if retry_with_existing_ledger:
+                completion = None
+                replayed = False
+                retry_with_existing_ledger = False
+            else:
+                completion = (
+                    await self._durability.before_model(request)
+                    if self._durability is not None
+                    else None
+                )
+                replayed = completion is not None
+            if completion is None:
+                task = asyncio.create_task(self._gateway.complete_with_context(request))
+                if cancellation_token is not None:
+                    cancellation_token.link_future(task)
+                try:
+                    completion = await task
+                except asyncio.CancelledError:
+                    if self._durability is not None:
+                        self._durability.fail_model()
+                    raise
+                except Exception as error:
+                    failure_reason = safe_model_gateway_failure_reason(error)
+                    if (
+                        failure_reason is not None
+                        and
+                        _is_empty_response_failure_reason(failure_reason)
+                        and empty_response_retries < _EMPTY_RESPONSE_RECOVERY_RETRIES
+                    ):
+                        retry_request = _empty_response_retry_request(request)
+                        if self._durability is not None:
+                            await self._durability.replace_running_model_request(
+                                request,
+                                retry_request,
+                            )
+                            retry_with_existing_ledger = True
+                        request = retry_request
+                        empty_response_retries += 1
+                        continue
+                    if self._durability is not None:
+                        self._durability.fail_model(failure_reason)
+                    raise
+            response = completion.response
+            if (
+                response.text is not None
+                and not response.tool_calls
+                and _safe_response_text_is_empty(response.text)
+            ):
+                if (
+                    not replayed
+                    and empty_response_retries < _EMPTY_RESPONSE_RECOVERY_RETRIES
+                ):
+                    retry_request = _empty_response_retry_request(request)
+                    if self._durability is not None:
+                        await self._durability.replace_running_model_request(
+                            request,
+                            retry_request,
+                        )
+                        retry_with_existing_ledger = True
+                    request = retry_request
+                    empty_response_retries += 1
+                    continue
+                if not replayed and self._durability is not None:
+                    self._durability.fail_model(_EMPTY_RESPONSE_FAILURE_REASON)
+                raise RuntimeExecutionError("model response text is empty")
+            break
         if response.usage is None:
             if not replayed and self._durability is not None:
                 self._durability.fail_model("unaccounted_usage")
@@ -1038,6 +1165,9 @@ class AutoGenDiscussionRuntime:
         message_artifacts: list[Artifact] = []
         usage = DiscussionUsage()
         durability: _DiscussionDurability | None = None
+        participant_models = {
+            participant.id: participant.logical_model for participant in self._plan.participants
+        }
         wall_expired = asyncio.Event()
         wall_handle: asyncio.TimerHandle | None = None
         try:
@@ -1136,9 +1266,6 @@ class AutoGenDiscussionRuntime:
                     durability=durability,
                 )
                 for participant in self._plan.participants
-            }
-            participant_models = {
-                participant.id: participant.logical_model for participant in self._plan.participants
             }
             selector = GatewayChatCompletionClient(
                 self._gateway,
@@ -1414,6 +1541,14 @@ class AutoGenDiscussionRuntime:
                 reason=reason,
             )
         except UnaccountedUsage:
+            yield _discussion_failure_summary_event(
+                context,
+                sequence,
+                plan=self._plan,
+                participant_models=participant_models,
+                failure_reason="unaccounted_usage",
+            )
+            sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -1422,6 +1557,14 @@ class AutoGenDiscussionRuntime:
                 payload=runtime_failure_diagnostic_from_reason("unaccounted_usage"),
             )
         except ModelOutcomeUncertain:
+            yield _discussion_failure_summary_event(
+                context,
+                sequence,
+                plan=self._plan,
+                participant_models=participant_models,
+                failure_reason="model_outcome_uncertain",
+            )
+            sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -1430,6 +1573,14 @@ class AutoGenDiscussionRuntime:
                 payload=runtime_failure_diagnostic_from_reason("model_outcome_uncertain"),
             )
         except ToolOutcomeUncertain:
+            yield _discussion_failure_summary_event(
+                context,
+                sequence,
+                plan=self._plan,
+                participant_models=participant_models,
+                failure_reason="tool_outcome_uncertain",
+            )
+            sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -1537,6 +1688,14 @@ class AutoGenDiscussionRuntime:
                     reason="partial_discussion_after_model_failure",
                 )
                 return
+            yield _discussion_failure_summary_event(
+                context,
+                sequence,
+                plan=self._plan,
+                participant_models=participant_models,
+                failure_reason=failure_reason,
+            )
+            sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,

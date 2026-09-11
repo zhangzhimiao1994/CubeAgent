@@ -1295,7 +1295,7 @@ async def test_auto_submission_reuses_recent_conversation_mode_for_continuation(
 
 @pytest.mark.parametrize(
     "ignored_status",
-    (RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED),
+    (RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED, RunStatus.FAILED),
 )
 async def test_conversation_mode_lookup_ignores_pending_approval_and_cancelled_runs(
     run_session_factory: async_sessionmaker[AsyncSession],

@@ -223,11 +223,25 @@ class DirectRunStream:
 class DirectRuntime:
     mode = TaskMode.DIRECT
 
-    def __init__(self, gateway: Gateway, *, logical_model: str) -> None:
+    def __init__(
+        self,
+        gateway: Gateway,
+        *,
+        logical_model: str,
+        fallback_logical_models: tuple[str, ...] = (),
+    ) -> None:
         if _SAFE_ID.fullmatch(logical_model) is None:
             raise ValueError("logical_model must be a safe identifier")
+        for fallback in fallback_logical_models:
+            if _SAFE_ID.fullmatch(fallback) is None:
+                raise ValueError("fallback_logical_models must be safe identifiers")
+        if logical_model in fallback_logical_models:
+            raise ValueError("fallback_logical_models must not include logical_model")
+        if len(set(fallback_logical_models)) != len(fallback_logical_models):
+            raise ValueError("fallback_logical_models must be unique")
         self._gateway = gateway
         self._logical_model = logical_model
+        self._fallback_logical_models = fallback_logical_models
         self._cancel_lock = asyncio.Lock()
         self._active_token: object | None = None
         self._active_stream: DirectRunStream | None = None
@@ -312,6 +326,7 @@ class DirectRuntime:
             gateway_failure_reason = "model gateway failed"
             completion: GatewayCompletion | None = None
             empty_response_retries = 0
+            fallback_model_index = 0
             while True:
                 try:
                     completion = await gateway_task
@@ -331,7 +346,9 @@ class DirectRuntime:
                         await self._consume_task_terminal(gateway_task)
                         self._active_task = None
                         request = _empty_response_retry_request(request)
-                        gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
+                        gateway_task = asyncio.create_task(
+                            self._gateway.complete_with_context(request)
+                        )
                         if self._active_token is not token:  # pragma: no cover - defensive
                             gateway_task.cancel()
                             raise RuntimeExecutionError("runtime ownership changed")
@@ -349,6 +366,42 @@ class DirectRuntime:
                                 "fallback_policy": "retry_once_then_fail",
                                 "warning": "model response text is empty",
                                 "attempt": empty_response_retries,
+                                **runtime_failure_diagnostic_from_reason(gateway_failure_reason),
+                            },
+                        )
+                        sequence += 1
+                        continue
+                    if (
+                        _is_empty_response_failure_reason(gateway_failure_reason)
+                        and fallback_model_index < len(self._fallback_logical_models)
+                    ):
+                        await self._consume_task_terminal(gateway_task)
+                        self._active_task = None
+                        previous_logical_model = request.logical_model
+                        fallback_logical_model = self._fallback_logical_models[
+                            fallback_model_index
+                        ]
+                        fallback_model_index += 1
+                        request = replace(request, logical_model=fallback_logical_model)
+                        gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
+                        if self._active_token is not token:  # pragma: no cover - defensive
+                            gateway_task.cancel()
+                            raise RuntimeExecutionError("runtime ownership changed")
+                        self._active_task = gateway_task
+                        empty_response_retries = 0
+                        yield RunEvent(
+                            kind=EventKind.STEP_RETRYING,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor="main_agent",
+                            step_id="direct_model_call",
+                            reason=gateway_failure_reason,
+                            payload={
+                                "strategy": "empty_response_model_fallback",
+                                "fallback_policy": "switch_model_after_empty_retry",
+                                "from_logical_model": previous_logical_model,
+                                "to_logical_model": fallback_logical_model,
+                                "warning": "model response text is empty",
                                 **runtime_failure_diagnostic_from_reason(gateway_failure_reason),
                             },
                         )

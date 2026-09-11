@@ -64,7 +64,6 @@ def _status_can_seed_conversation_mode(status: RunStatus) -> bool:
         RunStatus.RETRYING,
         RunStatus.SYNTHESIZING,
         RunStatus.COMPLETED,
-        RunStatus.FAILED,
     }
 
 

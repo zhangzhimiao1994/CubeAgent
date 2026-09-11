@@ -169,8 +169,34 @@ async def test_discussion_gateway_transport_failure_records_safe_diagnostic() ->
 
     events = await collect(AutoGenDiscussionRuntime(FailingGateway([]), plan()), context())
 
+    completed = next(event for event in events if event.kind == "discussion.completed")
+    assert "讨论阶段未能完成" in completed.payload["summary"]
+    assert completed.payload["reason"] == "model gateway failed: model transport failed (status=401)"
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
+    assert len(terminal_events(events)) == 1
+
+
+async def test_discussion_retries_empty_model_response_before_failing() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("", 1, Decimal("0.01")),
+            ("analyst", 1, Decimal("0.01")),
+            ("Facts are A.", 2, Decimal("0.01")),
+            ("critic", 1, Decimal("0.01")),
+            ("[COMPLETE] Facts are verified.", 2, Decimal("0.01")),
+        ]
+    )
+
+    events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+    assert "previous model response was empty" in str(gateway.requests[1].messages[-1].content).casefold()
+    assert [event.actor for event in events if event.kind is EventKind.MESSAGE_CREATED] == [
+        "analyst",
+        "critic",
+    ]
 
 
 async def test_participants_can_use_different_logical_models() -> None:

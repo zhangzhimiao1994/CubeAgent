@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,7 @@ from uuid import UUID, uuid4, uuid5
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.routing.rules import assess_rules
+from agent_hub.routing.rules import MAX_TASK_TEXT, assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import (
@@ -46,6 +47,7 @@ _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_MAX_SUBMISSION_MESSAGE_BYTES = 65_536
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
 _CONVERSATION_HISTORY_ARTIFACT_NAMESPACE = UUID("8ef85f85-3d8f-42e6-8e90-6a7c57f8d4a2")
@@ -388,6 +390,7 @@ class RunService:
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
+        message = _validated_submission_message(message)
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
         cleaned_direct_model = direct_model.strip() if direct_model else None
         if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
@@ -2044,12 +2047,19 @@ _SCHEDULE_TRIGGER_RE = re.compile(
     r"(定时|提醒|闹钟|日程|排程|计划任务|加入计划|列入计划|schedule|scheduled|remind|reminder|alarm)",
     re.IGNORECASE,
 )
+_STRONG_SCHEDULE_TRIGGER_RE = re.compile(
+    r"(定时|闹钟|日程|排程|计划任务|加入计划|列入计划|设置.{0,8}提醒|创建.{0,8}提醒|schedule|scheduled|reminder|alarm)",
+    re.IGNORECASE,
+)
 _SCHEDULE_EXECUTION_RE = re.compile(
     r"(执行|运行|提交|发送|填写|填报|打开|检查|触发|通知|生成|创建|更新|写|execute|run|submit|send|fill|open|check|generate|create|update)",
     re.IGNORECASE,
 )
 _SCHEDULE_REMINDER_ACTION_RE = re.compile(
-    r"(提醒我|通知我|叫我|remind\s+me|notify\s+me|ping\s+me|alarm\s+me)",
+    r"(^|[，。；;,.!?？\s])(?:请|帮我|麻烦你|记得)?\s*(提醒我|通知我|叫我)"
+    r"|(?:今天|明天|后天)\s*(?:早上|上午|下午|晚上|中午)?\s*(?:[01]?\d\s*点|2[0-3]\s*点|[01]?\d:|2[0-3]:)?\s*(提醒我|通知我|叫我)"
+    r"|(?:早上|上午|下午|晚上|中午)?\s*(?:[01]?\d\s*点|2[0-3]\s*点|[01]?\d:|2[0-3]:)\s*(提醒我|通知我|叫我)"
+    r"|remind\s+me|notify\s+me|ping\s+me|alarm\s+me",
     re.IGNORECASE,
 )
 _SCHEDULE_NEGATION_RE = re.compile(
@@ -2152,8 +2162,11 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         message, lowered
     )
     has_explicit_schedule_cue = _SCHEDULE_TRIGGER_RE.search(message) is not None
+    has_strong_schedule_cue = _STRONG_SCHEDULE_TRIGGER_RE.search(message) is not None
     has_reminder_action = _SCHEDULE_REMINDER_ACTION_RE.search(message) is not None
     has_specific_date = _SCHEDULE_DATE_RE.search(message) is not None
+    if _looks_like_background_request(message) and not has_strong_schedule_cue:
+        return False
     if not has_explicit_schedule_cue and not has_recurrence and _looks_like_background_request(message):
         return False
     has_time_anchor = bool(
@@ -2286,6 +2299,28 @@ def _explicit_new_conversation_request(message: str) -> bool:
         "change topic",
     )
     return any(marker in normalized for marker in new_conversation_markers)
+
+
+def _validated_submission_message(message: str) -> str:
+    if type(message) is not str:
+        raise TypeError("message must be a string")
+    stripped = message.strip()
+    if not stripped:
+        raise ValueError("message must be nonblank")
+    if len(stripped) > MAX_TASK_TEXT:
+        raise ValueError(
+            f"message must be at most {MAX_TASK_TEXT} characters; "
+            "upload long documents as attachments or split them across turns"
+        )
+    if len(stripped.encode("utf-8")) > _MAX_SUBMISSION_MESSAGE_BYTES:
+        raise ValueError("message must be bounded")
+    if unicodedata.normalize("NFC", stripped) != stripped:
+        raise ValueError("message must use normalized Unicode")
+    for character in stripped:
+        category = unicodedata.category(character)
+        if category == "Cf" or (category == "Cc" and character not in "\n\t"):
+            raise ValueError("message contains unsafe control characters")
+    return stripped
 
 
 def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
@@ -2683,6 +2718,13 @@ def _main_agent_adjusted_ready_mode(
     attachment_ids: tuple[str, ...],
 ) -> TaskMode:
     local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+    if (
+        local_mode is TaskMode.DIRECT
+        and router_mode is not TaskMode.DIRECT
+        and not attachment_ids
+        and _looks_like_interactive_support_request(message)
+    ):
+        return TaskMode.DIRECT
     if local_mode is TaskMode.HYBRID:
         return TaskMode.HYBRID
     if {router_mode, local_mode} == {TaskMode.DISPATCH, TaskMode.DISCUSS}:
@@ -2694,6 +2736,8 @@ def _main_agent_adjusted_ready_mode(
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
     text = message.lower()
+    if not attachment_ids and _looks_like_interactive_support_request(message):
+        return TaskMode.DIRECT
     execution_markers = (
         "文案",
         "脚本",
@@ -2746,7 +2790,7 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
     has_execution = bool(attachment_ids) or any(marker in text for marker in execution_markers)
     has_discussion = any(marker in text for marker in discussion_markers)
     if any(marker in text for marker in explicit_hybrid_markers) or (
-        has_execution and has_discussion
+        has_execution and has_discussion and _has_explicit_execution_action(text)
     ):
         return TaskMode.HYBRID
     if has_discussion:
@@ -2754,6 +2798,64 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
     if has_execution:
         return TaskMode.DISPATCH
     return TaskMode.DIRECT
+
+
+def _has_explicit_execution_action(normalized_message: str) -> bool:
+    return any(
+        marker in normalized_message
+        for marker in (
+            "生成",
+            "创建",
+            "制作",
+            "执行",
+            "运行",
+            "落地",
+            "实现",
+            "开发",
+            "部署",
+            "推送",
+            "提交",
+            "修改",
+            "修复",
+            "剪辑",
+            "撰写",
+            "produce",
+            "generate",
+            "create",
+            "build",
+            "execute",
+            "run",
+            "implement",
+            "deploy",
+            "push",
+            "commit",
+            "fix",
+        )
+    )
+
+
+_INTERACTIVE_SUPPORT_RE = re.compile(
+    r"(为什么|怎么|如何|能不能|是否|是不是|有没有|啥意思|什么意思|解释|说明|问一下|咨询|"
+    r"帮我看看|看一下|分析一下|梳理|复盘|给.*建议|讨论一下|检查一下|排查一下|问题|报错|失败|不对|不正常|无法|没办法|不能|"
+    r"交互|体验|权限|可见|读不了|看不到|找不到|"
+    r"\bwhy\b|\bhow\b|\bcan\b|\bcould\b|\bwhat\s+does\b|\bissue\b|\berror\b|\bfailed\b|\bproblem\b)",
+    re.IGNORECASE,
+)
+_INTERACTIVE_ACTION_RE = re.compile(
+    r"(修复|修一下|改一下|调整|实现|开发|部署|推送|提交|执行|运行|生成|创建|删除|清理|上传|"
+    r"\bfix\b|\bimplement\b|\bdeploy\b|\bpush\b|\bcommit\b|\brun\b|\bexecute\b|\bgenerate\b|\bcreate\b|\bdelete\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_interactive_support_request(message: str) -> bool:
+    if _INTERACTIVE_SUPPORT_RE.search(message) is None:
+        return False
+    if "?" in message or "？" in message:
+        return True
+    if _looks_like_background_request(message):
+        return True
+    return _INTERACTIVE_ACTION_RE.search(message) is None
 
 
 def _current_artifact_delivery_mode(message: str) -> TaskMode | None:

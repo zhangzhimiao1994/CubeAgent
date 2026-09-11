@@ -70,6 +70,7 @@ class StubRunService:
     enqueue_count: int = 0
     direct_models: list[str | None] | None = None
     vibe_coding_flags: list[bool] | None = None
+    submit_error: ValueError | None = None
 
     async def submit(
         self,
@@ -93,6 +94,8 @@ class StubRunService:
     ) -> SubmittedRun:
         del idempotency_key
         del skip_schedule_proposal
+        if self.submit_error is not None:
+            raise self.submit_error
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
@@ -541,6 +544,24 @@ def test_run_submission_rejects_hidden_control_characters_before_service_call() 
     )
 
     assert response.status_code == 422
+    assert service.submitted == []
+
+
+def test_run_submission_maps_service_message_validation_to_422() -> None:
+    client, service, _ = _client()
+    service.submit_error = ValueError(
+        "message must be at most 16000 characters; upload long documents as attachments"
+    )
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "背景材料" * 5000, "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+    assert response.json()["error"]["details"]["reason"].startswith("message must be at most")
     assert service.submitted == []
 
 

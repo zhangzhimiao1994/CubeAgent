@@ -106,6 +106,7 @@ type RunSubmissionOverride = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const COMPACT_CHAT_MEDIA_QUERY = "(max-width: 640px)";
+const MAX_RUN_MESSAGE_BYTES = 65_536;
 const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
 const ARCHIVE_EXTENSIONS = [
   ".zip",
@@ -1352,13 +1353,27 @@ function runCreatedAtMs(run: RunListItem) {
   return Number.isNaN(date.getTime()) ? 0 : date.getTime();
 }
 
+function utf8ByteLength(value: string) {
+  return new TextEncoder().encode(value).length;
+}
+
+function compareRunsChronologically(left: RunListItem, right: RunListItem) {
+  const timeDiff = runCreatedAtMs(left) - runCreatedAtMs(right);
+  if (timeDiff !== 0) return timeDiff;
+  return left.id.localeCompare(right.id);
+}
+
+function sortRunsChronologically<T extends RunListItem>(runs: T[]): T[] {
+  return [...runs].sort(compareRunsChronologically);
+}
+
 function conversationTitle(run: RunListItem, items: RunListItem[]) {
   const fallback = run.id.slice(0, 8);
   const conversationKey = run.conversation_id?.trim();
   const sameConversation = conversationKey ? items.filter((item) => item.conversation_id === conversationKey) : [];
   const firstRun =
     sameConversation.length > 0
-      ? [...sameConversation].sort((left, right) => runCreatedAtMs(left) - runCreatedAtMs(right))[0]
+      ? sortRunsChronologically(sameConversation)[0]
       : run;
   const question = normalizeConversationQuestion(firstRun?.request, fallback);
   const timestamp = conversationTimestamp(firstRun?.created_at);
@@ -1392,24 +1407,31 @@ function conversationListEntries(items: RunListItem[]): ConversationListEntry[] 
       grouped.set(key, { conversationId, runs: [run] });
     }
   }
-  return Array.from(grouped.entries()).map(([key, entry]) => {
-    const latestRun = [...entry.runs].sort((left, right) => runCreatedAtMs(right) - runCreatedAtMs(left))[0];
-    const runIds = entry.runs.map((run) => run.id);
-    const allTerminal = entry.runs.every((run) => TERMINAL_STATUSES.has(run.status));
-    return {
-      key,
-      conversationId: entry.conversationId,
-      latestRun,
-      runIds,
-      deletableRunIds: allTerminal ? runIds : [],
-      allTerminal,
-    };
-  });
+  return Array.from(grouped.entries())
+    .map(([key, entry]) => {
+      const orderedRuns = sortRunsChronologically(entry.runs);
+      const latestRun = orderedRuns.at(-1) ?? entry.runs[0];
+      const runIds = orderedRuns.map((run) => run.id);
+      const allTerminal = orderedRuns.every((run) => TERMINAL_STATUSES.has(run.status));
+      return {
+        key,
+        conversationId: entry.conversationId,
+        latestRun,
+        runIds,
+        deletableRunIds: allTerminal ? runIds : [],
+        allTerminal,
+      };
+    })
+    .sort((left, right) => {
+      const timeDiff = runCreatedAtMs(right.latestRun) - runCreatedAtMs(left.latestRun);
+      if (timeDiff !== 0) return timeDiff;
+      return left.key.localeCompare(right.key);
+    });
 }
 
 function conversationMessages(runs: RunDetail[]) {
   const dedupedRunsById = new Map(runs.map((run) => [run.id, run]));
-  const dedupedRuns = Array.from(dedupedRunsById.values());
+  const dedupedRuns = sortRunsChronologically(Array.from(dedupedRunsById.values()));
   return dedupedRuns.flatMap((run) =>
     detailMessages(run).map((message) => ({
       ...message,
@@ -1482,21 +1504,22 @@ function eventFingerprint(event: RunEvent) {
 }
 
 function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
-  if (!previous || previous.length === 0) return incoming;
-  if (incoming.length === 0) return previous;
+  if (!previous || previous.length === 0) return sortRunsChronologically(incoming);
+  if (incoming.length === 0) return sortRunsChronologically(previous);
   const incomingById = new Map(incoming.map((run) => [run.id, run]));
   const previousIds = new Set(previous.map((run) => run.id));
-  const merged = previous.map((run) => incomingById.get(run.id) ?? run);
+  const merged = sortRunsChronologically(previous.map((run) => incomingById.get(run.id) ?? run));
   for (const run of incoming) {
     if (!previousIds.has(run.id)) merged.push(run);
   }
+  const ordered = sortRunsChronologically(merged);
   if (
-    merged.length === previous.length &&
-    merged.every((run, index) => sameRunSnapshot(run, previous[index]))
+    ordered.length === previous.length &&
+    ordered.every((run, index) => sameRunSnapshot(run, previous[index]))
   ) {
     return previous;
   }
-  return merged;
+  return ordered;
 }
 
 function internalArtifactNotice(detail: RunDetail): ChatMessage | null {
@@ -3386,8 +3409,7 @@ export function RunsPage() {
     } else if (
       selectedRun.data &&
       selectedRun.data.status !== "waiting_user_mode" &&
-      modeSelection &&
-      modeSelection.runId !== selectedRun.data.id
+      modeSelection
     ) {
       setModeSelection(null);
     }
@@ -3729,6 +3751,10 @@ export function RunsPage() {
   const stopCurrentRun = useMutation({
     mutationFn: (runId: string) => api.cancelRun(runId),
     onSuccess: async (run) => {
+      setModeSelection((current) => (current?.runId === run.id ? null : current));
+      setTemporaryApproval((current) => (current?.runId === run.id ? null : current));
+      setScheduleApproval((current) => (current?.runId === run.id ? null : current));
+      setOpenClawApproval((current) => (current?.runId === run.id ? null : current));
       setSubmitNotice("已停止当前运行。你可以继续发送新消息。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
@@ -3998,6 +4024,10 @@ export function RunsPage() {
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    if (utf8ByteLength(trimmed) > MAX_RUN_MESSAGE_BYTES) {
+      setSubmitNotice("这段消息太长，已超过 64KB。请作为附件上传，或拆成几轮发送后再继续。");
+      return;
+    }
     if (skillUploadConflict) {
       const strategy = skillUploadConflictStrategyFromText(trimmed);
       if (!strategy) {

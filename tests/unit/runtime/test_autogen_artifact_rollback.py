@@ -8,6 +8,7 @@ import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
@@ -23,7 +24,7 @@ from agent_hub.runtime.autogen.adapter import (
     _discussion_has_enough_distinct_outputs,
     _should_fail_on_autogen_cleanup,
 )
-from agent_hub.runtime.contracts import Artifact, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000041")
 RUN_ID = UUID("00000000-0000-4000-8000-000000000042")
@@ -39,6 +40,40 @@ class UnusedGateway:
             provider_model="deepseek-v4-flash",
             cost_usd=Decimal(0),
         )
+
+
+class ScriptedGateway:
+    def __init__(self, replies: list[tuple[str, int, Decimal | None]]) -> None:
+        self.replies = list(replies)
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        text, tokens, cost = self.replies.pop(0)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=text,
+                usage=TokenUsage(
+                    prompt_tokens=max(tokens - 1, 0),
+                    completion_tokens=min(tokens, 1),
+                    total_tokens=tokens,
+                ),
+            ),
+            deployment_id="shared",
+            logical_model=request.logical_model,
+            provider_id="openai",
+            provider_model="openai/test",
+            cost_usd=cost,
+        )
+
+
+class FailingGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        raise ModelTransportError("Authorization: Bearer sk-secret", status_code=401)
 
 
 def _runtime(repository: InMemoryArtifactRepository) -> AutoGenDiscussionRuntime:
@@ -59,6 +94,28 @@ def _runtime(repository: InMemoryArtifactRepository) -> AutoGenDiscussionRuntime
     )
 
 
+def _scripted_runtime(gateway: object) -> AutoGenDiscussionRuntime:
+    return AutoGenDiscussionRuntime(
+        gateway,  # type: ignore[arg-type]
+        DiscussionPlan(
+            participants=(
+                DiscussionParticipant(
+                    id="analyst", role="Analyst", goal="Analyze", logical_model="general"
+                ),
+                DiscussionParticipant(
+                    id="critic", role="Critic", goal="Critique", logical_model="general"
+                ),
+            ),
+            selector_model="general",
+            max_turns=4,
+            wall_time_seconds=5.0,
+            token_budget=100,
+            cost_budget_usd=Decimal(1),
+            consensus_votes=2,
+        ),
+    )
+
+
 def _context() -> TaskContext:
     return TaskContext(
         run_id=RUN_ID,
@@ -70,6 +127,10 @@ def _context() -> TaskContext:
 
 def _artifact() -> Artifact:
     return Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "safe"})
+
+
+async def _collect(runtime: AutoGenDiscussionRuntime, ctx: TaskContext) -> list[RunEvent]:
+    return [event async for event in runtime.run(ctx)]
 
 
 def test_partial_discussion_can_complete_after_late_model_gateway_failure() -> None:
@@ -168,3 +229,37 @@ async def test_autogen_store_artifact_preserves_original_error_when_rollback_fai
         str(caught.value)
         == "artifact rollback failed after artifact repository capacity exceeded"
     )
+
+
+async def test_discussion_gateway_failure_emits_readable_summary_before_failure() -> None:
+    events = await _collect(_scripted_runtime(FailingGateway()), _context())
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+    summary = completed.payload["summary"]
+    assert isinstance(summary, str)
+    assert "讨论阶段未能完成" in summary
+    assert completed.payload["reason"] == "model gateway failed: model transport failed (status=401)"
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
+
+
+async def test_discussion_retries_empty_model_response_before_continuing() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("", 1, Decimal("0.01")),
+            ("analyst", 1, Decimal("0.01")),
+            ("Facts are A.", 2, Decimal("0.01")),
+            ("critic", 1, Decimal("0.01")),
+            ("[COMPLETE] Facts are verified.", 2, Decimal("0.01")),
+        ]
+    )
+
+    events = await _collect(_scripted_runtime(gateway), _context())
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+    assert "previous model response was empty" in str(gateway.requests[1].messages[-1].content).casefold()
+    assert [event.actor for event in events if event.kind is EventKind.MESSAGE_CREATED] == [
+        "analyst",
+        "critic",
+    ]

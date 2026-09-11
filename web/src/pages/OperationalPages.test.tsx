@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -1689,6 +1689,40 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
   });
+
+  it("clears a stale mode-selection prompt after stopping so the next message is a normal submission", async () => {
+    const user = userEvent.setup();
+    visibleRunListItem = { ...runListItem, status: "waiting_user_mode", mode: "auto" };
+    visibleRunListItems = [visibleRunListItem];
+    visibleRunDetail = {
+      ...runDetail,
+      status: "waiting_user_mode",
+      mode: "auto",
+      decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
+    expect(await screen.findByText(/主 Agent 需要你确认运行方式/)).not.toBeNull();
+
+    await user.click(await screen.findByRole("button", { name: "停止生成" }));
+    expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "你好，继续普通回答。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const postRequests = requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST");
+    expect(postRequests.at(-1)).toMatchObject({
+      body: {
+        message: "你好，继续普通回答。",
+        conversation_id: "conv-previous",
+      },
+    });
+    expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toBeUndefined();
+  });
+
   it("keeps agent process access visible while hiding per-run workflow configuration", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -2189,6 +2223,47 @@ describe("operational management pages", () => {
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
   });
 
+  it("renders conversation messages chronologically even when cached runs arrive out of order", async () => {
+    const secondRunDetail = {
+      ...runDetail,
+      id: secondRunId,
+      request: "再给我一个更强的开头。",
+      created_at: "2026-08-07T00:05:00Z",
+      artifacts: [
+        {
+          id: "artifact-2",
+          kind: "markdown",
+          title: "短视频脚本二稿",
+          text: "这是第二轮回复正文：已经把开头改得更强。",
+        },
+      ],
+    };
+    visibleRunListItems = [
+      {
+        ...secondRunListItem,
+        status: "completed",
+        conversation_id: "conv-previous",
+        request: "再给我一个更强的开头。",
+        created_at: "2026-08-07T00:05:00Z",
+      },
+      { ...runListItem, status: "completed" },
+    ];
+    visibleConversationRuns = [secondRunDetail, runDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const firstRequest = await within(stream).findByText("给我做一个短视频脚本方案。");
+    const secondRequest = await within(stream).findByText("再给我一个更强的开头。");
+    expect(firstRequest.compareDocumentPosition(secondRequest) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const firstReply = within(stream).getAllByText(/这是最终回复正文/)[0];
+    const secondReply = within(stream).getAllByText(/这是第二轮回复正文/)[0];
+    expect(firstReply.compareDocumentPosition(secondReply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("restores historical conversation messages after starting a new chat", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -2240,6 +2315,18 @@ describe("operational management pages", () => {
     const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
     expect(request).toMatchObject({ method: "POST", body: { message: "审查这个代码附件。" } });
     expect(request?.body).not.toHaveProperty("vibe_coding", true);
+  });
+
+  it("blocks oversized chat messages before creating a failed backend run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    fireEvent.change(screen.getByPlaceholderText(/输入消息/), { target: { value: "长文档".repeat(11000) } });
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByText(/这段消息太长/)).not.toBeNull();
+    expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(false);
   });
 
   it("creates a schedule from a chat-detected plan after user confirmation", async () => {

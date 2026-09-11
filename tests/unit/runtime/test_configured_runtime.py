@@ -214,6 +214,22 @@ class FakeTransport:
         )
 
 
+class EmptyQwenTransport(FakeTransport):
+    async def complete(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse:
+        self.calls.append((deployment, request, api_key))
+        if deployment.logical_model == "qwen":
+            return ModelResponse(text="")
+        return ModelResponse(
+            text="备用文本模型已接管",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+
 class ProbeDispatchRuntime:
     instances: ClassVar[list["ProbeDispatchRuntime"]] = []
 
@@ -327,6 +343,83 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
     assert capacities[0].wait_timeouts == [60.0]
     assert secrets.resolved == [(TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")]
     assert capacities[0].recorded == [True]
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_uses_explicit_text_fallback_model() -> None:
+    transport = EmptyQwenTransport()
+    secrets = FakeSecretService()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "qwen": {
+                        "fallback_model": "backup",
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-plus",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "backup": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://backup",
+                                "quota_scope_id": "deepseek",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="普通聊天问题",
+                routing_decision={"direct_model": "qwen"},
+            )
+        )
+    ]
+
+    assert [deployment.logical_model for deployment, _request, _api_key in transport.calls] == [
+        "qwen",
+        "backup",
+    ]
+    assert [request.logical_model for _deployment, request, _api_key in transport.calls] == [
+        "qwen",
+        "qwen",
+    ]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    artifact = next(event.artifact for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact is not None
+    assert artifact.content["text"] == "备用文本模型已接管"
+    assert artifact.provenance is not None
+    assert artifact.provenance.logical_model == "backup"
 
 
 @pytest.mark.asyncio

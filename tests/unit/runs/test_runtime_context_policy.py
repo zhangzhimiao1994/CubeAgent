@@ -179,11 +179,12 @@ def test_conversation_history_includes_media_pipeline_rejected_artifact_feedback
 def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None:
     old_noise = "old implementation detail " * 2000
     latest_decision = "latest important conclusion: use framework-level context compression"
+    current_request = "当前请求：继续普通对话，并解释刚才失败原因。"
 
     artifact = _conversation_history_artifact(
         run_id=uuid4(),
         conversation_id="conv-long",
-        current_request="continue the work",
+        current_request=current_request,
         context_items=(
             ConversationContextItem(
                 run_id=uuid4(),
@@ -219,6 +220,8 @@ def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None
     assert type(history_budget) is int
     assert isinstance(text, str)
     assert original_tokens > history_budget
+    assert f"CURRENT_USER_REQUEST: {current_request}" in text
+    assert artifact.content["current_user_request"] == current_request
     assert latest_decision in text
 
 
