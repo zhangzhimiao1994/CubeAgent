@@ -4047,12 +4047,12 @@ describe("operational management pages", () => {
     });
   });
 
-  it("forwards @skill and $plugin mentions from a normal chat message", async () => {
+  it("forwards @skill, $plugin, and @file mentions from a normal chat message", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @deep-research 和 $plugin:runway 生成调研方案");
+    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @deep-research 和 $plugin:runway 结合 @file:handoff.md 生成调研方案");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() =>
@@ -4061,9 +4061,10 @@ describe("operational management pages", () => {
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
-        message: "用 @deep-research 和 $plugin:runway 生成调研方案",
+        message: "用 @deep-research 和 $plugin:runway 结合 @file:handoff.md 生成调研方案",
         requested_skills: ["deep-research"],
         requested_plugins: ["runway"],
+        requested_files: ["handoff.md"],
       },
     });
   });
@@ -4095,11 +4096,12 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @skill:deep-research 和 $plugin:runway 做方案");
+    await user.type(screen.getByPlaceholderText(/输入消息/), "用 @skill:deep-research 和 $plugin:runway 结合 @file:docs/设定.md 做方案");
 
     const references = await screen.findByLabelText("已引用能力");
     expect(within(references).getByText("Skill deep-research")).not.toBeNull();
     expect(within(references).getByText("插件 runway")).not.toBeNull();
+    expect(within(references).getByText("文件 docs/设定.md")).not.toBeNull();
   });
 
   it("offers clickable @skill and $plugin mention suggestions in the chat composer", async () => {

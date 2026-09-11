@@ -1579,6 +1579,7 @@ export const api = {
     attachment_ids?: string[];
     requested_skills?: string[];
     requested_plugins?: string[];
+    requested_files?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;
   }): Promise<SubmittedRun> {

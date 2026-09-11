@@ -224,7 +224,8 @@ function skillUploadConflictStrategyFromText(text: string): SkillUploadStrategy 
 function referencedCapabilitiesFromText(text: string) {
   const skills: string[] = [];
   const plugins: string[] = [];
-  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/@]{2,100})/g;
+  const files: string[] = [];
+  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/@\u4e00-\u9fff]{2,100})/gu;
   for (const match of text.matchAll(mentionPattern)) {
     const marker = match[2];
     const raw = match[3]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
@@ -241,13 +242,20 @@ function referencedCapabilitiesFromText(text: string) {
       if (skill && !skills.includes(skill)) skills.push(skill);
       continue;
     }
+    if (normalized.startsWith("file:")) {
+      const file = raw.slice("file:".length).replace(/\\/g, "/");
+      if (file && !file.startsWith("/") && !/^[a-zA-Z]:\//.test(file) && !file.split("/").includes("..") && !files.includes(file)) {
+        files.push(file);
+      }
+      continue;
+    }
     if (marker === "$" || normalized.includes("plugin")) {
       if (!plugins.includes(raw)) plugins.push(raw);
     } else if (!skills.includes(raw)) {
       skills.push(raw);
     }
   }
-  return { skills, plugins };
+  return { skills, plugins, files };
 }
 
 function capabilityMentionTriggerFromText(text: string): CapabilityMentionTrigger | null {
@@ -3296,7 +3304,7 @@ export function RunsPage() {
     [capabilityMentionTrigger, skillsCatalog.data],
   );
   const hasCapabilityReferences =
-    referencedCapabilities.skills.length > 0 || referencedCapabilities.plugins.length > 0;
+    referencedCapabilities.skills.length > 0 || referencedCapabilities.plugins.length > 0 || referencedCapabilities.files.length > 0;
 
   const selectedRun = useQuery({
     queryKey: ["run", selectedRunId],
@@ -3479,6 +3487,7 @@ export function RunsPage() {
         attachment_ids: uniqueAttachmentIds(attachmentDrafts),
         requested_skills: runReferencedCapabilities.skills,
         requested_plugins: runReferencedCapabilities.plugins,
+        requested_files: runReferencedCapabilities.files,
         skip_evolution_proposal: true,
       });
     },
@@ -4921,6 +4930,9 @@ export function RunsPage() {
                 ))}
                 {referencedCapabilities.plugins.map((plugin) => (
                   <span key={`plugin-${plugin}`}>插件 {plugin}</span>
+                ))}
+                {referencedCapabilities.files.map((file) => (
+                  <span key={`file-${file}`}>文件 {file}</span>
                 ))}
               </div>
             ) : null}

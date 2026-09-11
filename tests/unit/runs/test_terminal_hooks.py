@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Self
@@ -690,6 +690,50 @@ async def test_execute_loads_previous_conversation_attachment_artifacts_into_run
     assert restored_attachment.producer == "conversation_uploaded_attachment"
     assert restored_attachment.content["context_scope"] == "previous_conversation_attachment"
     assert "前序交互上传过附件" in str(restored_attachment.content["text"])
+
+
+@pytest.mark.asyncio
+async def test_execute_loads_requested_resource_artifacts_into_runtime_context() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "conversation_id": "conv-with-resource",
+            "requested_skills": "cross-system-hub",
+            "requested_files": "handoff.md",
+        }
+    )
+    runtime = RuntimeCapturesArtifacts()
+    resource_artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="requested_resource_context",
+        content={
+            "text": "<REQUESTED_RESOURCE_CONTEXT>cross-system-hub handoff.md</REQUESTED_RESOURCE_CONTEXT>",
+        },
+    )
+
+    async def load_resources(
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
+    ) -> tuple[Artifact, ...]:
+        assert tenant_id == TENANT_ID
+        assert routing_decision["requested_skills"] == "cross-system-hub"
+        assert routing_decision["requested_files"] == "handoff.md"
+        return (resource_artifact,)
+
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        resource_context_loader=load_resources,
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert resource_artifact in runtime.artifacts
 
 
 @pytest.mark.asyncio

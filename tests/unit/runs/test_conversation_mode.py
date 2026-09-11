@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -189,6 +190,29 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
         "reference_conversation_id": None,
         "attachment_ids": [],
     }
+
+
+async def test_submit_extracts_explicit_file_reference_into_routing_context() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=WaitingRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="请结合 @file:handoff.md 继续任务",
+        mode=TaskMode.DIRECT,
+        skip_evolution_proposal=True,
+    )
+
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, Mapping)
+    assert submitted.status is RunStatus.QUEUED
+    assert routing["requested_files"] == "handoff.md"
 
 
 async def test_script_request_records_long_lived_media_pipeline_plan_without_slots() -> None:

@@ -163,6 +163,7 @@ class CreateRunRequest(BaseModel):
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     requested_skills: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     requested_plugins: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_files: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
 
@@ -173,7 +174,7 @@ class CreateRunRequest(BaseModel):
             return tuple(value)
         return value
 
-    @field_validator("requested_skills", "requested_plugins", mode="before")
+    @field_validator("requested_skills", "requested_plugins", "requested_files", mode="before")
     @classmethod
     def coerce_requested_capabilities(cls, value: object) -> object:
         if isinstance(value, list):
@@ -191,6 +192,26 @@ class CreateRunRequest(BaseModel):
                 continue
             if re.fullmatch(r"[\w\-:.\/@\u4e00-\u9fff]+", cleaned) is None:
                 raise ValueError("requested capabilities must be safe identifiers")
+            seen.add(cleaned)
+            result.append(cleaned)
+        return tuple(result)
+
+    @field_validator("requested_files")
+    @classmethod
+    def validate_requested_files(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            cleaned = item.strip().replace("\\", "/")
+            if not cleaned or cleaned in seen or len(cleaned) > 240:
+                continue
+            if (
+                cleaned.startswith("/")
+                or re.match(r"^[a-zA-Z]:/", cleaned)
+                or any(part == ".." for part in cleaned.split("/"))
+                or "\x00" in cleaned
+            ):
+                raise ValueError("requested files must be safe relative paths")
             seen.add(cleaned)
             result.append(cleaned)
         return tuple(result)
@@ -419,6 +440,7 @@ async def _record_run_submit_audit(
         "attachment_count": len(body.attachment_ids),
         "requested_skills": list(body.requested_skills),
         "requested_plugins": list(body.requested_plugins),
+        "requested_files": list(body.requested_files),
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
     }
@@ -436,6 +458,8 @@ def _requested_capability_payload(body: CreateRunRequest) -> dict[str, str] | No
         payload["requested_skills"] = ",".join(body.requested_skills)
     if body.requested_plugins:
         payload["requested_plugins"] = ",".join(body.requested_plugins)
+    if body.requested_files:
+        payload["requested_files"] = ",".join(body.requested_files)
     return payload or None
 
 

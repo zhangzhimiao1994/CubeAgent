@@ -26,6 +26,7 @@ from agent_hub.runs.repository import (
     RunRecord,
     RunRepository,
 )
+from agent_hub.runs.resource_context import requested_files_from_text
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -106,6 +107,15 @@ class AttachmentArtifactLoader(Protocol):
         *,
         tenant_id: UUID,
         attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]: ...
+
+
+class ResourceContextLoader(Protocol):
+    async def __call__(
+        self,
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
     ) -> tuple[Artifact, ...]: ...
 
 
@@ -336,6 +346,7 @@ class RunService:
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
         attachment_artifact_loader: AttachmentArtifactLoader | None = None,
+        resource_context_loader: ResourceContextLoader | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
         observer_policy: ObserverPolicy | None = None,
     ) -> None:
@@ -353,6 +364,7 @@ class RunService:
         )
         self._main_agent_context_window_getter = main_agent_context_window_getter
         self._attachment_artifact_loader = attachment_artifact_loader
+        self._resource_context_loader = resource_context_loader
         self._terminal_run_hooks = terminal_run_hooks
         self._observer_policy = observer_policy or ObserverPolicy()
 
@@ -399,6 +411,9 @@ class RunService:
             operator_selection["skip_evolution_proposal"] = True
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
+        requested_files = requested_files_from_text(message)
+        if requested_files and "requested_files" not in operator_selection:
+            operator_selection["requested_files"] = ",".join(requested_files)
         media_pipeline_plan = _media_pipeline_plan_for_request(message)
         if media_pipeline_plan is not None:
             operator_selection["media_pipeline_plan"] = media_pipeline_plan
@@ -1384,9 +1399,13 @@ class RunService:
             tenant_id=tenant_id,
             routing_decision=routing_decision,
         )
+        resource_artifacts = await self._requested_resource_artifacts(
+            tenant_id=tenant_id,
+            routing_decision=routing_decision,
+        )
         conversation_id = _string_or_none(routing_decision.get("conversation_id"))
         if conversation_id is None:
-            return attachment_artifacts
+            return (*attachment_artifacts, *resource_artifacts)
         try:
             context_items = await self._repository.conversation_context(
                 tenant_id,
@@ -1400,7 +1419,7 @@ class RunService:
                 run_id,
                 conversation_id,
             )
-            return attachment_artifacts
+            return (*attachment_artifacts, *resource_artifacts)
         previous_attachment_artifacts = await self._previous_attachment_artifacts(
             tenant_id=tenant_id,
             context_items=context_items,
@@ -1424,7 +1443,12 @@ class RunService:
             history_artifacts: tuple[Artifact, ...] = ()
         else:
             history_artifacts = (artifact,)
-        return (*attachment_artifacts, *previous_attachment_artifacts, *history_artifacts)
+        return (
+            *attachment_artifacts,
+            *resource_artifacts,
+            *previous_attachment_artifacts,
+            *history_artifacts,
+        )
 
     async def _current_attachment_artifacts(
         self,
@@ -1478,6 +1502,23 @@ class RunService:
             )
             return ()
         return _mark_previous_attachment_artifacts(artifacts)
+
+    async def _requested_resource_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
+    ) -> tuple[Artifact, ...]:
+        if self._resource_context_loader is None:
+            return ()
+        try:
+            return await self._resource_context_loader(
+                tenant_id=tenant_id,
+                routing_decision=routing_decision,
+            )
+        except Exception:
+            _LOGGER.exception("requested_resource_context_load_failed tenant_id=%s", tenant_id)
+            return ()
 
     async def _main_agent_context_window_tokens(
         self, routing_decision: Mapping[str, object]
@@ -3278,6 +3319,7 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
         "requested_skills",
         "requested_mcp_servers",
         "requested_plugins",
+        "requested_files",
         "requested_channel_features",
     }
     result: dict[str, str] = {}
