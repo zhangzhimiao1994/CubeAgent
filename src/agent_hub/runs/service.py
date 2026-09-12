@@ -3,24 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.routing.rules import assess_rules
+from agent_hub.routing.rules import MAX_TASK_TEXT, assess_rules
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
-from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from agent_hub.runs.repository import (
+    ConversationContextItem,
+    RunAlreadyActive,
+    RunRecord,
+    RunRepository,
+)
+from agent_hub.runs.resource_context import requested_files_from_text
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
@@ -32,8 +47,10 @@ _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 _AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_MAX_SUBMISSION_MESSAGE_BYTES = 65_536
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
+_CONVERSATION_HISTORY_ARTIFACT_NAMESPACE = UUID("8ef85f85-3d8f-42e6-8e90-6a7c57f8d4a2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +109,15 @@ class AttachmentArtifactLoader(Protocol):
         *,
         tenant_id: UUID,
         attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]: ...
+
+
+class ResourceContextLoader(Protocol):
+    async def __call__(
+        self,
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
     ) -> tuple[Artifact, ...]: ...
 
 
@@ -322,6 +348,7 @@ class RunService:
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
         attachment_artifact_loader: AttachmentArtifactLoader | None = None,
+        resource_context_loader: ResourceContextLoader | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
         observer_policy: ObserverPolicy | None = None,
     ) -> None:
@@ -339,6 +366,7 @@ class RunService:
         )
         self._main_agent_context_window_getter = main_agent_context_window_getter
         self._attachment_artifact_loader = attachment_artifact_loader
+        self._resource_context_loader = resource_context_loader
         self._terminal_run_hooks = terminal_run_hooks
         self._observer_policy = observer_policy or ObserverPolicy()
 
@@ -358,9 +386,11 @@ class RunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
+        message = _validated_submission_message(message)
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
         cleaned_direct_model = direct_model.strip() if direct_model else None
         if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
@@ -383,8 +413,16 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if skip_evolution_proposal:
             operator_selection["skip_evolution_proposal"] = True
+        if skip_schedule_proposal:
+            operator_selection["skip_schedule_proposal"] = True
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
+        requested_files = requested_files_from_text(message)
+        if requested_files and "requested_files" not in operator_selection:
+            operator_selection["requested_files"] = ",".join(requested_files)
+        media_pipeline_plan = _media_pipeline_plan_for_request(message)
+        if media_pipeline_plan is not None:
+            operator_selection["media_pipeline_plan"] = media_pipeline_plan
         evolution_proposal = None
         if not skip_evolution_proposal:
             evolution_proposal = _local_evolution_proposal(
@@ -402,11 +440,13 @@ class RunService:
                 idempotency_key=idempotency_key,
                 operator_selection=operator_selection,
             )
-        schedule_proposal = _local_schedule_proposal(
-            message=message,
-            mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
-            workflow_id=workflow_id,
-        )
+        schedule_proposal = None
+        if not skip_schedule_proposal:
+            schedule_proposal = _local_schedule_proposal(
+                message=message,
+                mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
+                workflow_id=workflow_id,
+            )
         if schedule_proposal is not None:
             return await self._create_schedule_approval_run(
                 tenant_id=tenant_id,
@@ -881,6 +921,58 @@ class RunService:
         )
         return _submitted(record)
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        cleaned_approval_id = approval_id.strip()
+        if not cleaned_approval_id:
+            raise ValueError("artifact review approval id must not be blank")
+        record = await self._repository.approve_artifact_review_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=cleaned_approval_id[:128],
+            version=version,
+        )
+        return _submitted(record)
+
+    async def reject_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+        review_items: tuple[Mapping[str, str], ...] = (),
+    ) -> SubmittedRun:
+        del actor_id
+        cleaned_approval_id = approval_id.strip()
+        if not cleaned_approval_id:
+            raise ValueError("artifact review approval id must not be blank")
+        cleaned_feedback = feedback.strip()
+        cleaned_review_items = _clean_artifact_review_items(review_items)
+        if not cleaned_feedback and not cleaned_review_items:
+            raise ValueError("artifact review feedback must not be blank")
+        if not cleaned_feedback:
+            cleaned_feedback = _artifact_review_items_feedback_summary(cleaned_review_items)
+        record = await self._repository.reject_artifact_review_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=cleaned_approval_id[:128],
+            version=version,
+            feedback=cleaned_feedback[:2000],
+            review_items=cleaned_review_items,
+        )
+        return _submitted(record)
+
     async def choose_mode(
         self,
         *,
@@ -1069,18 +1161,36 @@ class RunService:
             if checkpoint is not None:
                 await runtime.restore_checkpoint(checkpoint)
             token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
+            conversation_artifacts = await self._conversation_artifacts(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                current_request=request,
+                routing_decision=routing_decision,
+                runtime_token_budget=token_budget,
+            )
+            if checkpoint is None:
+                artifacts = conversation_artifacts
+            else:
+                current_run_artifacts = await self._current_run_artifacts(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                )
+                artifacts = _dedupe_artifacts(
+                    current_run_artifacts,
+                    conversation_artifacts,
+                    _checkpoint_lineage_input_artifacts(
+                        checkpoint,
+                        current_request=request,
+                        current_run_artifacts=current_run_artifacts,
+                        conversation_artifacts=conversation_artifacts,
+                    ),
+                )
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
                 mode=mode,
                 request=request,
-                artifacts=await self._conversation_artifacts(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    current_request=request,
-                    routing_decision=routing_decision,
-                    runtime_token_budget=token_budget,
-                ),
+                artifacts=artifacts,
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
                 timeout_seconds=_runtime_timeout_seconds(
@@ -1114,11 +1224,29 @@ class RunService:
                         terminal = RunStatus.CANCELLED
                     elif event.kind is EventKind.RUNTIME_FAILED:
                         terminal = RunStatus.FAILED
+                    elif _is_runtime_artifact_review_request(event):
+                        terminal = RunStatus.WAITING_APPROVAL
                     if terminal is not RunStatus.RUNNING:
                         locked.status = terminal.value
                         locked.version += 1
+                        if terminal is RunStatus.WAITING_APPROVAL:
+                            routing_decision = (
+                                {} if locked.routing_decision is None else dict(locked.routing_decision)
+                            )
+                            locked.routing_decision = {
+                                **routing_decision,
+                                "reason": "runtime_artifact_review_required",
+                                "approval_kind": "runtime_artifact_review",
+                                "approval_id": event.approval_id,
+                                "approval_action": event.action,
+                                "approval_stage_id": event.payload.get("stage_id"),
+                                "approval_artifact_id": event.payload.get("artifact_id"),
+                                "approval_review_items": event.payload.get("review_items"),
+                            }
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
+                if terminal is RunStatus.WAITING_APPROVAL:
+                    break
         except Exception as error:
             _LOGGER.exception(
                 "run_execute_failed run_id=%s error_type=%s",
@@ -1233,7 +1361,38 @@ class RunService:
                     run_id,
                     status.value,
                     type(error).__name__,
+        )
+
+    async def _current_run_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> tuple[Artifact, ...]:
+        raw_artifacts_loader = getattr(self._repository, "raw_artifacts", None)
+        if not callable(raw_artifacts_loader):
+            return ()
+        try:
+            raw_artifacts = await raw_artifacts_loader(tenant_id, run_id)
+        except Exception:
+            _LOGGER.exception(
+                "run_artifact_context_load_failed tenant_id=%s run_id=%s",
+                tenant_id,
+                run_id,
+            )
+            return ()
+        artifacts: list[Artifact] = []
+        for raw_artifact in raw_artifacts:
+            try:
+                artifacts.append(Artifact.from_payload(raw_artifact))
+            except Exception as error:  # noqa: BLE001 - corrupted artifacts must not leak payload.
+                _LOGGER.warning(
+                    "run_artifact_context_parse_failed tenant_id=%s run_id=%s error_type=%s",
+                    tenant_id,
+                    run_id,
+                    type(error).__name__,
                 )
+        return tuple(artifacts)
 
     async def _conversation_artifacts(
         self,
@@ -1248,9 +1407,13 @@ class RunService:
             tenant_id=tenant_id,
             routing_decision=routing_decision,
         )
+        resource_artifacts = await self._requested_resource_artifacts(
+            tenant_id=tenant_id,
+            routing_decision=routing_decision,
+        )
         conversation_id = _string_or_none(routing_decision.get("conversation_id"))
         if conversation_id is None:
-            return attachment_artifacts
+            return (*attachment_artifacts, *resource_artifacts)
         try:
             context_items = await self._repository.conversation_context(
                 tenant_id,
@@ -1264,7 +1427,12 @@ class RunService:
                 run_id,
                 conversation_id,
             )
-            return attachment_artifacts
+            return (*attachment_artifacts, *resource_artifacts)
+        previous_attachment_artifacts = await self._previous_attachment_artifacts(
+            tenant_id=tenant_id,
+            context_items=context_items,
+            current_attachment_ids=_attachment_ids_from_routing(routing_decision),
+        )
         main_agent_context_window_tokens = await self._main_agent_context_window_tokens(
             routing_decision
         )
@@ -1273,6 +1441,7 @@ class RunService:
             main_agent_context_window_tokens=main_agent_context_window_tokens,
         )
         artifact = _conversation_history_artifact(
+            run_id=run_id,
             conversation_id=conversation_id,
             current_request=current_request,
             context_items=context_items,
@@ -1282,7 +1451,12 @@ class RunService:
             history_artifacts: tuple[Artifact, ...] = ()
         else:
             history_artifacts = (artifact,)
-        return (*attachment_artifacts, *history_artifacts)
+        return (
+            *attachment_artifacts,
+            *resource_artifacts,
+            *previous_attachment_artifacts,
+            *history_artifacts,
+        )
 
     async def _current_attachment_artifacts(
         self,
@@ -1306,6 +1480,52 @@ class RunService:
                 tenant_id,
                 len(attachment_ids),
             )
+            return ()
+
+    async def _previous_attachment_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        context_items: tuple[ConversationContextItem, ...],
+        current_attachment_ids: tuple[str, ...],
+    ) -> tuple[Artifact, ...]:
+        if self._attachment_artifact_loader is None:
+            return ()
+        attachment_ids = _conversation_attachment_ids(
+            context_items,
+            excluding=current_attachment_ids,
+        )
+        if not attachment_ids:
+            return ()
+        try:
+            artifacts = await self._attachment_artifact_loader(
+                tenant_id=tenant_id,
+                attachment_ids=attachment_ids,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "conversation_attachment_context_load_failed tenant_id=%s attachment_count=%s",
+                tenant_id,
+                len(attachment_ids),
+            )
+            return ()
+        return _mark_previous_attachment_artifacts(artifacts)
+
+    async def _requested_resource_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        routing_decision: Mapping[str, object],
+    ) -> tuple[Artifact, ...]:
+        if self._resource_context_loader is None:
+            return ()
+        try:
+            return await self._resource_context_loader(
+                tenant_id=tenant_id,
+                routing_decision=routing_decision,
+            )
+        except Exception:
+            _LOGGER.exception("requested_resource_context_load_failed tenant_id=%s", tenant_id)
             return ()
 
     async def _main_agent_context_window_tokens(
@@ -1575,6 +1795,45 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     )
 
 
+def _clean_artifact_review_items(
+    review_items: tuple[Mapping[str, str], ...],
+) -> tuple[dict[str, str], ...]:
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in review_items:
+        item_id = item.get("id", "").strip()
+        feedback = item.get("feedback", "").strip()
+        if not item_id or not feedback or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned.append({"id": item_id[:160], "feedback": feedback[:2000]})
+    return tuple(cleaned)
+
+
+def _artifact_review_items_feedback_summary(
+    review_items: tuple[Mapping[str, str], ...],
+) -> str:
+    parts = [
+        f"{item.get('id', '').strip()}: {item.get('feedback', '').strip()}"
+        for item in review_items
+        if item.get("id", "").strip() and item.get("feedback", "").strip()
+    ]
+    return "；".join(parts)[:2000]
+
+
+def _dedupe_artifacts(*groups: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    artifacts: list[Artifact] = []
+    seen: set[str] = set()
+    for group in groups:
+        for artifact in group:
+            artifact_id = str(artifact.id)
+            if artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            artifacts.append(artifact)
+    return tuple(artifacts)
+
+
 _EVOLUTION_EXPLICIT_ACTION_RE = re.compile(
     r"(进化|蒸馏|达尔文|darwin|evolve|evolution|distill)",
     re.IGNORECASE,
@@ -1788,12 +2047,19 @@ _SCHEDULE_TRIGGER_RE = re.compile(
     r"(定时|提醒|闹钟|日程|排程|计划任务|加入计划|列入计划|schedule|scheduled|remind|reminder|alarm)",
     re.IGNORECASE,
 )
+_STRONG_SCHEDULE_TRIGGER_RE = re.compile(
+    r"(定时|闹钟|日程|排程|计划任务|加入计划|列入计划|设置.{0,8}提醒|创建.{0,8}提醒|schedule|scheduled|reminder|alarm)",
+    re.IGNORECASE,
+)
 _SCHEDULE_EXECUTION_RE = re.compile(
     r"(执行|运行|提交|发送|填写|填报|打开|检查|触发|通知|生成|创建|更新|写|execute|run|submit|send|fill|open|check|generate|create|update)",
     re.IGNORECASE,
 )
 _SCHEDULE_REMINDER_ACTION_RE = re.compile(
-    r"(提醒我|通知我|叫我|remind\s+me|notify\s+me|ping\s+me|alarm\s+me)",
+    r"(^|[，。；;,.!?？\s])(?:请|帮我|麻烦你|记得)?\s*(提醒我|通知我|叫我)"
+    r"|(?:今天|明天|后天)\s*(?:早上|上午|下午|晚上|中午)?\s*(?:[01]?\d\s*点|2[0-3]\s*点|[01]?\d:|2[0-3]:)?\s*(提醒我|通知我|叫我)"
+    r"|(?:早上|上午|下午|晚上|中午)?\s*(?:[01]?\d\s*点|2[0-3]\s*点|[01]?\d:|2[0-3]:)\s*(提醒我|通知我|叫我)"
+    r"|remind\s+me|notify\s+me|ping\s+me|alarm\s+me",
     re.IGNORECASE,
 )
 _SCHEDULE_NEGATION_RE = re.compile(
@@ -1895,7 +2161,14 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
         message, lowered
     )
+    has_explicit_schedule_cue = _SCHEDULE_TRIGGER_RE.search(message) is not None
+    has_strong_schedule_cue = _STRONG_SCHEDULE_TRIGGER_RE.search(message) is not None
+    has_reminder_action = _SCHEDULE_REMINDER_ACTION_RE.search(message) is not None
     has_specific_date = _SCHEDULE_DATE_RE.search(message) is not None
+    if _looks_like_background_request(message) and not has_strong_schedule_cue:
+        return False
+    if not has_explicit_schedule_cue and not has_recurrence and _looks_like_background_request(message):
+        return False
     has_time_anchor = bool(
         has_recurrence
         or has_specific_date
@@ -1903,13 +2176,23 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         or any(token in message for token in ("今天", "明天", "后天"))
         or any(token in lowered for token in ("today", "tomorrow"))
     )
-    has_schedule_cue = (
-        _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence or has_specific_date
-    )
-    has_execution = bool(
-        _SCHEDULE_EXECUTION_RE.search(message) or _SCHEDULE_REMINDER_ACTION_RE.search(message)
-    )
+    has_schedule_cue = has_explicit_schedule_cue or has_recurrence or has_specific_date
+    has_execution = bool(_SCHEDULE_EXECUTION_RE.search(message) or has_reminder_action)
     return has_schedule_cue and has_time_anchor and has_execution
+
+
+def _looks_like_background_request(message: str) -> bool:
+    stripped = message.strip()
+    if "\n" in stripped and len(stripped) > 120:
+        return True
+    if len(stripped) > 360:
+        return True
+    return bool(
+        re.search(
+            r"(研究一下|分析一下|帮我看看|该怎么办|怎么办|怎么处理|给.*建议|解释|为什么|复盘|梳理)",
+            stripped,
+        )
+    )
 
 
 def _contains_daily_intent(message: str, lowered: str) -> bool:
@@ -2016,6 +2299,28 @@ def _explicit_new_conversation_request(message: str) -> bool:
         "change topic",
     )
     return any(marker in normalized for marker in new_conversation_markers)
+
+
+def _validated_submission_message(message: str) -> str:
+    if type(message) is not str:
+        raise TypeError("message must be a string")
+    stripped = message.strip()
+    if not stripped:
+        raise ValueError("message must be nonblank")
+    if len(stripped) > MAX_TASK_TEXT:
+        raise ValueError(
+            f"message must be at most {MAX_TASK_TEXT} characters; "
+            "upload long documents as attachments or split them across turns"
+        )
+    if len(stripped.encode("utf-8")) > _MAX_SUBMISSION_MESSAGE_BYTES:
+        raise ValueError("message must be bounded")
+    if unicodedata.normalize("NFC", stripped) != stripped:
+        raise ValueError("message must use normalized Unicode")
+    for character in stripped:
+        category = unicodedata.category(character)
+        if category == "Cf" or (category == "Cc" and character not in "\n\t"):
+            raise ValueError("message contains unsafe control characters")
+    return stripped
 
 
 def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
@@ -2174,6 +2479,14 @@ def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
     return max(1, min(configured_tokens, 10_000_000))
 
 
+def _is_runtime_artifact_review_request(event: RunEvent) -> bool:
+    return (
+        event.kind is EventKind.APPROVAL_REQUESTED
+        and event.action == "artifact_review"
+        and event.payload.get("approval_kind") == "runtime_artifact_review"
+    )
+
+
 def _conversation_history_token_budget(
     *,
     runtime_token_budget: int,
@@ -2202,6 +2515,7 @@ def _conversation_history_token_budget(
 
 def _conversation_history_artifact(
     *,
+    run_id: UUID,
     conversation_id: str,
     current_request: str,
     context_items: tuple[object, ...],
@@ -2213,18 +2527,23 @@ def _conversation_history_artifact(
     bounded_budget = max(1, min(history_token_budget, _MAX_CONVERSATION_HISTORY_TOKENS))
     estimated_tokens = estimate_tokens(history_text)
     if estimated_tokens <= bounded_budget:
+        content: Mapping[str, JsonValue] = {
+            "text": history_text,
+            "conversation_id": conversation_id,
+            "trust": "internal_conversation_summary",
+            "context_policy": "full_history",
+            "estimated_tokens": estimated_tokens,
+            "history_token_budget": bounded_budget,
+        }
         return Artifact(
-            id=uuid4(),
+            id=_stable_conversation_history_artifact_id(
+                run_id=run_id,
+                producer="conversation_history",
+                content=content,
+            ),
             type="text",
             producer="conversation_history",
-            content={
-                "text": history_text,
-                "conversation_id": conversation_id,
-                "trust": "internal_conversation_summary",
-                "context_policy": "full_history",
-                "estimated_tokens": estimated_tokens,
-                "history_token_budget": bounded_budget,
-            },
+            content=content,
         )
 
     compacted = ContextCompactor().compact(
@@ -2236,20 +2555,95 @@ def _conversation_history_artifact(
         ),
         max_summary_tokens=bounded_budget,
     )
+    compacted_content: Mapping[str, JsonValue] = {
+        **dict(compacted.content),
+        "conversation_id": conversation_id,
+        "trust": "internal_conversation_summary",
+        "context_policy": "auto_compacted",
+        "original_estimated_tokens": estimated_tokens,
+        "history_token_budget": bounded_budget,
+    }
     return Artifact(
-        id=compacted.id,
+        id=_stable_conversation_history_artifact_id(
+            run_id=run_id,
+            producer="conversation_history_compacted",
+            content=compacted_content,
+        ),
         version=compacted.version,
         type="text",
         producer="conversation_history_compacted",
-        content={
-            **dict(compacted.content),
-            "conversation_id": conversation_id,
-            "trust": "internal_conversation_summary",
-            "context_policy": "auto_compacted",
-            "original_estimated_tokens": estimated_tokens,
-            "history_token_budget": bounded_budget,
-        },
+        content=compacted_content,
     )
+
+
+def _stable_conversation_history_artifact_id(
+    *, run_id: UUID, producer: str, content: Mapping[str, JsonValue]
+) -> UUID:
+    encoded = json.dumps(
+        {
+            "run_id": str(run_id),
+            "producer": producer,
+            "content": content,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(_CONVERSATION_HISTORY_ARTIFACT_NAMESPACE, encoded)
+
+
+def _checkpoint_lineage_input_artifacts(
+    checkpoint: RuntimeCheckpoint,
+    *,
+    current_request: str,
+    current_run_artifacts: tuple[Artifact, ...],
+    conversation_artifacts: tuple[Artifact, ...],
+) -> tuple[Artifact, ...]:
+    registry = checkpoint.state.get("artifact_registry")
+    registry_ids = set(registry) if isinstance(registry, Mapping) else set()
+    known_ids = {str(artifact.id) for artifact in (*current_run_artifacts, *conversation_artifacts)}
+    missing_input_ids: list[str] = []
+    for artifact in current_run_artifacts:
+        for source_id in artifact.source_ids:
+            if source_id in known_ids or source_id in registry_ids or source_id in missing_input_ids:
+                continue
+            missing_input_ids.append(source_id)
+    if not missing_input_ids:
+        return ()
+    template = next(iter(conversation_artifacts), None)
+    artifacts: list[Artifact] = []
+    for source_id in missing_input_ids:
+        try:
+            artifact_id = UUID(source_id)
+        except ValueError:
+            continue
+        if template is None:
+            artifacts.append(
+                Artifact(
+                    id=artifact_id,
+                    type="text",
+                    producer="runtime_input",
+                    content={
+                        "text": current_request,
+                        "trust": "current_user_request",
+                        "context_policy": "recovered_checkpoint_lineage_input",
+                    },
+                )
+            )
+            continue
+        artifacts.append(
+            Artifact(
+                id=artifact_id,
+                version=template.version,
+                type=template.type,
+                producer=template.producer,
+                content=template.content,
+                source_ids=template.source_ids,
+                provenance=template.provenance,
+            )
+        )
+    return tuple(artifacts)
 
 
 def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:
@@ -2324,6 +2718,13 @@ def _main_agent_adjusted_ready_mode(
     attachment_ids: tuple[str, ...],
 ) -> TaskMode:
     local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+    if (
+        local_mode is TaskMode.DIRECT
+        and router_mode is not TaskMode.DIRECT
+        and not attachment_ids
+        and _looks_like_interactive_support_request(message)
+    ):
+        return TaskMode.DIRECT
     if local_mode is TaskMode.HYBRID:
         return TaskMode.HYBRID
     if {router_mode, local_mode} == {TaskMode.DISPATCH, TaskMode.DISCUSS}:
@@ -2335,6 +2736,8 @@ def _main_agent_adjusted_ready_mode(
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
     text = message.lower()
+    if not attachment_ids and _looks_like_interactive_support_request(message):
+        return TaskMode.DIRECT
     execution_markers = (
         "文案",
         "脚本",
@@ -2387,7 +2790,7 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
     has_execution = bool(attachment_ids) or any(marker in text for marker in execution_markers)
     has_discussion = any(marker in text for marker in discussion_markers)
     if any(marker in text for marker in explicit_hybrid_markers) or (
-        has_execution and has_discussion
+        has_execution and has_discussion and _has_explicit_execution_action(text)
     ):
         return TaskMode.HYBRID
     if has_discussion:
@@ -2395,6 +2798,64 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
     if has_execution:
         return TaskMode.DISPATCH
     return TaskMode.DIRECT
+
+
+def _has_explicit_execution_action(normalized_message: str) -> bool:
+    return any(
+        marker in normalized_message
+        for marker in (
+            "生成",
+            "创建",
+            "制作",
+            "执行",
+            "运行",
+            "落地",
+            "实现",
+            "开发",
+            "部署",
+            "推送",
+            "提交",
+            "修改",
+            "修复",
+            "剪辑",
+            "撰写",
+            "produce",
+            "generate",
+            "create",
+            "build",
+            "execute",
+            "run",
+            "implement",
+            "deploy",
+            "push",
+            "commit",
+            "fix",
+        )
+    )
+
+
+_INTERACTIVE_SUPPORT_RE = re.compile(
+    r"(为什么|怎么|如何|能不能|是否|是不是|有没有|啥意思|什么意思|解释|说明|问一下|咨询|"
+    r"帮我看看|看一下|分析一下|梳理|复盘|给.*建议|讨论一下|检查一下|排查一下|问题|报错|失败|不对|不正常|无法|没办法|不能|"
+    r"交互|体验|权限|可见|读不了|看不到|找不到|"
+    r"\bwhy\b|\bhow\b|\bcan\b|\bcould\b|\bwhat\s+does\b|\bissue\b|\berror\b|\bfailed\b|\bproblem\b)",
+    re.IGNORECASE,
+)
+_INTERACTIVE_ACTION_RE = re.compile(
+    r"(修复|修一下|改一下|调整|实现|开发|部署|推送|提交|执行|运行|生成|创建|删除|清理|上传|"
+    r"\bfix\b|\bimplement\b|\bdeploy\b|\bpush\b|\bcommit\b|\brun\b|\bexecute\b|\bgenerate\b|\bcreate\b|\bdelete\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_interactive_support_request(message: str) -> bool:
+    if _INTERACTIVE_SUPPORT_RE.search(message) is None:
+        return False
+    if "?" in message or "？" in message:
+        return True
+    if _looks_like_background_request(message):
+        return True
+    return _INTERACTIVE_ACTION_RE.search(message) is None
 
 
 def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
@@ -2451,6 +2912,8 @@ _ARTIFACT_DELIVERY_TERMS = (
     "photo",
     "poster",
     "cover",
+    "character model sheet",
+    "model sheet",
     "video",
     "animation",
     "audio",
@@ -2479,6 +2942,13 @@ _ARTIFACT_DELIVERY_TERMS = (
     "海报",
     "封面",
     "设定板",
+    "角色参考设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
+    "角色设定表",
+    "设定表",
     "概念图",
     "分镜图",
     "视频",
@@ -2533,6 +3003,177 @@ _ARTIFACT_DELIVERY_NEGATIONS = (
 )
 
 
+_MEDIA_PIPELINE_SCRIPT_TERMS = (
+    "script",
+    "screenplay",
+    "story script",
+    "剧本",
+    "脚本",
+    "故事大纲",
+)
+_MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS = (
+    "write",
+    "draft",
+    "create",
+    "generate",
+    "produce",
+    "写",
+    "撰写",
+    "创作",
+    "生成",
+    "产出",
+)
+_MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS = (
+    "based on",
+    "from the previous",
+    "previous script",
+    "existing script",
+    "基于",
+    "根据",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+)
+_MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS = (
+    "from the previous",
+    "previous script",
+    "existing script",
+    "above script",
+    "earlier script",
+    "the script above",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+    "这个剧本",
+    "这个脚本",
+    "这段剧本",
+    "这段脚本",
+    "该剧本",
+    "该脚本",
+    "本剧本",
+    "本脚本",
+    "本会话",
+)
+_MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "storyboard",
+    "shot",
+    "compose video",
+    "edit",
+    "final video",
+    "角色参考设定表",
+    "角色设定表",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜",
+    "分镜图",
+    "视频",
+    "剪辑",
+    "成片",
+)
+
+
+def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
+    text = message.casefold()
+    if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+        return None
+    if _is_media_pipeline_script_authoring_request(text):
+        return _media_pipeline_plan(
+            source="script_request",
+            script_status="completed",
+            summary=(
+                "长期多媒体生产计划：剧本完成后，可按需继续生成角色参考设定表、服装设定板、"
+                "场景道具资产、分镜、单镜头视频、剪辑决策表和最终成片。"
+            ),
+        )
+    if _is_unresolved_media_pipeline_script_reference_request(text):
+        return _media_pipeline_plan(
+            source="unresolved_script_reference",
+            script_status="planned",
+            summary=(
+                "多媒体请求引用剧本但未指向可确认的已有剧本；先补齐剧本，再生成角色参考设定表、"
+                "定妆参考图、分镜或成片。"
+            ),
+        )
+    return None
+
+
+def _media_pipeline_plan(
+    *,
+    source: str,
+    script_status: str,
+    summary: str,
+) -> dict[str, object]:
+    return {
+        "plan_id": f"media-plan-{uuid4().hex}",
+        "status": "planned",
+        "source": source,
+        "summary": summary,
+        "execution_slots": [],
+        "stages": [
+            {"id": "script", "status": script_status, "requires_user_review": False},
+            {
+                "id": "character_model_sheet",
+                "status": "planned",
+                "requires_user_review": True,
+            },
+            {"id": "costume_sheet", "status": "planned", "requires_user_review": True},
+            {"id": "scene_prop_assets", "status": "planned", "requires_user_review": True},
+            {"id": "storyboard", "status": "planned", "requires_user_review": True},
+            {"id": "shot_videos", "status": "planned", "requires_user_review": True},
+            {"id": "edit_decision_list", "status": "planned", "requires_user_review": True},
+            {"id": "compose_video", "status": "planned", "requires_user_review": False},
+        ],
+        "approved_artifacts": [],
+    }
+
+
+def _is_media_pipeline_script_authoring_request(text: str) -> bool:
+    for clause in _split_media_pipeline_clauses(text):
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS) and any(
+            term in clause for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS
+        ):
+            continue
+        if any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_AUTHORING_TERMS):
+            return True
+    return False
+
+
+def _is_unresolved_media_pipeline_script_reference_request(text: str) -> bool:
+    for clause in _split_media_pipeline_clauses(text):
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if not any(term in clause for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+            continue
+        if not any(term in clause for term in _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS):
+            continue
+        if any(term in clause for term in _MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS):
+            continue
+        return True
+    return False
+
+
+def _split_media_pipeline_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
+        if clause.strip()
+    )
+
+
 def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
     return {
         "recommended_mode": advice.recommended_mode.value,
@@ -2580,6 +3221,47 @@ def _attachment_ids_from_routing(routing_decision: Mapping[str, object]) -> tupl
         if item not in result:
             result.append(item)
     return tuple(result)
+
+
+def _conversation_attachment_ids(
+    items: tuple[ConversationContextItem, ...],
+    *,
+    excluding: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    excluded = set(excluding)
+    result: list[str] = []
+    for item in items:
+        routing_decision = getattr(item, "routing_decision", None)
+        if not isinstance(routing_decision, Mapping):
+            continue
+        for attachment_id in _attachment_ids_from_routing(routing_decision):
+            if attachment_id in excluded or attachment_id in result:
+                continue
+            result.append(attachment_id)
+    return tuple(result)
+
+
+def _mark_previous_attachment_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    marked: list[Artifact] = []
+    for artifact in artifacts:
+        content = dict(artifact.content)
+        text = content.get("text")
+        if isinstance(text, str):
+            content["text"] = text.replace(
+                "用户本轮上传了附件，以下内容与当前对话消息直接关联。",
+                "用户在本会话前序交互上传过附件，以下内容可作为连续对话上下文引用。",
+                1,
+            )
+        content["context_scope"] = "previous_conversation_attachment"
+        marked.append(
+            Artifact(
+                id=artifact.id,
+                type=artifact.type,
+                producer="conversation_uploaded_attachment",
+                content=cast(Mapping[str, JsonValue], content),
+            )
+        )
+    return tuple(marked)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:
@@ -2631,6 +3313,11 @@ def _conversation_history_text(items: tuple[object, ...]) -> str:
                     current_lines.append(
                         f"第 {index} 轮 {str(producer)[:80]}：{_bounded_history_text(text)}"
                     )
+        media_plan_line = _conversation_media_pipeline_plan_line(
+            getattr(item, "routing_decision", None)
+        )
+        if media_plan_line is not None:
+            current_lines.append(f"第 {index} 轮 {media_plan_line}")
         if current_lines:
             item_lines.append(current_lines)
     if not item_lines:
@@ -2650,6 +3337,87 @@ def _conversation_history_text(items: tuple[object, ...]) -> str:
 
 def _conversation_history_lines(items: tuple[object, ...]) -> tuple[str, ...]:
     return tuple(_conversation_history_text(items).splitlines())
+
+
+def _conversation_media_pipeline_plan_line(routing_decision: object) -> str | None:
+    if not isinstance(routing_decision, Mapping):
+        return None
+    plan = routing_decision.get("media_pipeline_plan")
+    if not isinstance(plan, Mapping):
+        return None
+    plan_id = _safe_public_plan_text(plan.get("plan_id"), max_chars=96)
+    status = _safe_public_plan_text(plan.get("status"), max_chars=48)
+    summary = _safe_public_plan_text(plan.get("summary"), max_chars=320)
+    stages = _media_pipeline_stage_summaries(plan.get("stages"))
+    approved = _media_pipeline_approved_artifact_summaries(plan.get("approved_artifacts"))
+    rejected = _media_pipeline_rejected_artifact_summaries(plan.get("rejected_artifacts"))
+    parts = ["MEDIA_PIPELINE_PLAN"]
+    if plan_id:
+        parts.append(f"plan_id={plan_id}")
+    if status:
+        parts.append(f"status={status}")
+    if summary:
+        parts.append(f"summary={summary}")
+    if stages:
+        parts.append(f"stages={','.join(stages)}")
+    if approved:
+        parts.append(f"approved_artifacts={','.join(approved)}")
+    if rejected:
+        parts.append(f"rejected_artifacts={','.join(rejected)}")
+    return " ".join(parts) if len(parts) > 1 else None
+
+
+def _media_pipeline_stage_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:12]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("id"), max_chars=64)
+        status = _safe_public_plan_text(item.get("status"), max_chars=32)
+        if stage_id and status:
+            summaries.append(f"{stage_id}:{status}")
+    return tuple(summaries)
+
+
+def _media_pipeline_approved_artifact_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:24]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("stage_id"), max_chars=64)
+        artifact_id = _safe_public_plan_text(item.get("artifact_id"), max_chars=96)
+        if stage_id and artifact_id:
+            summaries.append(f"{stage_id}:{artifact_id}")
+    return tuple(summaries)
+
+
+def _media_pipeline_rejected_artifact_summaries(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    summaries: list[str] = []
+    for item in value[:24]:
+        if not isinstance(item, Mapping):
+            continue
+        stage_id = _safe_public_plan_text(item.get("stage_id"), max_chars=64)
+        artifact_id = _safe_public_plan_text(item.get("artifact_id"), max_chars=96)
+        feedback = _safe_public_plan_text(item.get("feedback"), max_chars=160)
+        if stage_id and artifact_id and feedback:
+            summaries.append(f"{stage_id}:{artifact_id}:{feedback}")
+    return tuple(summaries)
+
+
+def _safe_public_plan_text(value: object, *, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = re.sub(r"[\r\n\t]+", " ", value).strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[^0-9A-Za-z_\-:. \u4e00-\u9fff，。！？、；：]+", "", cleaned)
+    return cleaned[:max_chars].strip()
 
 
 def _bounded_history_text(value: str, *, max_chars: int = 1800) -> str:
@@ -2672,6 +3440,8 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
         "requested_skills",
         "requested_mcp_servers",
         "requested_plugins",
+        "requested_files",
+        "skip_schedule_proposal",
         "requested_channel_features",
     }
     result: dict[str, str] = {}

@@ -246,8 +246,22 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
         "给我做一张图片版设定板。",
         "出一张赛博朋克产品概念图。",
         "生成一段 8 秒动画短片。",
+        "根据分镜剪辑成片。",
         "为开场白合成一段旁白配音。",
         "给发布会做一段 BGM 背景音乐。",
+        (
+            "给我生成一个剧本，大概的背景是中西方融合的修仙神话体系下，"
+            "男主角是一个异类，无法进行修仙也无法获得神位的认可，其实男主角是仙神魔的混合，"
+            "所以一开始完全无法修炼，后续因为一些机缘，成功踏上修行一途，但是又差点入魔，"
+            "女主角是东西方融合的结晶，既能修仙也能继承神位，为了男主角回归，苦苦追寻男主角。"
+            "然后根据剧情以Character Model Sheet的形式生成角色参考设定表"
+        ),
+        (
+            "根据这个剧情生成 Character Model Sheet 形式的角色参考设定表，"
+            "只需要图片，不要生成视频成片。"
+        ),
+        "根据剧本为每个角色生成定妆参考图。",
+        "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
     ],
 )
 async def test_multimedia_generation_auto_routes_to_dispatch_without_classifier(text: str) -> None:

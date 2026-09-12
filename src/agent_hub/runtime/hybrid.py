@@ -32,6 +32,7 @@ from agent_hub.runtime.failure_reason import (
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
+_NEGATIVE_CONSENSUS_REVISION_LIMIT = 1
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -158,12 +159,15 @@ class HybridRuntime:
             ):
                 next_stage = 1
 
-            for stage_index in range(next_stage, len(stages)):
+            stage_index = next_stage
+            negative_consensus_revisions = 0
+            while stage_index < len(stages):
                 if stage_index > 0 and _has_new_final_attachment_artifact(
                     artifacts, input_artifact_ids=input_artifact_ids
                 ):
                     break
                 child, mode, is_discussion = stages[stage_index]
+                stage_input_count = len(artifacts)
                 child_events = (
                     self._run_discussion(context, tuple(artifacts), sequence)
                     if is_discussion
@@ -181,7 +185,44 @@ class HybridRuntime:
                         yield event
                 except RuntimeExecutionError as error:
                     failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
-                    if is_discussion and _has_later_synthesis_stage(stages, stage_index):
+                    if (
+                        is_discussion
+                        and _is_negative_discussion_consensus_failure(failure_reason)
+                        and negative_consensus_revisions < _NEGATIVE_CONSENSUS_REVISION_LIMIT
+                    ):
+                        revision_stage = _previous_dispatch_stage(stages, stage_index)
+                        if revision_stage is not None:
+                            retrying_event = _negative_consensus_revision_event(
+                                context,
+                                sequence,
+                                artifacts=tuple(artifacts),
+                                stage_input_count=stage_input_count,
+                                revision_attempt=negative_consensus_revisions + 1,
+                            )
+                            artifacts = list(
+                                _negative_consensus_revision_artifacts(
+                                    artifacts,
+                                    stage_input_count=stage_input_count,
+                                    input_artifact_ids=input_artifact_ids,
+                                )
+                            )
+                            negative_consensus_revisions += 1
+                            stage_index = revision_stage
+                            yield retrying_event
+                            sequence += 1
+                            continue
+                    if (
+                        is_discussion
+                        and _has_later_synthesis_stage(stages, stage_index)
+                        and not _is_negative_discussion_consensus_failure(failure_reason)
+                    ):
+                        yield _discussion_fallback_summary_event(
+                            context,
+                            sequence,
+                            child=child,
+                            failure_reason=failure_reason,
+                        )
+                        sequence += 1
                         yield RunEvent(
                             kind=EventKind.STEP_FAILED,
                             sequence=sequence,
@@ -192,6 +233,7 @@ class HybridRuntime:
                             payload=runtime_failure_diagnostic_from_reason(failure_reason),
                         )
                         sequence += 1
+                        stage_index += 1
                         continue
                     raise
                 stage_checkpoint = self._checkpoint(
@@ -210,6 +252,7 @@ class HybridRuntime:
                     checkpoint=stage_checkpoint,
                 )
                 sequence += 1
+                stage_index += 1
             checkpoint = self._checkpoint(
                 context,
                 artifacts=tuple(artifacts),
@@ -355,6 +398,10 @@ class HybridRuntime:
                 if item.kind is EventKind.RUNTIME_CANCELLED:
                     raise asyncio.CancelledError
                 if item.kind is EventKind.RUNTIME_COMPLETED:
+                    if mode is TaskMode.DISCUSS and item.reason == "negative_consensus":
+                        raise RuntimeExecutionError(
+                            "hybrid discuss failed: discussion negative consensus"
+                        )
                     terminal_seen = True
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
@@ -499,7 +546,13 @@ def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
     return safe_runtime_failure_reason(error, fallback=fallback)
 
 
+def _is_negative_discussion_consensus_failure(failure_reason: str) -> bool:
+    return failure_reason == "hybrid discuss failed: discussion negative consensus"
+
+
 def _is_forwardable_child_event(event: RunEvent) -> bool:
+    if event.kind == "discussion.completed":
+        return True
     return event.kind in {
         EventKind.STEP_STARTED,
         EventKind.STEP_COMPLETED,
@@ -527,6 +580,33 @@ def _renumber_child_event(
         if not event.inputs:
             updates["inputs"] = inputs
     return event.model_copy(update=updates)
+
+
+def _discussion_fallback_summary_event(
+    context: TaskContext,
+    sequence: int,
+    *,
+    child: ChildRuntime,
+    failure_reason: str,
+) -> RunEvent:
+    participants = getattr(child, "participant_ids", ("moderator", "reviewer"))
+    if not isinstance(participants, tuple) or not participants:
+        participants = ("moderator", "reviewer")
+    summary = (
+        "讨论阶段未能完成：讨论模型调用失败，未产生完整多方发言。"
+        "系统已保留前置执行产物，并继续进入后续综合/执行阶段。"
+    )
+    return RunEvent(
+        kind="discussion.completed",
+        sequence=sequence,
+        run_id=context.run_id,
+        payload={
+            "participants": tuple(str(participant) for participant in participants[:8]),
+            "summary": summary,
+            "reason": failure_reason,
+            "fallback_policy": "continue_to_synthesis",
+        },
+    )
 
 
 def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
@@ -601,6 +681,53 @@ def _has_later_synthesis_stage(
     stage_index: int,
 ) -> bool:
     return any(mode is TaskMode.DIRECT for _, mode, _ in stages[stage_index + 1 :])
+
+
+def _previous_dispatch_stage(
+    stages: tuple[tuple[ChildRuntime, TaskMode, bool], ...],
+    stage_index: int,
+) -> int | None:
+    for candidate in range(stage_index - 1, -1, -1):
+        _, mode, _ = stages[candidate]
+        if mode is TaskMode.DISPATCH:
+            return candidate
+    return None
+
+
+def _negative_consensus_revision_artifacts(
+    artifacts: list[Artifact],
+    *,
+    stage_input_count: int,
+    input_artifact_ids: set[UUID],
+) -> tuple[Artifact, ...]:
+    original_inputs = tuple(artifact for artifact in artifacts if artifact.id in input_artifact_ids)
+    negative_feedback = tuple(artifacts[stage_input_count:])
+    return (*original_inputs, *negative_feedback)
+
+
+def _negative_consensus_revision_event(
+    context: TaskContext,
+    sequence: int,
+    *,
+    artifacts: tuple[Artifact, ...],
+    stage_input_count: int,
+    revision_attempt: int,
+) -> RunEvent:
+    rejected_artifacts = artifacts[:stage_input_count]
+    feedback_artifacts = artifacts[stage_input_count:]
+    return RunEvent(
+        kind=EventKind.STEP_RETRYING,
+        sequence=sequence,
+        run_id=context.run_id,
+        actor="hybrid",
+        step_id="hybrid_negative_consensus_revision",
+        reason="negative consensus requested regeneration",
+        payload={
+            "revision_attempt": revision_attempt,
+            "rejected_artifact_ids": tuple(str(artifact.id) for artifact in rejected_artifacts),
+            "feedback_artifact_ids": tuple(str(artifact.id) for artifact in feedback_artifacts),
+        },
+    )
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]

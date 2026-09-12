@@ -16,6 +16,15 @@ def test_resource_hints_only_parse_leading_selector_block() -> None:
     assert hints.mcp_servers == ("filesystem",)
 
 
+def test_resource_hints_keep_full_plugin_ids_with_source_suffix() -> None:
+    hints = parse_channel_resource_hints(
+        "@app-6a05e3b201788191be12b590b43e6ce3@openai-curated-remote &deep-research 请处理"
+    )
+
+    assert hints.plugins == ("app-6a05e3b201788191be12b590b43e6ce3@openai-curated-remote",)
+    assert hints.skills == ("deep-research",)
+
+
 def test_resource_hints_ignore_body_symbols_without_leading_selector() -> None:
     hints = parse_channel_resource_hints("请分析 @someone 的账号、#标题、C# 示例和 & 符号")
 

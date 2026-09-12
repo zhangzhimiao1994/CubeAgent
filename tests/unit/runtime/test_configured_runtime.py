@@ -33,8 +33,10 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _PlannedRuntime,
     _select_logical_model_for_role,
     _selected_config_role_assignments,
+    _should_use_standalone_multimedia_roles,
     configured_runtime_registry,
 )
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
@@ -53,6 +55,14 @@ def test_python_project_zip_request_is_profiled_as_software() -> None:
 
 def test_plain_zip_delivery_request_is_not_profiled_as_software_engineering() -> None:
     profiles = defaults_module._task_profiles("把这份材料整理成一个可下载 zip 压缩包。")
+
+    assert TaskProfile.SOFTWARE not in profiles
+
+
+def test_media_test_cut_request_is_not_profiled_as_software_engineering() -> None:
+    profiles = defaults_module._task_profiles(
+        "生成一个 5 秒以内的最终 MP4 测试成片；缺少镜头素材就先生成镜头视频再剪辑。"
+    )
 
     assert TaskProfile.SOFTWARE not in profiles
 
@@ -115,6 +125,26 @@ class FakeCapabilityAvailability:
     ) -> Mapping[str, JsonValue]:
         del tenant_id, run_id, actor, name, arguments, idempotency_key
         return {}
+
+
+class CompletingRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise RuntimeError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        return None
 
 
 class ImmediateCapacity:
@@ -180,6 +210,22 @@ class FakeTransport:
         self.calls.append((deployment, request, api_key))
         return ModelResponse(
             text="生产配置链路已接通",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+
+class EmptyQwenTransport(FakeTransport):
+    async def complete(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse:
+        self.calls.append((deployment, request, api_key))
+        if deployment.logical_model == "qwen":
+            return ModelResponse(text="")
+        return ModelResponse(
+            text="备用文本模型已接管",
             usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
         )
 
@@ -300,6 +346,83 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
 
 
 @pytest.mark.asyncio
+async def test_config_backed_direct_runtime_uses_explicit_text_fallback_model() -> None:
+    transport = EmptyQwenTransport()
+    secrets = FakeSecretService()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "qwen": {
+                        "fallback_model": "backup",
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-plus",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://qwen",
+                                "quota_scope_id": "qwen",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "backup": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://backup",
+                                "quota_scope_id": "deepseek",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="普通聊天问题",
+                routing_decision={"direct_model": "qwen"},
+            )
+        )
+    ]
+
+    assert [deployment.logical_model for deployment, _request, _api_key in transport.calls] == [
+        "qwen",
+        "backup",
+    ]
+    assert [request.logical_model for _deployment, request, _api_key in transport.calls] == [
+        "qwen",
+        "qwen",
+    ]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    artifact = next(event.artifact for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact is not None
+    assert artifact.content["text"] == "备用文本模型已接管"
+    assert artifact.provenance is not None
+    assert artifact.provenance.logical_model == "backup"
+
+
+@pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,6 +534,60 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_accepts_long_padded_user_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+    )
+    raw_request = "\n" + ("请根据这份长材料整理执行方案。" * 400) + "\n"
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request=raw_request,
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].step_id == "main_agent_plan"
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    probe = ProbeDispatchRuntime.instances[0]
+    assert probe.contexts[0].request == raw_request
 
 
 @pytest.mark.asyncio
@@ -591,6 +768,121 @@ async def test_selected_dispatch_agents_do_not_hide_required_multimedia_generati
         and step["tools"] == ("read_context", "generate_multimedia")
         for step in steps
     )
+
+
+@pytest.mark.asyncio
+async def test_media_pipeline_generation_step_requires_user_review_when_intermediate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="先生成角色参考设定表、服装设定板和分镜图，最终剪辑成片。",
+                routing_decision={
+                    "main_agent_model": "main",
+                    "media_pipeline_plan": {
+                        "plan_id": "media-plan-001",
+                        "status": "planned",
+                    },
+                },
+            )
+        )
+    ]
+
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    media_step = next(step for step in steps if step["agent"] == "multimedia_generator")
+    assert media_step["requires_user_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_character_sheet_single_media_delivery_requires_user_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request=(
+                    "基于刚才剧本，只生成 Character Model Sheet 形式的角色参考设定表和角色服装设定板图片，"
+                    "不要生成视频，不要剪辑成片。"
+                ),
+                routing_decision={"main_agent_model": "main"},
+            )
+        )
+    ]
+
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    media_step = next(step for step in steps if step["agent"] == "multimedia_generator")
+    assert media_step["requires_user_review"] is True
 
 
 @pytest.mark.parametrize(
@@ -786,6 +1078,60 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_accepts_long_padded_user_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+    )
+    raw_request = "\n" + ("先分析再执行这份长材料。" * 450) + "\n"
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.HYBRID,
+                request=raw_request,
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].step_id == "main_agent_plan"
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[0])
+    assert hybrid.contexts[0].request == raw_request
 
 
 @pytest.mark.asyncio
@@ -1044,6 +1390,60 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_accepts_long_padded_user_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDiscussionRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+    )
+    raw_request = "\n" + ("帮我讨论这份长材料并给出建议。" * 400) + "\n"
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISCUSS,
+                request=raw_request,
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].step_id == "main_agent_plan"
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    probe = cast(ProbeDiscussionRuntime, ProbeDiscussionRuntime.instances[0])
+    assert probe.contexts[0].request == raw_request
 
 
 @pytest.mark.asyncio
@@ -1427,6 +1827,65 @@ def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
     assert any("reviewer 超时时先压缩上下文再分块审查" in step.task for step in plan.steps)
 
 
+def test_dispatch_plan_includes_requested_plugin_context_in_steps() -> None:
+    role = RoleAssignment(
+        id="video_director",
+        role="Video Director",
+        purpose=RolePurpose.EXECUTE,
+        mission="Prepare video generation guidance.",
+        must_answer=("Which video workflow should run?",),
+        allowed_tools=(),
+        forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="main",
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="用 $plugin:runway 对比生成视频",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    plan = _dispatch_plan((role,), context, max_parallelism=1)
+
+    assert any("REQUESTED_PLUGIN_CONTEXT" in step.task for step in plan.steps)
+    assert any("runway" in step.task for step in plan.steps)
+    assert any("higgsfield" in step.task for step in plan.steps)
+    assert any("not proof" in step.task for step in plan.steps)
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_plan_event_includes_requested_plugin_context() -> None:
+    runtime = _PlannedRuntime(
+        CompletingRuntime(),
+        mode=TaskMode.DISPATCH,
+        main_agent_model="main",
+        roles=(),
+        steps=(),
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="用 $plugin:runway 生成视频",
+        routing_decision={"requested_plugins": "runway"},
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    plan_event = events[0]
+    assert plan_event.kind is EventKind.STEP_STARTED
+    plugin_context = plan_event.payload["requested_plugin_context"]
+    assert isinstance(plugin_context, Mapping)
+    assert plugin_context["requested_plugins"] == ("runway",)
+    assert "not proof" in str(plugin_context["policy"])
+
+
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
     roles = (
         RoleAssignment(
@@ -1636,6 +2095,204 @@ def test_dispatch_plan_keeps_available_project_zip_tool() -> None:
     assert "project.generate_zip" in plan.allowed_tools
 
 
+def test_dispatch_plan_keeps_compose_video_only_for_video_compositor_role() -> None:
+    roles = (
+        RoleAssignment(
+            id="video_editor",
+            role="Video Editor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan edit rhythm and captions.",
+            must_answer=("What edit structure was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not claim a generated video artifact.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Compose generated media artifacts into an MP4.",
+            must_answer=("What generated MP4 artifact was produced?",),
+            allowed_tools=("read_context", "compose_video"),
+            forbidden_actions=("Do not use arbitrary filesystem paths.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="把生成的视频和图片素材合成一个可下载成片。",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"compose_video"}),
+    )
+
+    editor = next(agent for agent in plan.agents if agent.id == "video_editor")
+    compositor = next(agent for agent in plan.agents if agent.id == "video_compositor")
+    compositor_step = next(step for step in plan.steps if step.agent == "video_compositor")
+    assert editor.allowed_tools == ()
+    assert "compose_video" in compositor.allowed_tools
+    assert "compose_video" in compositor_step.tools
+    assert "compose_video" in plan.allowed_tools
+
+
+def test_dispatch_plan_composes_after_generated_media_step() -> None:
+    roles = (
+        RoleAssignment(
+            id="multimedia_generator",
+            role="Multimedia Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate the minimum necessary shot video assets.",
+            must_answer=("What media asset was produced?",),
+            allowed_tools=("read_context", "generate_multimedia"),
+            forbidden_actions=("Do not claim a composed MP4.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Merge generated image/video artifacts into a downloadable MP4.",
+            must_answer=("What downloadable MP4 artifact was produced?",),
+            allowed_tools=("read_context", "compose_video"),
+            forbidden_actions=("Do not generate new source videos.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成最小必要镜头视频，再剪辑成片。",
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
+    )
+
+    generator_step = next(step for step in plan.steps if step.agent == "multimedia_generator")
+    compositor_step = next(step for step in plan.steps if step.agent == "video_compositor")
+
+    assert generator_step.id in compositor_step.depends_on
+    assert "compose_video" in compositor_step.tools
+
+
+def test_dispatch_plan_generates_character_media_after_script_step() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the short drama script.",
+            must_answer=("What script was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="multimedia_generator",
+            role="Multimedia Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate character reference images.",
+            must_answer=("What images were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not claim approval without review.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="根据剧本为每个角色生成定妆参考图。",
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    media_step = next(step for step in plan.steps if step.agent == "multimedia_generator")
+
+    assert media_step.depends_on == ("copywriter_step",)
+
+
+def test_deferred_media_script_plan_copywriter_does_not_use_read_context_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Produce the short script text.",
+            must_answer=("What script was produced?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="planner",
+            role="Planner",
+            purpose=RolePurpose.PLAN,
+            mission="Produce the deferred media production plan.",
+            must_answer=("What plan was produced?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "请为一个 8 秒玄幻恐怖短片写极短剧本，主题是石门内的影子。"
+                "只生成剧本和多媒体制作计划，暂时不要生成图片、不要生成视频、不要剪辑成片；"
+                "计划里保留 Character Model Sheet、角色服装设定板、资产图、分镜图、镜头视频、最终剪辑成片这些后续阶段。"
+            ),
+            routing_decision={
+                "media_pipeline_plan": {
+                    "plan_id": "media-plan-001",
+                    "status": "planned",
+                },
+            },
+        ),
+        capability_gateway=FakeCapabilityAvailability({"read_context"}),
+    )
+
+    copywriter = next(agent for agent in plan.agents if agent.id == "copywriter")
+    copywriter_step = next(step for step in plan.steps if step.agent == "copywriter")
+    planner = next(agent for agent in plan.agents if agent.id == "planner")
+
+    assert copywriter.allowed_tools == ()
+    assert copywriter_step.tools == ()
+    assert planner.allowed_tools == ("read_context",)
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
@@ -1719,6 +2376,32 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
                         }
                     ]
                 },
+                "media": {
+                    "deployments": [
+                        {
+                            "provider": "minimax",
+                            "model": "MiniMax-M3",
+                            "api_base": "https://api.minimax.io/v1",
+                            "credential_ref": "secret://media",
+                            "quota_scope_id": "minimax",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "structured_output"],
+                        },
+                        {
+                            "provider": "minimax",
+                            "model": "MiniMax Hailuo 03",
+                            "api_base": "https://api.minimax.io/v1",
+                            "credential_ref": "secret://media",
+                            "quota_scope_id": "minimax-video",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["video_generation"],
+                        },
+                    ]
+                },
                 "analyst": {
                     "deployments": [
                         {
@@ -1782,6 +2465,26 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
     assert (
         _select_logical_model_for_role(
             RoleAssignment(
+                id="video_editor",
+                role="视频剪辑师",
+                purpose=RolePurpose.EXECUTE,
+                mission="根据分镜和角色设定剪辑最终成片。",
+                must_answer=("成片剪辑方案是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={},
+                model="main",
+            ),
+            config,
+            default_model="main",
+            task="根据已审核角色设定表和分镜生成视频并剪辑成片。",
+        )
+        == "media"
+    )
+    assert (
+        _select_logical_model_for_role(
+            RoleAssignment(
                 id="economic_analyst",
                 role="经济分析师",
                 purpose=RolePurpose.EXPERTISE,
@@ -1799,6 +2502,78 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
         )
         == "analyst"
     )
+
+
+def test_media_planner_roles_replace_default_generic_selected_roles() -> None:
+    generic_roles = (
+        RoleAssignment(
+            id="architect",
+            role="Architect",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan implementation.",
+            must_answer=("What architecture is needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="qwen",
+        ),
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Implement the task.",
+            must_answer=("What was implemented?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="qwen",
+        ),
+    )
+    media_roles = (
+        RoleAssignment(
+            id="director",
+            role="Director",
+            purpose=RolePurpose.EXECUTE,
+            mission="Plan shots.",
+            must_answer=("What shots are needed?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="minimax",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Compose the final clip.",
+            must_answer=("What clip was composed?",),
+            allowed_tools=("compose_video",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="minimax",
+        ),
+    )
+    custom_roles = (
+        RoleAssignment(
+            id="brand_director",
+            role="Brand Director",
+            purpose=RolePurpose.EXECUTE,
+            mission="Preserve brand consistency.",
+            must_answer=("What brand choices matter?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={},
+            model="main",
+        ),
+    )
+
+    assert _should_use_standalone_multimedia_roles(generic_roles, media_roles)
+    assert not _should_use_standalone_multimedia_roles(custom_roles, media_roles)
 
 
 def test_role_model_assignment_balances_repeated_roles_across_available_capacity() -> None:

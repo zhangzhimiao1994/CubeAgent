@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     attachment_store_dir: Path = Path("/var/lib/agent-hub/attachments")
     generated_artifact_dir: Path = Path("/var/lib/agent-hub/generated-artifacts")
+    workspace_read_roots: tuple[Path, ...] = Field(default_factory=tuple, max_length=16)
     litellm_health_url: str | None = None
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(

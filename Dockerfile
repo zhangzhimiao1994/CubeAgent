@@ -30,7 +30,10 @@ ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     AGENT_HUB_WEB_DIR=/opt/agent-hub/web
 WORKDIR /opt/agent-hub
-RUN groupadd --gid 10001 agent-hub \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 agent-hub \
     && useradd --uid 10001 --gid 10001 --home-dir /opt/agent-hub --shell /usr/sbin/nologin agent-hub \
     && mkdir -p /opt/agent-hub/web /var/lib/agent-hub /run/agent-hub \
     && chown -R 10001:10001 /opt/agent-hub /var/lib/agent-hub /run/agent-hub

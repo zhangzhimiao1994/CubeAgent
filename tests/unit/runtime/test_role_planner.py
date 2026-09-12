@@ -25,6 +25,39 @@ def test_role_planning_request_allows_shared_link_multiline_text() -> None:
     assert request.task == "标题\nhttps://example.com/a?x=1&y=2\t备注"
 
 
+def test_role_planning_request_normalizes_long_padded_user_text_for_planning() -> None:
+    tail_instruction = "只生成每个角色单独的角色参考设定表，不要生成视频。"
+    raw_task = "\n  " + ("用户长文材料。" * 500) + tail_instruction + "  \n"
+
+    request = RolePlanningRequest(
+        task=raw_task,
+        mode=TaskMode.DISCUSS,
+        profile=TaskProfile.GENERAL,
+        high_risk=False,
+        requested_skills=(),
+        default_model="main-agent",
+    )
+
+    assert request.task == request.task.strip()
+    assert len(request.task) <= 2_000
+    assert "[truncated for role planning; middle omitted]" in request.task
+    assert request.task.endswith(tail_instruction)
+
+
+def test_role_planning_request_rejects_hidden_control_even_beyond_planning_limit() -> None:
+    raw_task = ("正常长文" * 700) + "\u200b"
+
+    with pytest.raises(ValueError, match="control characters"):
+        RolePlanningRequest(
+            task=raw_task,
+            mode=TaskMode.DISCUSS,
+            profile=TaskProfile.GENERAL,
+            high_risk=False,
+            requested_skills=(),
+            default_model="main-agent",
+        )
+
+
 @pytest.mark.parametrize("hidden_character", ["\x00", "\x1b", "\u200b", "\u202e"])
 def test_role_planning_request_rejects_hidden_or_dangerous_control_text(
     hidden_character: str,
@@ -240,6 +273,348 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+def test_video_editing_delivery_dispatch_adds_compose_video_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="把这些子 Agent 生成的视频和图片素材合成一个30秒竖屏 MP4，最终给我可下载成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert compositor.purpose is RolePurpose.EXECUTE
+    assert "compose_video" in compositor.allowed_tools
+    assert "generate_multimedia" not in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        "根据分镜剪辑成片。",
+        "生成视频并剪辑成片。",
+        "先生成角色参考设定表、服装设定板和分镜图，最终剪辑成片。",
+    ),
+)
+def test_final_video_requests_generate_video_without_composing_missing_assets(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+
+
+def test_final_video_request_with_missing_shots_generates_then_composes() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "现在明确要剪辑成片：请使用本会话已经生成或审核通过的角色参考设定表/资产，"
+                "生成一个 5 秒以内的最终 MP4 测试成片；如果缺少镜头素材，"
+                "请先生成最小必要镜头视频，再按分镜合并剪辑。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "planner" not in role_ids
+    assert "reviewer" not in role_ids
+    assert "quality_reviewer" not in role_ids
+    assert "video_editor" not in role_ids
+
+
+def test_reference_locked_video_comparison_generates_and_composes_two_versions() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成两种方式的视频对比：一版带参考图锁定人物，一版不带参考图，然后剪辑成可下载成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
+
+
+def test_generate_assets_then_edit_final_video_routes_to_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成角色参考设定表后再剪辑成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
+    assert "video_editor" not in role_ids
+
+
+def test_video_workflow_planning_request_does_not_generate_or_compose() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="只规划先生成镜头视频再剪辑成片的流程，不成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "video_editor" in role_ids
+    assert "multimedia_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
+def test_deferred_script_media_plan_does_not_start_media_generation_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="先生成一个短剧剧本，后续我可能要生成角色参考设定表、分镜图并剪辑成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "video_editor" not in role_ids
+    assert "multimedia_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
+def test_script_plan_with_explicit_no_video_now_does_not_start_video_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "请为一个 8 秒玄幻恐怖短片写极短剧本，主题是石门内的影子。"
+                "只生成剧本和多媒体制作计划，暂时不要生成图片、不要生成视频、不要剪辑成片；"
+                "计划里保留 Character Model Sheet、角色服装设定板、资产图、分镜图、镜头视频、最终剪辑成片这些后续阶段。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "video_editor" not in role_ids
+    assert "multimedia_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+
+
+def test_character_sheet_followup_with_negated_video_routes_to_media_generator_only() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "基于刚才剧本，只生成 Character Model Sheet 形式的角色参考设定表和角色服装设定板图片，"
+                "不要生成视频，不要剪辑成片。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
+def test_long_script_tail_character_sheet_instruction_still_routes_image_only() -> None:
+    task = (
+        ("都市短剧正文：两位主角在办公室和街角反复拉扯，人物关系逐步推进。\n" * 180)
+        + "基于上面的剧本，只生成男女主每个人单独一张 Character Model Sheet 角色参考设定表。"
+        + "全片风格统一为写实，不要生成视频，不要剪辑成片。"
+    )
+
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert role_ids == {"multimedia_generator"}
+
+
+def test_long_script_tail_final_video_comparison_still_routes_generation_and_composition() -> None:
+    task = (
+        ("都市短剧正文：男女主在多个场景中误会、靠近、反转，素材可能来自分镜图和镜头视频。\n" * 180)
+        + "现在明确要剪辑成片，并生成两种方式的视频对比："
+        + "一版带角色参考图锁定人物，一版不带参考图，然后输出可下载 MP4。"
+    )
+
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "video_compositor" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "compose_video" in plan.role("video_compositor").allowed_tools
+
+
+def test_unresolved_script_character_makeup_reference_generates_script_before_image() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="根据剧本为每个角色生成定妆参考图。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "video_compositor" not in role_ids
+
+
+def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="帮我规划这个广告视频的剪辑节奏、转场和字幕，不需要生成成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    editor = plan.role("video_editor")
+
+    assert editor.purpose is RolePurpose.EXECUTE
+    assert "compose_video" not in editor.allowed_tools
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
+def test_english_video_merge_dispatch_adds_compose_video_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Merge the generated clips and still images into one downloadable vertical reel.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert [role.id for role in plan.roles] != ["multimedia_generator"]
+
+
+def test_downloadable_media_generation_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Generate a downloadable product video.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["multimedia_generator"]
+
+
+def test_merge_existing_clips_routes_to_compositor_even_when_new_generation_is_negated() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Do not generate new videos; merge the existing clips into one MP4.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
+
+
+def test_approved_media_pipeline_assets_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="根据长期计划里的已审核资产最终剪辑成片。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    compositor = plan.role("video_compositor")
+
+    assert "compose_video" in compositor.allowed_tools
+    assert "multimedia_generator" not in {role.id for role in plan.roles}
+
+
+def test_generated_brief_video_request_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Render a final video from the generated product brief and storyboard.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
+def test_existing_brief_video_request_does_not_route_to_video_compositor() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Render a final video from the existing product brief and storyboard.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert "video_compositor" not in {role.id for role in plan.roles}
+
+
 def test_compound_script_and_image_request_keeps_text_and_multimedia_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
@@ -252,6 +627,31 @@ def test_compound_script_and_image_request_keeps_text_and_multimedia_roles() -> 
 
     role_ids = {role.id for role in plan.roles}
 
+    assert "copywriter" in role_ids
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert [role.id for role in plan.roles] != ["multimedia_generator"]
+
+
+def test_character_model_sheet_request_keeps_text_and_multimedia_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "给我生成一个剧本，大概的背景是中西方融合的修仙神话体系下，"
+                "男主角是一个异类，无法进行修仙也无法获得神位的认可，其实男主角是仙神魔的混合，"
+                "所以一开始完全无法修炼，后续因为一些机缘，成功踏上修行一途，但是又差点入魔，"
+                "女主角是东西方融合的结晶，既能修仙也能继承神位，为了男主角回归，苦苦追寻男主角。"
+                "然后根据剧情以Character Model Sheet的形式生成角色参考设定表"
+            ),
+            mode=TaskMode.HYBRID,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "director" in role_ids
     assert "copywriter" in role_ids
     assert "multimedia_generator" in role_ids
     assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
@@ -286,6 +686,7 @@ def test_standalone_multimedia_generation_uses_only_multimedia_executor_role() -
         "生成三张可下载表情包贴纸。",
         "做一张商品 3D 渲染图。",
         "输出一张分镜图和一段口播音频。",
+        "根据剧本生成男女主角同框合照。",
         "确认，开始执行多媒体产物，最终结果要可下载。",
         "不要让我去 Midjourney，直接调用系统里的多媒体模型生成图片。",
         "不用外部工具，直接给我生成一张图片版设定板。",
@@ -305,6 +706,38 @@ def test_multimedia_generation_dispatch_covers_final_and_intermediate_media_arti
 
     assert executor.purpose is RolePurpose.EXECUTE
     assert "generate_multimedia" in executor.allowed_tools
+
+
+@pytest.mark.parametrize(
+    "task",
+    (
+        (
+            "根据这个剧情生成 Character Model Sheet 形式的角色参考设定表，"
+            "只需要图片，不要生成视频成片。"
+        ),
+        "我只要 Character Model Sheet 形式的角色参考设定表，不要生成视频成片。",
+        "只生成角色参考设定表，不要生成视频。",
+        "生成角色定妆照，暂时不剪辑成片。",
+    ),
+)
+def test_image_only_character_model_sheet_request_does_not_route_to_video_roles(
+    task: str,
+) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" in role_ids
+    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "video_editor" not in role_ids
+    assert "video_compositor" not in role_ids
 
 
 def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None:

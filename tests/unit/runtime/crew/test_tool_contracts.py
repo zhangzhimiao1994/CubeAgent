@@ -18,6 +18,7 @@ from agent_hub.runtime.crew.adapter import (
     CrewLLMBridge,
     CrewObjectFactory,
     CrewTaskDefinition,
+    _requires_final_attachment_tool,
     _tool_definitions,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -351,6 +352,53 @@ def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None
     assert isinstance(prompt, Mapping)
     assert prompt["type"] == "string"
     assert prompt["minLength"] == 1
+    artifact_count = properties["artifact_count"]
+    assert isinstance(artifact_count, Mapping)
+    assert artifact_count["type"] == "integer"
+    assert artifact_count["minimum"] == 1
+    assert artifact_count["maximum"] == 8
+    artifact_prompts = properties["artifact_prompts"]
+    assert isinstance(artifact_prompts, Mapping)
+    assert artifact_prompts["type"] == "array"
+    assert artifact_prompts["minItems"] == 1
+    assert artifact_prompts["maxItems"] == 8
+
+
+def test_compose_video_tool_definition_exposes_strict_clip_contract() -> None:
+    tool = _tool_definitions(("compose_video",))[0]
+
+    assert tool.name == "compose_video"
+    assert "compose_video" in tool.description
+    assert "downloadable MP4" in tool.description
+    assert tool.parameters["type"] == "object"
+    assert tool.parameters["additionalProperties"] is False
+    required = tool.parameters["required"]
+    assert isinstance(required, tuple)
+    assert required == ("title", "clips")
+    properties = tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    assert set(properties) == {
+        "title",
+        "filename",
+        "aspect_ratio",
+        "image_duration_seconds",
+        "presentation",
+        "clips",
+    }
+    assert properties["aspect_ratio"] == {
+        "type": "string",
+        "enum": ("original", "16:9", "9:16"),
+        "description": "Output aspect ratio normalization.",
+    }
+    clips = properties["clips"]
+    assert isinstance(clips, Mapping)
+    assert clips["type"] == "array"
+    assert clips["minItems"] == 1
+    assert clips["maxItems"] == 32
+
+
+def test_compose_video_is_required_final_attachment_tool() -> None:
+    assert _requires_final_attachment_tool(("compose_video",)) is True
 
 
 async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
@@ -392,6 +440,37 @@ async def test_final_attachment_tool_result_completes_without_extra_tool_rounds(
         EventKind.TOOL_COMPLETED,
     ]
     assert len(gateway.requests) == 1
+
+
+async def test_step_prompt_includes_requested_plugin_context() -> None:
+    gateway = TextOnlyGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=()),
+        crew_factory=FastFactory(),
+    )
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="Compare $plugin:runway and local video generation.",
+        token_budget=1000,
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 1
+    serialized = "\n".join(
+        str(message.content)
+        for request in gateway.requests
+        for message in request.messages
+    )
+    assert "requested_plugin_context" in serialized
+    assert "runway" in serialized
+    assert "higgsfield" in serialized
+    assert "not proof" in serialized
 
 
 @pytest.mark.parametrize(

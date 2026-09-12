@@ -32,29 +32,81 @@ type ChatAttachmentDraft = {
   fileName: string;
   size: number;
   kind: "archive" | "image" | "context";
+  file?: File;
   attachment?: AttachmentUpload;
 };
 type SkillUploadStrategy = "overwrite" | "new_version";
 type SkillUploadRequest = {
-  file: File;
+  file?: File;
+  files?: File[];
   strategy?: SkillUploadStrategy;
+};
+type SkillUploadBatchResult = {
+  files: File[];
+  skills: Skill[];
+  skipped: SkillArchiveUpload["skipped"];
 };
 type SkillUploadConflict = {
   file: File;
   skillName: string;
   newContentSha256?: string;
 };
+type CapabilityMentionTrigger = {
+  start: number;
+  end: number;
+  marker: "@" | "$";
+  query: string;
+};
+type CapabilityReferenceSuggestion = {
+  kind: "skill" | "plugin";
+  name: string;
+  token: string;
+  detail: string;
+};
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
+type ArtifactReviewArtifact = RunDetail["artifacts"][number] | NonNullable<RunDetail["events"][number]["artifact"]>;
+type ArtifactReviewItem = {
+  id: string;
+  artifactId: string | null;
+  title: string | null;
+  filename: string | null;
+  sha256: string | null;
+  mimeType: string | null;
+  kind: string | null;
+  artifact: ArtifactReviewArtifact | null;
+};
+type ArtifactReviewRejectedItem = {
+  id: string;
+  feedback: string;
+};
+type ArtifactReviewRejectPayload = {
+  feedback?: string;
+  rejectedItems?: ArtifactReviewRejectedItem[];
+};
+type ArtifactReviewApproval = {
+  runId: string;
+  approvalId: string;
+  version: number;
+  stageId: string;
+  artifactId: string;
+  producer: string | null;
+  artifact: ArtifactReviewArtifact | null;
+  artifacts: ArtifactReviewArtifact[];
+  reviewItems: ArtifactReviewItem[];
+};
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
   mode?: RunMode;
+  skipScheduleProposal?: boolean;
   successNotice?: string;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const COMPACT_CHAT_MEDIA_QUERY = "(max-width: 640px)";
+const MAX_RUN_MESSAGE_BYTES = 65_536;
 const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
 const ARCHIVE_EXTENSIONS = [
   ".zip",
@@ -93,6 +145,12 @@ const ATTACHMENT_ACCEPT = [
   ".xlsx",
   "image/*",
 ].join(",");
+const PLUGIN_REFERENCE_SUGGESTIONS: CapabilityReferenceSuggestion[] = [
+  { kind: "plugin", name: "runway", token: "$plugin:runway", detail: "视频生成与剪辑对比" },
+  { kind: "plugin", name: "higgsfield", token: "$plugin:higgsfield", detail: "视频与视觉生成" },
+  { kind: "plugin", name: "github", token: "$plugin:github", detail: "仓库、Issue 和 PR" },
+  { kind: "plugin", name: "canva", token: "$plugin:canva", detail: "设计素材与成片资产" },
+];
 
 function shortHash(value?: string | null) {
   if (!value) return "未记录";
@@ -117,11 +175,168 @@ function isArchiveFileName(fileName: string) {
   return ARCHIVE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
+function uniqueAttachmentIds(drafts: ChatAttachmentDraft[]) {
+  const ids: string[] = [];
+  for (const draft of drafts) {
+    const id = draft.attachment?.id;
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function archiveDraftFiles(drafts: ChatAttachmentDraft[]) {
+  return drafts
+    .filter((draft) => draft.kind === "archive" && draft.file)
+    .map((draft) => draft.file as File);
+}
+
+function matchesDraftFile(draft: ChatAttachmentDraft, file: File) {
+  return draft.file === file || (draft.fileName === file.name && draft.size === file.size);
+}
+
+function hasSkillInstallIntent(text: string) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const installIntent = /(安装|装上|导入|加载|启用|接入|使用|install|enable|import|load)/i.test(normalized);
+  const skillTarget = /(skill|技能|插件|工具包|能力包|压缩包|zip|tar)/i.test(normalized);
+  return installIntent && skillTarget;
+}
+
+function hasSkillInstallApprovalIntent(text: string) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const approvalIntent = /^(确认|同意|可以|安装|启用|批准|approve|install|enable|yes|ok)/i.test(normalized);
+  const skillTarget = /(安装|启用|skill|技能|插件|工具包|能力包|install|enable)/i.test(normalized);
+  return approvalIntent && skillTarget;
+}
+
+function skillUploadConflictStrategyFromText(text: string): SkillUploadStrategy | null {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return null;
+  const newVersion = parseChoiceText(normalized, [
+    { value: "new_version", label: "保存为新版本", aliases: ["2", "新版本", "另存", "保留两个", "new version"] },
+  ]);
+  if (newVersion) return "new_version";
+  const overwrite = parseChoiceText(normalized, [
+    { value: "overwrite", label: "覆盖当前版本", aliases: ["1", "覆盖", "覆盖当前", "替换", "overwrite", "replace"] },
+  ]);
+  return overwrite ? "overwrite" : null;
+}
+
+function referencedCapabilitiesFromText(text: string) {
+  const skills: string[] = [];
+  const plugins: string[] = [];
+  const files: string[] = [];
+  const mentionPattern = /(^|[\s([{（【])([@$])([a-zA-Z0-9_\-:.\/@\u4e00-\u9fff]{2,100})/gu;
+  for (const match of text.matchAll(mentionPattern)) {
+    const marker = match[2];
+    const raw = match[3]?.replace(/[，。；、,.!?！？)）\]}]+$/u, "");
+    if (!raw) continue;
+    if (/^\d+(?:\.\d+)?$/.test(raw) || (marker === "@" && raw.includes("@"))) continue;
+    const normalized = raw.toLowerCase();
+    if (normalized.startsWith("plugin:")) {
+      const plugin = raw.slice("plugin:".length);
+      if (plugin && !plugins.includes(plugin)) plugins.push(plugin);
+      continue;
+    }
+    if (normalized.startsWith("skill:")) {
+      const skill = raw.slice("skill:".length);
+      if (skill && !skills.includes(skill)) skills.push(skill);
+      continue;
+    }
+    if (normalized.startsWith("file:")) {
+      const file = raw.slice("file:".length).replace(/\\/g, "/");
+      if (file && !file.startsWith("/") && !/^[a-zA-Z]:\//.test(file) && !file.split("/").includes("..") && !files.includes(file)) {
+        files.push(file);
+      }
+      continue;
+    }
+    if (marker === "$" || normalized.includes("plugin")) {
+      if (!plugins.includes(raw)) plugins.push(raw);
+    } else if (!skills.includes(raw)) {
+      skills.push(raw);
+    }
+  }
+  return { skills, plugins, files };
+}
+
+function capabilityMentionTriggerFromText(text: string): CapabilityMentionTrigger | null {
+  const match = /(^|\s)([@$])([a-zA-Z0-9_\-:.\/@\u4e00-\u9fff]*)$/u.exec(text);
+  if (!match) return null;
+  return {
+    start: (match.index ?? 0) + match[1].length,
+    end: text.length,
+    marker: match[2] as "@" | "$",
+    query: match[3] ?? "",
+  };
+}
+
+function capabilitySuggestionKind(trigger: CapabilityMentionTrigger) {
+  const normalized = trigger.query.toLowerCase();
+  if (normalized.startsWith("plugin:")) return "plugin";
+  if (normalized.startsWith("skill:")) return "skill";
+  return trigger.marker === "$" ? "plugin" : "skill";
+}
+
+function capabilitySuggestionFilter(trigger: CapabilityMentionTrigger) {
+  return trigger.query.replace(/^(?:skill|plugin):/i, "").toLowerCase();
+}
+
+function capabilitySuggestionsForTrigger(
+  trigger: CapabilityMentionTrigger | null,
+  skills: Skill[] | undefined,
+): CapabilityReferenceSuggestion[] {
+  if (!trigger) return [];
+  const kind = capabilitySuggestionKind(trigger);
+  const filter = capabilitySuggestionFilter(trigger);
+  const suggestions =
+    kind === "skill"
+      ? (skills ?? [])
+          .filter((skill) => skill.status === "enabled")
+          .map((skill) => ({
+            kind: "skill" as const,
+            name: skill.name,
+            token: `@skill:${skill.name}`,
+            detail: skill.source_filename ? `来自 ${skill.source_filename}` : "已启用 Skill",
+          }))
+      : PLUGIN_REFERENCE_SUGGESTIONS;
+  return suggestions
+    .filter((suggestion) => !filter || suggestion.name.toLowerCase().includes(filter))
+    .slice(0, 6);
+}
+
+function insertCapabilityReferenceToken(
+  text: string,
+  trigger: CapabilityMentionTrigger | null,
+  token: string,
+) {
+  if (!trigger) return `${text}${text.endsWith(" ") || text.length === 0 ? "" : " "}${token} `;
+  return `${text.slice(0, trigger.start)}${token} ${text.slice(trigger.end).replace(/^\s+/u, "")}`;
+}
+
 function newConversationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `conv-${crypto.randomUUID()}`;
   }
   return `conv-${Date.now().toString(36)}`;
+}
+
+function useCompactChatViewport() {
+  const [compact, setCompact] = useState(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+    return window.matchMedia(COMPACT_CHAT_MEDIA_QUERY).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(COMPACT_CHAT_MEDIA_QUERY);
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return compact;
 }
 
 function displayMode(mode: string | null | undefined) {
@@ -155,6 +370,8 @@ const FALLBACK_AGENT_NAMES: Record<string, string> = {
   final_synthesizer: "最终汇总员",
   decision_recorder: "裁决记录员",
   decision_maker: "裁决助手",
+  cost_estimator: "成本评估员",
+  user_advocate: "用户立场代表",
   researcher: "研究员",
   summarizer: "总结助手",
   operator: "执行员",
@@ -380,6 +597,7 @@ type ChatMessage = {
   body: string;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
   temporaryAgentProposal?: TemporaryAgentProposal;
+  artifactReviewApproval?: ArtifactReviewApproval;
 };
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -775,6 +993,7 @@ function temporaryAgentCardSummary(proposal: TemporaryAgentProposal) {
 
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
+  const artifactReviewApproval = artifactReviewApprovalFromRunDetail(detail);
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
@@ -807,7 +1026,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   const fallbackArtifactMessages = replyArtifact
     ? []
     : detail.artifacts
-        .filter((artifact) => !artifact.text?.trim())
+        .filter((artifact) => !artifact.text?.trim() && !hasArtifactDownload(artifact))
         .map((artifact) => ({
           id: `artifact-${artifact.id}`,
           role: "assistant" as const,
@@ -842,7 +1061,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.temporary_agent_proposal
       ? [
           {
-            id: `${detail.id}-temporary-agent-approval`,
+            id: "temporary-agent-approval",
             role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentSummary(detail.temporary_agent_proposal),
@@ -853,7 +1072,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.schedule_proposal
       ? [
           {
-            id: `${detail.id}-schedule-approval`,
+            id: "schedule-approval",
             role: "assistant" as const,
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
@@ -863,10 +1082,22 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...(detail.status === "waiting_approval" && detail.openclaw_proposal
       ? [
           {
-            id: `${detail.id}-openclaw-approval`,
+            id: "openclaw-approval",
             role: "assistant" as const,
             title: "OpenClaw 操作确认",
             body: openClawProposalBody(detail.openclaw_proposal),
+          },
+        ]
+      : []),
+    ...(artifactReviewApproval
+      ? [
+          {
+            id: "artifact-review-approval",
+            role: "assistant" as const,
+            title: "中间产物审核",
+            body: `阶段 ${artifactReviewApproval.stageId} 已生成中间产物，请确认是否放行进入下一步。`,
+            artifact: artifactReviewApproval.artifact ?? undefined,
+            artifactReviewApproval,
           },
         ]
       : []),
@@ -910,6 +1141,102 @@ function runConversationId(detail: RunDetail | undefined) {
 function payloadText(payload: Record<string, unknown>, key: string) {
   const value = payload[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function artifactReviewString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function artifactReviewItemsFromPayload(
+  payload: Record<string, unknown>,
+  artifacts: ArtifactReviewArtifact[],
+): ArtifactReviewItem[] {
+  const rawItems = payload.review_items;
+  if (!Array.isArray(rawItems)) return [];
+  const artifactsById = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+  const artifactsByFilename = new Map(
+    artifacts
+      .filter((artifact) => artifact.filename?.trim())
+      .map((artifact) => [artifact.filename?.trim() as string, artifact]),
+  );
+  const artifactsBySha = new Map(
+    artifacts.filter((artifact) => artifact.sha256?.trim()).map((artifact) => [artifact.sha256?.trim() as string, artifact]),
+  );
+  const seen = new Set<string>();
+  const items: ArtifactReviewItem[] = [];
+  for (const rawItem of rawItems) {
+    if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+    const record = rawItem as Record<string, unknown>;
+    const id = artifactReviewString(record.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const artifactId = artifactReviewString(record.artifact_id);
+    const filename = artifactReviewString(record.filename);
+    const sha256 = artifactReviewString(record.sha256);
+    const artifact =
+      artifactsById.get(id) ??
+      (filename ? artifactsByFilename.get(filename) : undefined) ??
+      (sha256 ? artifactsBySha.get(sha256) : undefined) ??
+      null;
+    items.push({
+      id,
+      artifactId,
+      title: artifactReviewString(record.title) ?? artifact?.title ?? null,
+      filename: filename ?? artifact?.filename ?? null,
+      sha256: sha256 ?? artifact?.sha256 ?? null,
+      mimeType: artifactReviewString(record.mime_type) ?? artifact?.mime_type ?? null,
+      kind: artifactReviewString(record.kind) ?? artifact?.kind ?? null,
+      artifact,
+    });
+  }
+  return items;
+}
+
+function artifactReviewApprovalFromRunDetail(run: RunDetail | undefined): ArtifactReviewApproval | null {
+  if (!run || run.status !== "waiting_approval") return null;
+  const requested = [...run.events]
+    .sort((left, right) => right.sequence - left.sequence)
+    .find(
+      (event) =>
+        event.kind === "approval.requested" &&
+        event.action === "artifact_review" &&
+        payloadText(event.payload, "approval_kind") === "runtime_artifact_review",
+    );
+  if (!requested?.approval_id) return null;
+  const stageId = payloadText(requested.payload, "stage_id");
+  const artifactId = payloadText(requested.payload, "artifact_id");
+  if (!stageId || !artifactId) return null;
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  const expandedArtifacts = run.artifacts.filter(
+    (artifact) => artifact.id === artifactId || artifact.id.startsWith(`${artifactId}:`),
+  );
+  const eventArtifacts = [...run.events]
+    .filter((event) => event.artifact?.id === artifactId || event.artifact?.id.startsWith(`${artifactId}:`))
+    .map((event) => event.artifact)
+    .filter((artifact): artifact is NonNullable<RunEvent["artifact"]> => Boolean(artifact));
+  const eventExpandedArtifacts = (requested.artifacts ?? []).filter(
+    (artifact) => artifact.id === artifactId || artifact.id.startsWith(`${artifactId}:`),
+  );
+  const artifacts = [...expandedArtifacts, ...eventExpandedArtifacts, ...eventArtifacts].filter(
+    (artifact, index, all) => all.findIndex((candidate) => candidate.id === artifact.id) === index,
+  );
+  const artifact =
+    artifacts[0] ??
+    run.artifacts.find((candidate) => candidate.id === artifactId) ??
+    run.events.find((event) => event.artifact?.id === artifactId)?.artifact ??
+    null;
+  const reviewItems = artifactReviewItemsFromPayload(requested.payload, artifacts);
+  return {
+    runId: run.id,
+    approvalId: requested.approval_id,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    stageId,
+    artifactId,
+    producer: payloadText(requested.payload, "producer") ?? requested.actor ?? null,
+    artifact,
+    artifacts: artifact ? [artifact, ...artifacts.filter((candidate) => candidate.id !== artifact.id)] : artifacts,
+    reviewItems,
+  };
 }
 
 function payloadNumberValue(payload: Record<string, unknown>, key: string) {
@@ -1026,13 +1353,27 @@ function runCreatedAtMs(run: RunListItem) {
   return Number.isNaN(date.getTime()) ? 0 : date.getTime();
 }
 
+function utf8ByteLength(value: string) {
+  return new TextEncoder().encode(value).length;
+}
+
+function compareRunsChronologically(left: RunListItem, right: RunListItem) {
+  const timeDiff = runCreatedAtMs(left) - runCreatedAtMs(right);
+  if (timeDiff !== 0) return timeDiff;
+  return left.id.localeCompare(right.id);
+}
+
+function sortRunsChronologically<T extends RunListItem>(runs: T[]): T[] {
+  return [...runs].sort(compareRunsChronologically);
+}
+
 function conversationTitle(run: RunListItem, items: RunListItem[]) {
   const fallback = run.id.slice(0, 8);
   const conversationKey = run.conversation_id?.trim();
   const sameConversation = conversationKey ? items.filter((item) => item.conversation_id === conversationKey) : [];
   const firstRun =
     sameConversation.length > 0
-      ? [...sameConversation].sort((left, right) => runCreatedAtMs(left) - runCreatedAtMs(right))[0]
+      ? sortRunsChronologically(sameConversation)[0]
       : run;
   const question = normalizeConversationQuestion(firstRun?.request, fallback);
   const timestamp = conversationTimestamp(firstRun?.created_at);
@@ -1066,23 +1407,32 @@ function conversationListEntries(items: RunListItem[]): ConversationListEntry[] 
       grouped.set(key, { conversationId, runs: [run] });
     }
   }
-  return Array.from(grouped.entries()).map(([key, entry]) => {
-    const latestRun = [...entry.runs].sort((left, right) => runCreatedAtMs(right) - runCreatedAtMs(left))[0];
-    const runIds = entry.runs.map((run) => run.id);
-    const allTerminal = entry.runs.every((run) => TERMINAL_STATUSES.has(run.status));
-    return {
-      key,
-      conversationId: entry.conversationId,
-      latestRun,
-      runIds,
-      deletableRunIds: allTerminal ? runIds : [],
-      allTerminal,
-    };
-  });
+  return Array.from(grouped.entries())
+    .map(([key, entry]) => {
+      const orderedRuns = sortRunsChronologically(entry.runs);
+      const latestRun = orderedRuns.at(-1) ?? entry.runs[0];
+      const runIds = orderedRuns.map((run) => run.id);
+      const allTerminal = orderedRuns.every((run) => TERMINAL_STATUSES.has(run.status));
+      return {
+        key,
+        conversationId: entry.conversationId,
+        latestRun,
+        runIds,
+        deletableRunIds: allTerminal ? runIds : [],
+        allTerminal,
+      };
+    })
+    .sort((left, right) => {
+      const timeDiff = runCreatedAtMs(right.latestRun) - runCreatedAtMs(left.latestRun);
+      if (timeDiff !== 0) return timeDiff;
+      return left.key.localeCompare(right.key);
+    });
 }
 
 function conversationMessages(runs: RunDetail[]) {
-  return runs.flatMap((run) =>
+  const dedupedRunsById = new Map(runs.map((run) => [run.id, run]));
+  const dedupedRuns = sortRunsChronologically(Array.from(dedupedRunsById.values()));
+  return dedupedRuns.flatMap((run) =>
     detailMessages(run).map((message) => ({
       ...message,
       id: `${run.id}-${message.id}`,
@@ -1154,21 +1504,22 @@ function eventFingerprint(event: RunEvent) {
 }
 
 function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
-  if (!previous || previous.length === 0) return incoming;
-  if (incoming.length === 0) return previous;
+  if (!previous || previous.length === 0) return sortRunsChronologically(incoming);
+  if (incoming.length === 0) return sortRunsChronologically(previous);
   const incomingById = new Map(incoming.map((run) => [run.id, run]));
   const previousIds = new Set(previous.map((run) => run.id));
-  const merged = previous.map((run) => incomingById.get(run.id) ?? run);
+  const merged = sortRunsChronologically(previous.map((run) => incomingById.get(run.id) ?? run));
   for (const run of incoming) {
     if (!previousIds.has(run.id)) merged.push(run);
   }
+  const ordered = sortRunsChronologically(merged);
   if (
-    merged.length === previous.length &&
-    merged.every((run, index) => sameRunSnapshot(run, previous[index]))
+    ordered.length === previous.length &&
+    ordered.every((run, index) => sameRunSnapshot(run, previous[index]))
   ) {
     return previous;
   }
-  return merged;
+  return ordered;
 }
 
 function internalArtifactNotice(detail: RunDetail): ChatMessage | null {
@@ -1325,6 +1676,68 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function eventParticipantIds(event: RunEvent) {
+  const payloadParticipants = event.payload.participants;
+  const ids = [...event.participants];
+  if (Array.isArray(payloadParticipants)) {
+    payloadParticipants.forEach((item) => {
+      if (typeof item === "string" && item.trim()) ids.push(item.trim());
+    });
+  }
+  return Array.from(new Set(ids));
+}
+
+function sameDiscussionParticipants(left: RunEvent, right: RunEvent) {
+  const leftIds = eventParticipantIds(left);
+  const rightIds = eventParticipantIds(right);
+  if (leftIds.length === 0 || rightIds.length === 0) return true;
+  return leftIds.some((id) => rightIds.includes(id));
+}
+
+function discussionWindowBounds(event: RunEvent, events: RunEvent[]) {
+  if (event.kind === "discussion.started") {
+    const completed = events.find(
+      (candidate) =>
+        candidate.kind === "discussion.completed" &&
+        candidate.sequence > event.sequence &&
+        sameDiscussionParticipants(event, candidate),
+    );
+    return { start: event.sequence, end: completed?.sequence ?? Number.POSITIVE_INFINITY };
+  }
+  if (event.kind === "discussion.completed") {
+    const started = [...events]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.kind === "discussion.started" &&
+          candidate.sequence < event.sequence &&
+          sameDiscussionParticipants(event, candidate),
+      );
+    return { start: started?.sequence ?? Number.NEGATIVE_INFINITY, end: event.sequence };
+  }
+  return null;
+}
+
+function discussionSpeechSummary(event: RunEvent, events: RunEvent[], agentNames: Map<string, string>) {
+  const bounds = discussionWindowBounds(event, events);
+  if (!bounds) return "";
+  const participants = new Set(eventParticipantIds(event));
+  const speeches = events
+    .filter((candidate) => candidate.kind === "message.created")
+    .filter((candidate) => candidate.sequence > bounds.start && candidate.sequence < bounds.end)
+    .filter((candidate) => !participants.size || (candidate.actor ? participants.has(candidate.actor) : false))
+    .map((candidate) => {
+      const actor = candidate.actor ? displayAgentName(candidate.actor, agentNames) : "参与者";
+      const value =
+        formatEventPayloadValue(candidate.payload.role_message) ||
+        (candidate.message && candidate.message !== candidate.kind ? candidate.message : "");
+      return value ? `${actor}：${conciseProcessText(value, "给出发言")}` : "";
+    })
+    .filter(Boolean);
+  if (speeches.length === 0) return "";
+  return `发言摘要：${speeches.slice(0, 4).join("；")}${speeches.length > 4 ? `；另有 ${speeches.length - 4} 条发言` : ""}`;
+}
+
 function discussionCompactSummary(event: RunEvent, agentNames: Map<string, string>) {
   const conclusionCount = formatEventPayloadValue(event.payload.result) || formatEventPayloadValue(event.payload.conclusion) ? 1 : 0;
   const decisionCount = eventDecisionSignal(event) ? 1 : 0;
@@ -1341,6 +1754,7 @@ function eventSummaryText(
   event: RunDetail["events"][number],
   agentNames: Map<string, string>,
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
+  events: RunDetail["events"] = [],
 ) {
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
@@ -1384,7 +1798,8 @@ function eventSummaryText(
     return `${subject} 输出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
   }
   if (event.kind === "discussion.started") {
-    return `${participants || "多角色"} 开始讨论`;
+    const speechSummary = discussionSpeechSummary(event, events, agentNames);
+    return speechSummary || `${participants || "多角色"} 开始讨论`;
   }
   if (event.kind === "discussion.completed") {
     return discussionCompactSummary(event, agentNames);
@@ -1476,7 +1891,7 @@ function processItemsForEvent(
   const baseItem: ProcessDetailTarget = {
     id: `${detail.id}-event-${event.sequence}-${index}`,
     title: displayEventTitle(event, agentNames),
-    message: eventSummaryText(event, agentNames, artifact),
+    message: eventSummaryText(event, agentNames, artifact, detail.events),
     badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,
@@ -1933,134 +2348,41 @@ function RunProcessSummary({
   onOpen,
   agentNames,
   mainAgentModelName,
+  compact = false,
 }: {
   detail: RunDetail;
   onOpen: (target: ProcessDrawerTarget) => void;
   agentNames: Map<string, string>;
   mainAgentModelName?: string;
+  compact?: boolean;
 }) {
   const workItems = buildAgentWorkItems(detail, agentNames, mainAgentModelName);
-  const milestoneItems = runMilestones(detail, workItems);
-  const highlightedIds = new Set<string>();
-  const outputHighlights = [
-    ...workItems.flatMap((item) => item.outputs.map((output) => ({ ...output, agentId: item.id }))),
-    ...workItems.flatMap((item) =>
-      item.activity
-        .filter((activity) => activity.kind === "中间产物" || /输出|产出/.test(`${activity.title} ${activity.summary}`))
-        .map((activity) => ({ ...activity, agentId: item.id })),
-    ),
-  ].filter((item) => {
-    const key = `${item.agentId}-${item.id}`;
-    if (highlightedIds.has(key)) return false;
-    highlightedIds.add(key);
-    return true;
-  });
-  const activityHighlights = workItems
-    .flatMap((item) => item.activity.map((activity) => ({ ...activity, agentId: item.id })))
-    .filter((item) => {
-      const key = `${item.agentId}-${item.id}`;
-      if (highlightedIds.has(key)) return false;
-      highlightedIds.add(key);
-      return true;
-    });
-  const compareActivityTime = (left: AgentWorkActivity, right: AgentWorkActivity) => {
-    if (left.createdAt && right.createdAt) return left.createdAt.localeCompare(right.createdAt);
-    if (left.createdAt) return -1;
-    if (right.createdAt) return 1;
-    return 0;
-  };
-  const highlights = [...outputHighlights.sort(compareActivityTime), ...activityHighlights.sort(compareActivityTime)].slice(0, 3);
-  if (workItems.length === 0 && highlights.length === 0) return null;
+  if (workItems.length === 0) return null;
   const doneCount = workItems.filter((item) => item.status === "done").length;
+  const openWorkforce = () =>
+    onOpen({
+      runId: detail.id,
+      conversationId: runConversationId(detail),
+      scopeLabel: runSeatScope(detail),
+      workItems,
+      hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
+    });
   return (
-    <section className="run-process-summary" aria-label="Agent 集群动作">
-      <div className="agent-cluster-status" role="status" aria-label={`Agent 工作席，${workItems.length} 个子 Agent`}>
+    <section className={`run-process-summary${compact ? " run-process-summary-compact" : ""}`} aria-label="Agent 集群动作">
+      <button
+        type="button"
+        className="agent-cluster-status"
+        aria-label={`查看 Agent 工作席，${workItems.length} 个子 Agent${doneCount > 0 ? `，${doneCount} 已下班` : ""}`}
+        onClick={openWorkforce}
+      >
         <span aria-hidden="true">⌘</span>
         <strong>Agent 工作席</strong>
         <small>
           {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
         </small>
-      </div>
-      <div className="run-milestones" aria-label="本轮里程碑">
-        {milestoneItems.map((item) => (
-          <span key={item.label} className={`run-milestone run-milestone-${item.state}`}>
-            {item.label}
-          </span>
-        ))}
-      </div>
-      <div className="agent-cluster-actions">
-        {highlights.map((item, index) => (
-          <button
-            key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
-            type="button"
-            className="run-process-toggle process-intermediate-card"
-            onClick={() =>
-              onOpen({
-                runId: detail.id,
-                conversationId: runConversationId(detail),
-                scopeLabel: runSeatScope(detail),
-                workItems,
-                hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
-                selectedAgentId: item.agentId,
-                selectedActivityId: item.id,
-              })
-            }
-          >
-            <span aria-hidden="true">›</span>
-            <small className="process-card-badge">{item.kind}</small>
-            <strong>{item.summary}</strong>
-          </button>
-        ))}
-        <button
-          type="button"
-          className="run-process-toggle process-open-workforce"
-          onClick={() =>
-            onOpen({
-              runId: detail.id,
-              conversationId: runConversationId(detail),
-              scopeLabel: runSeatScope(detail),
-              workItems,
-              hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
-            })
-          }
-        >
-          查看子 Agent 工作席
-        </button>
-      </div>
+      </button>
     </section>
   );
-}
-
-function runMilestones(
-  detail: RunDetail,
-  workItems: AgentWorkItem[],
-): { label: string; state: "done" | "active" | "pending" | "failed" }[] {
-  const eventKinds = new Set(detail.events.map((event) => event.kind));
-  const hasAgentActivity =
-    workItems.length > 0 ||
-    detail.events.some((event) =>
-      Boolean(event.actor || event.step_id || event.kind.startsWith("dispatch.") || event.kind.startsWith("model.")),
-    );
-  const hasOutput = detail.events.some((event) =>
-    ["artifact.created", "message.created", "tool.completed", "step.completed"].includes(event.kind),
-  );
-  const isTerminal = TERMINAL_STATUSES.has(detail.status);
-  const failed = detail.status === "failed" || eventKinds.has("runtime.failed");
-  return [
-    { label: "接收", state: "done" as const },
-    {
-      label: "执行",
-      state: hasAgentActivity ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
-    },
-    {
-      label: "产物",
-      state: hasOutput ? ("done" as const) : isTerminal ? ("pending" as const) : ("active" as const),
-    },
-    {
-      label: failed ? "失败" : isTerminal ? "完成" : "运行中",
-      state: failed ? ("failed" as const) : isTerminal ? ("done" as const) : ("active" as const),
-    },
-  ];
 }
 
 function HermesMemorySummaryRow({
@@ -2167,6 +2489,7 @@ function RunProcessDrawer({
   const initialAgentId =
     target.selectedAgentId ??
     selectedAgentForActivity(target.workItems, target.selectedActivityId) ??
+    target.workItems.find((item) => dedupeAgentActivities(item).length > 0)?.id ??
     target.workItems[0]?.id ??
     "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
@@ -2578,6 +2901,167 @@ function TemporaryAgentRecruitmentCard({
   );
 }
 
+function ArtifactReviewApprovalCard({
+  approval,
+  feedback,
+  onFeedbackChange,
+  onApprove,
+  onReject,
+  disabled = false,
+}: {
+  approval: ArtifactReviewApproval;
+  feedback: string;
+  onFeedbackChange: (value: string) => void;
+  onApprove: () => void;
+  onReject: (payload?: ArtifactReviewRejectPayload) => void;
+  disabled?: boolean;
+}) {
+  const title = approval.artifact?.title || approval.stageId;
+  const artifacts = approval.artifacts.length > 0 ? approval.artifacts : approval.artifact ? [approval.artifact] : [];
+  const hasReviewItems = approval.reviewItems.length > 0;
+  const [itemDecisions, setItemDecisions] = useState<Record<string, "approved" | "rejected">>({});
+  const [itemFeedback, setItemFeedback] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setItemDecisions({});
+    setItemFeedback({});
+  }, [approval.approvalId, approval.runId, approval.version]);
+
+  const rejectSelectedItems = () => {
+    const rejectedItems = approval.reviewItems
+      .filter((item) => itemDecisions[item.id] === "rejected")
+      .map((item) => ({ id: item.id, feedback: (itemFeedback[item.id] ?? "").trim() }));
+    if (rejectedItems.length === 0) {
+      onReject({ rejectedItems: [] });
+      return;
+    }
+    onReject({ rejectedItems });
+  };
+
+  return (
+    <article className="artifact-review-card" aria-label="中间产物审核">
+      <span className="eyebrow">中间产物审核</span>
+      <div className="artifact-review-head">
+        <h3>{title}</h3>
+        <em className="agent-workforce-status status-working">待审核</em>
+      </div>
+      <dl className="artifact-review-meta">
+        <div>
+          <dt>阶段</dt>
+          <dd>{approval.stageId}</dd>
+        </div>
+        <div>
+          <dt>产物</dt>
+          <dd>{approval.artifactId}</dd>
+        </div>
+        {approval.producer ? (
+          <div>
+            <dt>生成者</dt>
+            <dd>{approval.producer}</dd>
+          </div>
+        ) : null}
+      </dl>
+      <p>确认后进入下一步；退回时会把反馈交给对应阶段重新生成，并再次等待审核。</p>
+      {hasReviewItems ? (
+        <>
+          <p>本阶段共 {approval.reviewItems.length} 个文件，可逐个确认或退回。</p>
+          <div className="artifact-review-item-list">
+            {approval.reviewItems.map((item) => {
+              const itemTitle = item.title || item.filename || item.id;
+              const decision = itemDecisions[item.id];
+              const itemArtifact = item.artifact;
+              const meta = [item.kind, item.mimeType, item.sha256 ? `SHA-256 ${shortHash(item.sha256)}` : ""].filter(Boolean);
+              return (
+                <section key={item.id} className="artifact-review-item" aria-label={`审核 ${itemTitle}`}>
+                  <div className="artifact-review-item-head">
+                    <div>
+                      <strong>{itemTitle}</strong>
+                      <small>{item.filename || item.id}</small>
+                    </div>
+                    <div className="artifact-review-item-actions">
+                      <button
+                        type="button"
+                        className={decision === "approved" ? "" : "secondary-action"}
+                        onClick={() => setItemDecisions((current) => ({ ...current, [item.id]: "approved" }))}
+                        disabled={disabled}
+                      >
+                        通过
+                      </button>
+                      <button
+                        type="button"
+                        className={decision === "rejected" ? "" : "secondary-action"}
+                        onClick={() => setItemDecisions((current) => ({ ...current, [item.id]: "rejected" }))}
+                        disabled={disabled}
+                      >
+                        退回
+                      </button>
+                    </div>
+                  </div>
+                  {meta.length > 0 ? (
+                    <small className="artifact-review-item-meta">
+                      {meta.map((value) => (
+                        <span key={value}>{value}</span>
+                      ))}
+                    </small>
+                  ) : null}
+                  {itemArtifact && hasArtifactDownload(itemArtifact) ? (
+                    <ArtifactFileCard artifact={itemArtifact} compact />
+                  ) : null}
+                  {decision === "rejected" ? (
+                    <label className="artifact-review-feedback">
+                      <span>该文件退回意见</span>
+                      <textarea
+                        value={itemFeedback[item.id] ?? ""}
+                        rows={3}
+                        placeholder="说明这个文件哪里不合格，例如：女主没有按设定生成单人参考表。"
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setItemFeedback((current) => ({ ...current, [item.id]: value }));
+                        }}
+                        disabled={disabled}
+                      />
+                    </label>
+                  ) : null}
+                </section>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <>
+          {artifacts.length > 1 ? <p>本阶段共 {artifacts.length} 个文件，请按整组产物审核。</p> : null}
+          {artifacts.map((artifact) =>
+            hasArtifactDownload(artifact) ? <ArtifactFileCard key={artifact.id} artifact={artifact} compact /> : null,
+          )}
+          <label className="artifact-review-feedback">
+            <span>退回意见</span>
+            <textarea
+              value={feedback}
+              rows={3}
+              placeholder="说明哪里不合格，例如：角色脸型和服装不一致，重新生成完整 Character Model Sheet。"
+              onChange={(event) => onFeedbackChange(event.currentTarget.value)}
+              disabled={disabled}
+            />
+          </label>
+        </>
+      )}
+      <div className="artifact-review-actions">
+        <button type="button" onClick={onApprove} disabled={disabled}>
+          确认放行
+        </button>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={hasReviewItems ? rejectSelectedItems : () => onReject()}
+          disabled={disabled}
+        >
+          {hasReviewItems ? "退回选中文件" : "退回重做"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
 function TemporaryAgentDetailDialog({
   proposal,
   onClose,
@@ -2784,12 +3268,14 @@ function MessageBody({ text, title }: { text: string; title: string }) {
 }
 export function RunsPage() {
   const queryClient = useQueryClient();
+  const compactChatViewport = useCompactChatViewport();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
   const runListItems = runs.data ?? [];
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
+  const skillsCatalog = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
   const [agentIds, setAgentIds] = useState<string[]>([]);
@@ -2806,8 +3292,8 @@ export function RunsPage() {
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [skillUploadConflict, setSkillUploadConflict] = useState<SkillUploadConflict | null>(null);
-  const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
-  const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
+  const [attachmentDrafts, setAttachmentDrafts] = useState<ChatAttachmentDraft[]>([]);
+  const [attachmentUploadCount, setAttachmentUploadCount] = useState(0);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
@@ -2817,6 +3303,7 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
+  const [artifactReviewFeedback, setArtifactReviewFeedback] = useState("");
   const [scheduleApproval, setScheduleApproval] = useState<{
     runId: string;
     proposal: ScheduleProposal;
@@ -2830,9 +3317,18 @@ export function RunsPage() {
   } | null>(null);
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
   const chatFooterRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
+  const referencedCapabilities = useMemo(() => referencedCapabilitiesFromText(message), [message]);
+  const capabilityMentionTrigger = useMemo(() => capabilityMentionTriggerFromText(message), [message]);
+  const capabilityReferenceSuggestions = useMemo(
+    () => capabilitySuggestionsForTrigger(capabilityMentionTrigger, skillsCatalog.data),
+    [capabilityMentionTrigger, skillsCatalog.data],
+  );
+  const hasCapabilityReferences =
+    referencedCapabilities.skills.length > 0 || referencedCapabilities.plugins.length > 0 || referencedCapabilities.files.length > 0;
 
   const selectedRun = useQuery({
     queryKey: ["run", selectedRunId],
@@ -2844,6 +3340,7 @@ export function RunsPage() {
       return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
     },
   });
+  const selectedArtifactReviewApproval = artifactReviewApprovalFromRunDetail(selectedRun.data);
 
   const referenceConversation = useQuery({
     queryKey: ["conversation", trimmedReferenceConversationId],
@@ -2912,8 +3409,7 @@ export function RunsPage() {
     } else if (
       selectedRun.data &&
       selectedRun.data.status !== "waiting_user_mode" &&
-      modeSelection &&
-      modeSelection.runId !== selectedRun.data.id
+      modeSelection
     ) {
       setModeSelection(null);
     }
@@ -2934,6 +3430,13 @@ export function RunsPage() {
           ? current
           : approval,
       );
+    }
+    const artifactApproval = artifactReviewApprovalFromRunDetail(selectedRun.data);
+    if (artifactApproval) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setOpenClawApproval(null);
     }
     const proposedSchedule = scheduleApprovalFromRunDetail(selectedRun.data);
     if (proposedSchedule && !dismissedScheduleApprovalRunIds.includes(proposedSchedule.runId)) {
@@ -2958,6 +3461,7 @@ export function RunsPage() {
   useEffect(() => {
     setProcessDetailTarget(null);
     setTemporaryAgentDetail(null);
+    setArtifactReviewFeedback("");
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -2993,6 +3497,7 @@ export function RunsPage() {
       const runMessage = (override?.message ?? message).trim();
       const runMode = override?.mode ?? mode;
       const selectedDirectModel = (override?.directModel ?? directModel).trim();
+      const runReferencedCapabilities = referencedCapabilitiesFromText(runMessage);
       return api.createRun({
         message: runMessage,
         mode: runMode,
@@ -3002,8 +3507,12 @@ export function RunsPage() {
         direct_model: runMode === "direct" ? selectedDirectModel : null,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
-        attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
+        attachment_ids: uniqueAttachmentIds(attachmentDrafts),
+        requested_skills: runReferencedCapabilities.skills,
+        requested_plugins: runReferencedCapabilities.plugins,
+        requested_files: runReferencedCapabilities.files,
         skip_evolution_proposal: true,
+        skip_schedule_proposal: override?.skipScheduleProposal === true,
       });
     },
     onSuccess: async (run, override) => {
@@ -3031,8 +3540,7 @@ export function RunsPage() {
           await queryClient.invalidateQueries({ queryKey: ["conversation", continued.conversation_id] });
         }
         setMessage("");
-        setAttachmentDraft(null);
-        setArchiveInstallFile(null);
+        setAttachmentDrafts([]);
         return;
       }
       if (run.openclaw_proposal) {
@@ -3075,8 +3583,7 @@ export function RunsPage() {
         setSubmitNotice(override?.successNotice ?? null);
       }
       setMessage("");
-      setAttachmentDraft(null);
-      setArchiveInstallFile(null);
+      setAttachmentDrafts([]);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
       if (run.conversation_id) {
@@ -3120,13 +3627,99 @@ export function RunsPage() {
     },
   });
 
+  const approveArtifactReview = useMutation({
+    mutationFn: (approval: ArtifactReviewApproval) =>
+      api.approveArtifactReview(approval.runId, approval.approvalId, {
+        version: approval.version,
+      }),
+    onSuccess: async (run) => {
+      setArtifactReviewFeedback("");
+      setSubmitNotice("已确认中间产物，任务会继续进入下一步。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
+    },
+  });
+
+  const rejectArtifactReview = useMutation({
+    mutationFn: ({
+      approval,
+      feedback,
+      rejectedItems,
+    }: {
+      approval: ArtifactReviewApproval;
+      feedback?: string;
+      rejectedItems?: ArtifactReviewRejectedItem[];
+    }) =>
+      api.rejectArtifactReview(approval.runId, approval.approvalId, {
+        version: approval.version,
+        ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+        ...(rejectedItems && rejectedItems.length > 0 ? { rejected_items: rejectedItems } : {}),
+      }),
+    onSuccess: async (run) => {
+      setArtifactReviewFeedback("");
+      setSubmitNotice("已退回中间产物，主 Agent 会按反馈重新生成该阶段。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
+    },
+  });
+
+  const approveArtifactReviewFromCard = (approval: ArtifactReviewApproval) => {
+    setSubmitNotice("已选择确认放行，正在继续任务。");
+    approveArtifactReview.mutate(approval);
+  };
+
+  const rejectArtifactReviewFromCard = (
+    approval: ArtifactReviewApproval,
+    payload?: ArtifactReviewRejectPayload,
+  ) => {
+    if (approval.reviewItems.length > 0) {
+      const rejectedItems = payload?.rejectedItems ?? [];
+      if (rejectedItems.length === 0) {
+        setSubmitNotice("请先在需要重做的文件上选择“退回”，并填写对应原因。");
+        return;
+      }
+      if (rejectedItems.some((item) => !item.feedback.trim())) {
+        setSubmitNotice("逐文件退回时，每个被退回文件都需要单独填写问题。");
+        return;
+      }
+      setSubmitNotice("已选择退回指定文件，正在提交反馈。");
+      rejectArtifactReview.mutate({ approval, rejectedItems });
+      return;
+    }
+    const feedback = artifactReviewFeedback.trim();
+    if (!feedback) {
+      setSubmitNotice("退回中间产物时需要写明问题，主 Agent 会用这段反馈重新生成。");
+      return;
+    }
+    setSubmitNotice("已选择退回重做，正在提交反馈。");
+    rejectArtifactReview.mutate({ approval, feedback });
+  };
+
   const cancelScheduleApproval = () => {
-    if (!scheduleApproval) return;
+    const approval = scheduleApproval;
+    if (!approval) return;
     setDismissedScheduleApprovalRunIds((current) =>
-      current.includes(scheduleApproval.runId) ? current : [...current, scheduleApproval.runId],
+      current.includes(approval.runId) ? current : [...current, approval.runId],
     );
     setScheduleApproval(null);
-    setSubmitNotice("已取消计划任务创建，后续消息会继续作为普通对话处理。");
+    setSubmitNotice("已取消计划任务创建，正在按普通对话继续处理原消息。");
+    void api
+      .cancelRun(approval.runId)
+      .catch(() => undefined)
+      .then(() =>
+        createRun.mutate({
+          message: approval.proposal.message,
+          mode: approval.proposal.mode as RunMode,
+          skipScheduleProposal: true,
+          successNotice: "已取消计划任务创建，原消息已按普通对话继续处理。",
+        }),
+      );
   };
   const createScheduleFromProposal = useMutation({
     mutationFn: () => {
@@ -3158,6 +3751,10 @@ export function RunsPage() {
   const stopCurrentRun = useMutation({
     mutationFn: (runId: string) => api.cancelRun(runId),
     onSuccess: async (run) => {
+      setModeSelection((current) => (current?.runId === run.id ? null : current));
+      setTemporaryApproval((current) => (current?.runId === run.id ? null : current));
+      setScheduleApproval((current) => (current?.runId === run.id ? null : current));
+      setOpenClawApproval((current) => (current?.runId === run.id ? null : current));
       setSubmitNotice("已停止当前运行。你可以继续发送新消息。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
@@ -3296,16 +3893,47 @@ export function RunsPage() {
   });
 
   const uploadSkillArchive = useMutation({
-    mutationFn: ({ file, strategy }: SkillUploadRequest) => api.uploadSkillArchive(file, strategy),
-    onSuccess: (result, { file }) => {
-      setArchiveInstallFile(null);
+    mutationFn: async ({ file, files, strategy }: SkillUploadRequest): Promise<SkillUploadBatchResult> => {
+      const uploadFiles = files?.length ? files : file ? [file] : [];
+      if (uploadFiles.length === 0) throw new Error("skill archive file is unavailable");
+      const uploads: SkillArchiveUpload[] = [];
+      for (const uploadFile of uploadFiles) {
+        try {
+          uploads.push(await api.uploadSkillArchive(uploadFile, strategy));
+        } catch (error) {
+          throw Object.assign(error instanceof Error ? error : new Error("Skill archive upload failed"), {
+            skillArchiveFile: uploadFile,
+          });
+        }
+      }
+      return {
+        files: uploadFiles,
+        skills: uploads.flatMap((upload) => upload.items),
+        skipped: uploads.flatMap((upload) => upload.skipped),
+      };
+    },
+    onSuccess: (result) => {
       setSkillUploadConflict(null);
-      setSkillInstallCandidate({ fileName: file.name, skills: result.items, skipped: result.skipped, status: "scanned" });
+      setAttachmentDrafts((current) =>
+        current.filter((draft) => !result.files.some((file) => matchesDraftFile(draft, file))),
+      );
+      setSkillInstallCandidate({
+        fileName: result.files.length === 1 ? result.files[0].name : `${result.files.length} 个 Skill 压缩包`,
+        skills: result.skills,
+        skipped: result.skipped,
+        status: "scanned",
+      });
       setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
-    onError: (error, { file }) => {
-      const conflict = skillUploadConflictFromError(error, file);
+    onError: (error, { file, files }) => {
+      const failedFile =
+        (error as { skillArchiveFile?: File }).skillArchiveFile ?? file ?? files?.[0];
+      if (!failedFile) {
+        setSubmitNotice("Skill 扫描失败。请重新上传压缩包后再试。");
+        return;
+      }
+      const conflict = skillUploadConflictFromError(error, failedFile);
       if (conflict) {
         setSkillInstallCandidate(null);
         setSkillUploadConflict(conflict);
@@ -3314,12 +3942,18 @@ export function RunsPage() {
       }
       setSkillUploadConflict(null);
       setSkillInstallCandidate(null);
-      setAttachmentDraft((current) =>
-        current ?? {
-          fileName: file.name,
-          size: file.size,
-          kind: isArchiveFileName(file.name) ? "archive" : "context",
-        },
+      setAttachmentDrafts((current) =>
+        current.some((draft) => matchesDraftFile(draft, failedFile))
+          ? current
+          : [
+              ...current,
+              {
+                fileName: failedFile.name,
+                size: failedFile.size,
+                kind: isArchiveFileName(failedFile.name) ? "archive" : "context",
+                file: failedFile,
+              },
+            ],
       );
       setSubmitNotice(
         error instanceof ApiError && error.code === "invalid_skill_package"
@@ -3351,29 +3985,38 @@ export function RunsPage() {
             ? "archive"
             : "context";
       setSkillInstallCandidate(null);
-      setAttachmentDraft({ fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, attachment });
-      setArchiveInstallFile(kind === "archive" ? file : null);
+      setAttachmentDrafts((current) => [
+        ...current.filter((draft) => !matchesDraftFile(draft, file)),
+        { fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, file, attachment },
+      ]);
       setSubmitNotice(
         kind === "archive"
-          ? "压缩包已上传。请在输入框说明它是 Skill、代码审查材料，还是普通任务附件。"
+          ? "压缩包已添加到本轮消息；输入安装意图会进入 Skill 扫描。"
           : kind === "image"
-            ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
-            : "附件已上传。提交任务后会作为附件引用进入运行上下文。",
+            ? "图片已添加到本轮消息。"
+            : "附件已添加到本轮消息。",
       );
     },
+    onSettled: () => setAttachmentUploadCount((current) => Math.max(0, current - 1)),
   });
 
   function handleAttachmentUpload(fileList: FileList | null) {
-    const file = fileList?.item(0);
-    if (!file) return;
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0) return;
     uploadAttachment.reset();
     uploadSkillArchive.reset();
     setSubmitNotice(null);
-    setAttachmentDraft(null);
     setSkillInstallCandidate(null);
     setSkillUploadConflict(null);
-    setArchiveInstallFile(isArchiveFileName(file.name) ? file : null);
-    uploadAttachment.mutate(file);
+    setAttachmentUploadCount((current) => current + files.length);
+    for (const file of files) {
+      uploadAttachment.mutate(file);
+    }
+  }
+
+  function insertCapabilitySuggestion(suggestion: CapabilityReferenceSuggestion) {
+    setMessage((current) => insertCapabilityReferenceToken(current, capabilityMentionTrigger, suggestion.token));
+    window.setTimeout(() => composerInputRef.current?.focus(), 0);
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -3381,6 +4024,54 @@ export function RunsPage() {
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    if (utf8ByteLength(trimmed) > MAX_RUN_MESSAGE_BYTES) {
+      setSubmitNotice("这段消息太长，已超过 64KB。请作为附件上传，或拆成几轮发送后再继续。");
+      return;
+    }
+    if (skillUploadConflict) {
+      const strategy = skillUploadConflictStrategyFromText(trimmed);
+      if (!strategy) {
+        setSubmitNotice("请回复 1/覆盖当前版本，或回复 2/保存为新版本。");
+        return;
+      }
+      setMessage("");
+      setSubmitNotice(strategy === "overwrite" ? "正在覆盖当前 Skill 版本。" : "正在保存为一个新的 Skill 版本。");
+      uploadSkillArchive.mutate({
+        file: skillUploadConflict.file,
+        strategy,
+      });
+      return;
+    }
+    if (skillInstallCandidate?.status === "scanned" && hasSkillInstallApprovalIntent(trimmed)) {
+      setMessage("");
+      setSubmitNotice("已收到 Skill 安装确认，正在启用扫描通过的 Skill。");
+      approveUploadedSkill.mutate();
+      return;
+    }
+    if (selectedArtifactReviewApproval) {
+      const choice = parseChoiceText(trimmed, [
+        { value: "approve", label: "确认放行", aliases: ["同意", "确认", "通过", "放行", "approve", "yes"] },
+        { value: "reject", label: "退回重做", aliases: ["退回", "拒绝", "不通过", "重做", "重新生成", "reject", "revise", "no"] },
+      ]);
+      if (!choice) {
+        setSubmitNotice("请回复 1/确认放行，或回复 2 加上退回意见。");
+        return;
+      }
+      setMessage("");
+      if (choice.option.value === "approve") {
+        approveArtifactReviewFromCard(selectedArtifactReviewApproval);
+        return;
+      }
+      const feedback = choice.note || artifactReviewFeedback.trim();
+      if (!feedback) {
+        setSubmitNotice("退回重做时需要写明问题，例如：2 角色脸型和服装不一致，重新生成完整设定表。");
+        return;
+      }
+      setArtifactReviewFeedback(feedback);
+      setSubmitNotice("已收到退回意见，正在提交给主 Agent。");
+      rejectArtifactReview.mutate({ approval: selectedArtifactReviewApproval, feedback });
+      return;
+    }
     if (temporaryApproval) {
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "同意临时加入", aliases: ["同意", "接受", "加入", "approve", "yes"] },
@@ -3468,6 +4159,17 @@ export function RunsPage() {
         return;
       }
     }
+    const skillArchiveFiles = archiveDraftFiles(attachmentDrafts);
+    if (skillArchiveFiles.length > 0 && hasSkillInstallIntent(effectiveMessage)) {
+      setMessage("");
+      setSubmitNotice(
+        skillArchiveFiles.length === 1
+          ? "已识别为 Skill 安装请求，正在扫描压缩包。"
+          : `已识别为 Skill 安装请求，正在扫描 ${skillArchiveFiles.length} 个压缩包。`,
+      );
+      uploadSkillArchive.mutate({ files: skillArchiveFiles });
+      return;
+    }
     if (effectiveMode === "direct") {
       if (savedModels.length === 0) {
         setSubmitNotice("还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。");
@@ -3517,6 +4219,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
+    setAttachmentDrafts([]);
+    setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setProcessDetailTarget(null);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
@@ -3538,6 +4243,9 @@ export function RunsPage() {
     setScheduleApproval(null);
     setOpenClawApproval(null);
     setModeSelection(null);
+    setAttachmentDrafts([]);
+    setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setProcessDetailTarget(null);
     setSubmitNotice(`已按原思路新建分支：新对话会读取 ${trimmedSourceConversationId} 作为参考上下文。`);
   }
@@ -3561,6 +4269,9 @@ export function RunsPage() {
   const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
   const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
+  const artifactReviewApprovalVisibleInMessages =
+    !!selectedArtifactReviewApproval &&
+    messages.some((item) => item.id === `${selectedArtifactReviewApproval.runId}-artifact-review-approval`);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
@@ -3586,6 +4297,8 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
+  const attachmentUploadBusy = attachmentUploadCount > 0 || uploadAttachment.isPending;
+  const skillScanBusy = uploadSkillArchive.isPending;
   const refreshedRunForProcessDetail = processDetailTarget
     ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
       (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
@@ -3673,7 +4386,7 @@ export function RunsPage() {
       observer.disconnect();
       window.removeEventListener("resize", updateFooterHeight);
     };
-  }, [activeProcessDockRun, attachmentDraft, showModeEntry, submitNotice, skillInstallCandidate, skillUploadConflict]);
+  }, [activeProcessDockRun, attachmentDrafts, showModeEntry, submitNotice, skillInstallCandidate, skillUploadConflict]);
 
   if (runs.isLoading) {
     return <p>正在加载对话...</p>;
@@ -3909,6 +4622,16 @@ export function RunsPage() {
                 </ol>
               </article>
             ) : null}
+            {selectedArtifactReviewApproval && !artifactReviewApprovalVisibleInMessages ? (
+              <ArtifactReviewApprovalCard
+                approval={selectedArtifactReviewApproval}
+                feedback={artifactReviewFeedback}
+                onFeedbackChange={setArtifactReviewFeedback}
+                onApprove={() => approveArtifactReviewFromCard(selectedArtifactReviewApproval)}
+                onReject={(payload) => rejectArtifactReviewFromCard(selectedArtifactReviewApproval, payload)}
+                disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
+              />
+            ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
               <TemporaryAgentRecruitmentCard
                 proposal={temporaryApproval.proposal}
@@ -3939,7 +4662,18 @@ export function RunsPage() {
               const shouldDockProcess = item.id.endsWith("-request") && item.run?.id === activeProcessDockRun?.id;
               return (
                 <Fragment key={item.id}>
-                  {item.temporaryAgentProposal ? (
+                  {item.artifactReviewApproval ? (
+                    <ArtifactReviewApprovalCard
+                      approval={item.artifactReviewApproval}
+                      feedback={artifactReviewFeedback}
+                      onFeedbackChange={setArtifactReviewFeedback}
+                      onApprove={() => approveArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval)}
+                      onReject={(payload) =>
+                        rejectArtifactReviewFromCard(item.artifactReviewApproval as ArtifactReviewApproval, payload)
+                      }
+                      disabled={approveArtifactReview.isPending || rejectArtifactReview.isPending}
+                    />
+                  ) : item.temporaryAgentProposal ? (
                     <TemporaryAgentRecruitmentCard
                       proposal={item.temporaryAgentProposal}
                       approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
@@ -3994,6 +4728,7 @@ export function RunsPage() {
                 onOpen={setProcessDetailTarget}
                 agentNames={agentNameMap}
                 mainAgentModelName={mainAgentModelName}
+                compact={compactChatViewport}
               />
             </div>
           ) : null}
@@ -4004,6 +4739,12 @@ export function RunsPage() {
             ) : null}
             {approveTemporaryAgent.isError ? (
               <p role="alert">{formatApiError(approveTemporaryAgent.error, "临时 Agent 确认失败")}</p>
+            ) : null}
+            {approveArtifactReview.isError ? (
+              <p role="alert">{formatApiError(approveArtifactReview.error, "中间产物确认失败")}</p>
+            ) : null}
+            {rejectArtifactReview.isError ? (
+              <p role="alert">{formatApiError(rejectArtifactReview.error, "中间产物退回失败")}</p>
             ) : null}
             {reviseTemporaryAgent.isError ? (
               <p role="alert">{formatApiError(reviseTemporaryAgent.error, "临时 Agent 重规失败")}</p>
@@ -4071,7 +4812,12 @@ export function RunsPage() {
                     <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
                       {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
                     </button>
-                    <button type="button" className="secondary-action" disabled={createScheduleFromProposal.isPending} onClick={cancelScheduleApproval}>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      disabled={createScheduleFromProposal.isPending || createRun.isPending}
+                      onClick={cancelScheduleApproval}
+                    >
                       取消计划
                     </button>
                   </div>
@@ -4098,8 +4844,8 @@ export function RunsPage() {
                 {skillInstallCandidate.skills.some((skill) => skill.requested_permissions.length > 0) ? (
                   <ul>
                     {skillInstallCandidate.skills.flatMap((skill) =>
-                      skill.requested_permissions.map((permission) => (
-                        <li key={`${skill.id}-${permission}`}>
+                      skill.requested_permissions.map((permission, permissionIndex) => (
+                        <li key={`${skill.id}-${permission}-${permissionIndex}`}>
                           {skill.name}: {permission}
                         </li>
                       )),
@@ -4120,8 +4866,24 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
-            {attachmentDraft ? (
-              <aside className="composer-attachment-card" role="status" aria-label="附件草稿">
+            {attachmentDrafts.length > 1 && archiveDraftFiles(attachmentDrafts).length > 1 ? (
+              <aside className="composer-attachment-card" role="status" aria-label="批量 Skill 安装">
+                <div>
+                  <span className="eyebrow">多个压缩包</span>
+                  <strong>{archiveDraftFiles(attachmentDrafts).length} 个可扫描 Skill 压缩包</strong>
+                  <small>也可以直接输入“安装这些 skill”</small>
+                </div>
+                <button
+                  type="button"
+                  disabled={skillScanBusy}
+                  onClick={() => uploadSkillArchive.mutate({ files: archiveDraftFiles(attachmentDrafts) })}
+                >
+                  {skillScanBusy ? "扫描中..." : "全部作为 Skill 扫描"}
+                </button>
+              </aside>
+            ) : null}
+            {attachmentDrafts.map((attachmentDraft) => (
+              <aside className="composer-attachment-card" role="status" aria-label="附件草稿" key={`${attachmentDraft.fileName}-${attachmentDraft.size}`}>
                 <div>
                   <span className="eyebrow">
                     {attachmentDraft.kind === "archive"
@@ -4135,22 +4897,22 @@ export function RunsPage() {
                 </div>
                 <p>
                   {attachmentDraft.kind === "archive"
-                    ? "压缩包已作为附件保存。请在对话里说明它是 Skill、代码审查材料，还是普通任务文件。"
+                    ? "压缩包已作为附件保存。输入安装意图会转入 Skill 扫描；作为普通资料提交后，后续同会话也会保留附件清单上下文。"
                     : attachmentDraft.kind === "image"
-                      ? "图片已选中。当前先记录附件，启用多模态链路后可交给视觉模型识别。"
-                      : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
+                      ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
+                      : "附件已上传。提交任务后会作为附件引用进入运行上下文。"}
                 </p>
-                {attachmentDraft.kind === "archive" && archiveInstallFile ? (
+                {attachmentDraft.kind === "archive" && attachmentDraft.file ? (
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
-                    onClick={() => uploadSkillArchive.mutate({ file: archiveInstallFile })}
+                    disabled={skillScanBusy}
+                    onClick={() => uploadSkillArchive.mutate({ file: attachmentDraft.file })}
                   >
-                    {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
+                    {skillScanBusy ? "扫描中..." : "作为 Skill 扫描"}
                   </button>
                 ) : null}
               </aside>
-            ) : null}
+            ))}
             {skillUploadConflict ? (
               <aside className="composer-attachment-card" role="alert" aria-label="Skill 版本选择">
                 <div>
@@ -4162,7 +4924,7 @@ export function RunsPage() {
                 <div className="composer-card-actions">
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
+                    disabled={skillScanBusy}
                     onClick={() =>
                       uploadSkillArchive.mutate({
                         file: skillUploadConflict.file,
@@ -4174,7 +4936,7 @@ export function RunsPage() {
                   </button>
                   <button
                     type="button"
-                    disabled={uploadSkillArchive.isPending}
+                    disabled={skillScanBusy}
                     onClick={() =>
                       uploadSkillArchive.mutate({
                         file: skillUploadConflict.file,
@@ -4188,12 +4950,41 @@ export function RunsPage() {
               </aside>
             ) : null}
             <textarea
+              ref={composerInputRef}
               value={message}
               onChange={(event) => setMessage(event.target.value)}
               placeholder="输入消息..."
               rows={1}
               required
             />
+            {capabilityReferenceSuggestions.length > 0 ? (
+              <div className="composer-reference-suggestions" role="listbox" aria-label="能力引用建议">
+                {capabilityReferenceSuggestions.map((suggestion) => (
+                  <button
+                    type="button"
+                    key={`${suggestion.kind}-${suggestion.name}`}
+                    aria-label={`${suggestion.kind === "skill" ? "引用 Skill" : "引用插件"} ${suggestion.name}`}
+                    onClick={() => insertCapabilitySuggestion(suggestion)}
+                  >
+                    <strong>{suggestion.kind === "skill" ? `@skill:${suggestion.name}` : `$plugin:${suggestion.name}`}</strong>
+                    <small>{suggestion.detail}</small>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {hasCapabilityReferences ? (
+              <div className="composer-capability-references" role="status" aria-label="已引用能力">
+                {referencedCapabilities.skills.map((skill) => (
+                  <span key={`skill-${skill}`}>Skill {skill}</span>
+                ))}
+                {referencedCapabilities.plugins.map((plugin) => (
+                  <span key={`plugin-${plugin}`}>插件 {plugin}</span>
+                ))}
+                {referencedCapabilities.files.map((file) => (
+                  <span key={`file-${file}`}>文件 {file}</span>
+                ))}
+              </div>
+            ) : null}
             <div className="composer-actions">
               <div className="composer-status-line" role="status">
                 <span>
@@ -4216,8 +5007,9 @@ export function RunsPage() {
                   <input
                     aria-label="上传文件或 Skill 压缩包"
                     type="file"
+                    multiple
                     accept={ATTACHMENT_ACCEPT}
-                    disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                    disabled={skillScanBusy || attachmentUploadBusy}
                     onChange={(event) => {
                       handleAttachmentUpload(event.currentTarget.files);
                       event.currentTarget.value = "";
@@ -4259,15 +5051,16 @@ export function RunsPage() {
                 <button
                   type="submit"
                   className="composer-send-button"
-                  aria-label={uploadAttachment.isPending ? "上传中..." : createRun.isPending ? "发送中..." : "发送"}
+                  aria-label={attachmentUploadBusy ? "上传中..." : skillScanBusy ? "扫描中..." : createRun.isPending ? "发送中..." : "发送"}
                   disabled={
                     createRun.isPending ||
-                    uploadAttachment.isPending ||
+                    attachmentUploadBusy ||
+                    skillScanBusy ||
                     message.trim().length === 0 ||
                     Boolean(directSendBlockedReason)
                   }
                 >
-                  {createRun.isPending || uploadAttachment.isPending ? "…" : "↑"}
+                  {createRun.isPending || attachmentUploadBusy || skillScanBusy ? "…" : "↑"}
                 </button>
               </div>
             </div>
@@ -4275,8 +5068,8 @@ export function RunsPage() {
               <p className="field-help" role="status">{directSendBlockedReason}</p>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
-            {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
-            {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
+            {skillScanBusy ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
+            {attachmentUploadBusy ? <p role="status">正在上传附件...</p> : null}
             {uploadSkillArchive.isError && !skillUploadConflict ? (
               <p className="field-help" role="status">
                 {formatApiError(uploadSkillArchive.error, "Skill 扫描失败")}

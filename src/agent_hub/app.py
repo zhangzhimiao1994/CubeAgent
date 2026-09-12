@@ -116,6 +116,7 @@ from agent_hub.routing.types import (
 )
 from agent_hub.runs.attachments import FileSystemAttachmentArtifactLoader
 from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.resource_context import ResourceContextArtifactLoader
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
@@ -899,9 +900,14 @@ def create_app(
                 if active_runtime_registry is None:
                     assert active_redis is not None
                     assert active_secret_service is not None
+                    workspace_read_root = (
+                        configured.workspace_read_roots[0]
+                        if configured.workspace_read_roots
+                        else configured.attachment_store_dir
+                    )
                     runtime_capabilities = RuntimeCapabilityGateway(
                         skill_store_dir=configured.skill_store_dir,
-                        workspace_root=configured.attachment_store_dir,
+                        workspace_root=workspace_read_root,
                         generated_artifact_dir=configured.generated_artifact_dir,
                         multimedia_generation_executor=getattr(
                             application.state,
@@ -952,6 +958,16 @@ def create_app(
                     runtime_token_budget=configured.runtime_token_budget,
                     attachment_artifact_loader=FileSystemAttachmentArtifactLoader(
                         configured.attachment_store_dir
+                    ),
+                    resource_context_loader=ResourceContextArtifactLoader(
+                        skill_store_dir=configured.skill_store_dir,
+                        workspace_roots=configured.workspace_read_roots,
+                        list_skills=cast(
+                            admin.AdminResourceService,
+                            admin_resource_service
+                            if admin_resource_service is not None
+                            else application.state.admin_resource_service,
+                        ).list_skills,
                     ),
                     main_agent_context_window_getter=_MainAgentContextWindowGetter(
                         cast(

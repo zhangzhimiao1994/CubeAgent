@@ -62,7 +62,7 @@ fi
 manager="$(detect_manager /etc/os-release)"
 packages=(ca-certificates curl openssl tar gzip coreutils nodejs npm)
 if [[ "$manager" == "apt" ]]; then
-  packages+=(python3 python3-venv python3-pip build-essential xz-utils)
+  packages+=(python3 python3-venv python3-pip build-essential xz-utils ffmpeg)
   if [[ "$LOCAL_DB" -eq 1 ]]; then
     packages+=(postgresql postgresql-client)
   else
@@ -136,6 +136,29 @@ run_package_install() {
   fi
 }
 
+install_ffmpeg() {
+  if command -v ffmpeg >/dev/null 2>&1; then
+    return
+  fi
+  if [[ "$manager" == "apt" ]]; then
+    echo "ffmpeg is required for compose_video but was not installed" >&2
+    return 1
+  fi
+  if [[ "$manager" == "dnf" ]]; then
+    if dnf install -y ffmpeg; then
+      return
+    fi
+    if dnf install -y ffmpeg-free; then
+      return
+    fi
+    cat >&2 <<'EOF'
+ffmpeg is required for compose_video but was not available from enabled dnf repositories.
+Enable a repository that provides ffmpeg for Rocky/Alma 9, or deploy Agent Hub in Docker mode.
+EOF
+    return 1
+  fi
+}
+
 install_with_mirror_fallback() {
   if [[ "$mirror_mode" == "china" ]]; then
     configure_china_package_mirror
@@ -162,3 +185,4 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 install_with_mirror_fallback
+install_ffmpeg

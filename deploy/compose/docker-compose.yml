@@ -87,6 +87,7 @@ services:
       test: ["CMD", "agent-hub-healthcheck"]
       interval: 30s
       timeout: 5s
+      start_period: 60s
       retries: 3
 
   worker:

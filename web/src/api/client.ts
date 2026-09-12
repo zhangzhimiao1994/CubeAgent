@@ -614,8 +614,10 @@ const RunEventSchema = z.object({
   step_id: z.string().nullable().optional(),
   action: z.string().nullable().optional(),
   decision: z.string().nullable().optional(),
+  approval_id: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
   artifact: RunArtifactSchema.nullable().optional(),
+  artifacts: z.array(RunArtifactSchema).optional(),
 });
 
 const HermesInjectedMemorySchema = z.object({
@@ -647,6 +649,7 @@ const RoutingDecisionSchema = z
   .passthrough();
 
 const RunDetailSchema = RunListItemSchema.extend({
+  version: z.number(),
   request: z.string(),
   events: z.array(RunEventSchema),
   artifacts: z.array(RunArtifactSchema),
@@ -1574,8 +1577,12 @@ export const api = {
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
     attachment_ids?: string[];
+    requested_skills?: string[];
+    requested_plugins?: string[];
+    requested_files?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;
+    skip_schedule_proposal?: boolean;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
@@ -1672,6 +1679,28 @@ export const api = {
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/approve-temporary-agent`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  approveArtifactReview(
+    id: string,
+    approvalId: string,
+    payload: { version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/artifact-reviews/${encodeURIComponent(approvalId)}/approve`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  rejectArtifactReview(
+    id: string,
+    approvalId: string,
+    payload: { version: number; feedback?: string; rejected_items?: Array<{ id: string; feedback: string }> },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/artifact-reviews/${encodeURIComponent(approvalId)}/reject`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

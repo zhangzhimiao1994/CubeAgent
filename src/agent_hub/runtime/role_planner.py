@@ -125,7 +125,7 @@ class RolePlanningRequest:
     model_overrides: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _require_text("task", self.task)
+        task = _normalize_task_text(self.task, label="role planning")
         if type(self.mode) is not TaskMode or self.mode is TaskMode.AUTO:
             raise ValueError("mode must be an executable task mode")
         if type(self.profile) is not TaskProfile:
@@ -144,6 +144,7 @@ class RolePlanningRequest:
                 for role_id, model in self.model_overrides.items()
             }
         )
+        object.__setattr__(self, "task", task)
         object.__setattr__(self, "requested_skills", requested_skills)
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "model_overrides", overrides)
@@ -216,6 +217,25 @@ class RolePlanner:
         else:
             role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
+        if request.mode is not TaskMode.DISCUSS and _is_script_first_media_generation_request(
+            request.task
+        ):
+            role_specs = tuple(
+                spec
+                for spec in catalog_specs
+                if spec[0]
+                in {
+                    "copywriter",
+                    "multimedia_generator",
+                }
+            )
+            roles = tuple(_assignment(spec, request) for spec in role_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
         if request.mode is not TaskMode.DISCUSS and _is_standalone_multimedia_generation_request(
             request.task
         ):
@@ -228,6 +248,17 @@ class RolePlanner:
                 roles=roles,
             )
         role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
+        if request.mode is not TaskMode.DISCUSS and _is_final_media_delivery_request(request.task):
+            role_specs = tuple(
+                spec
+                for spec in role_specs
+                if spec[0]
+                in {
+                    "director",
+                    "video_compositor",
+                    "multimedia_generator",
+                }
+            )
         roles = tuple(_assignment(spec, request) for spec in role_specs)
         return RolePlan(
             mode=request.mode,
@@ -882,6 +913,7 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "copywriter": (
             "文案",
             "脚本",
+            "剧本",
             "短剧",
             "标题",
             "口播",
@@ -905,6 +937,19 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "图生视频",
             "edit",
             "caption",
+        ),
+        "video_compositor": (
+            "compose_video",
+            "合成",
+            "合并",
+            "拼接",
+            "成片",
+            "mp4",
+            "merge",
+            "stitch",
+            "concatenate",
+            "combine clips",
+            "downloadable vertical reel",
         ),
         "document_writer": (
             "word",
@@ -962,6 +1007,16 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "图生视频",
             "生成图片",
             "生成视频",
+            "参考图",
+            "人物参考图",
+            "角色参考图",
+            "定妆图",
+            "定妆照",
+            "人设图",
+            "角色立绘",
+            "人物立绘",
+            "合照",
+            "同框",
         ),
         "content_editor": ("润色", "校对", "编辑", "文案", "脚本", "改写", "polish", "edit"),
         "economic_analyst": ("经济", "市场", "需求", "定价", "宏观", "商业回报", "roi", "market"),
@@ -989,8 +1044,22 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
     requested = set(request.requested_skills)
+    if role_id in {
+        "multimedia_generator",
+        "video_compositor",
+        "video_editor",
+    } and _is_deferred_media_pipeline_request(request.task):
+        return False
     if role_id == "multimedia_generator":
-        return _is_multimedia_generation_request(request.task)
+        if _requires_media_generation_before_composition(request.task):
+            return True
+        return _is_multimedia_generation_request(request.task) and not _is_video_composition_request(
+            request.task
+        )
+    if role_id == "video_compositor":
+        return _is_video_composition_request(
+            request.task
+        ) or _requires_media_generation_before_composition(request.task)
     if role_id == "document_writer":
         return _is_document_generation_request(request.task)
     if role_id == "presentation_designer":
@@ -1047,6 +1116,7 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
         for keyword in (
             "文案",
             "脚本",
+            "剧本",
             "标题",
             "口播",
             "短剧",
@@ -1118,6 +1188,16 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "生成图片",
     "生成一张图",
     "生成一张图片",
+    "生成角色参考图",
+    "生成人物参考图",
+    "生成定妆图",
+    "生成定妆照",
+    "生成人设图",
+    "生成角色立绘",
+    "生成人物立绘",
+    "生成合照",
+    "生成同框合照",
+    "生成双人照",
     "生成图像",
     "生成视频",
     "制作视频",
@@ -1135,16 +1215,30 @@ _MULTIMEDIA_GENERATION_TERMS = (
     "做一张海报",
     "做一张封面",
     "做一张设定板",
+    "做一张角色参考图",
+    "做一张人物参考图",
+    "做一张定妆图",
+    "做一张定妆照",
+    "做一张人设图",
+    "做一张角色立绘",
+    "做一张合照",
     "做一张概念图",
     "做一张渲染图",
     "做成动画",
     "做成成片",
     "做成短片",
+    "剪辑成片",
+    "剪成片",
     "出一张图",
     "出一张图片",
     "出一张海报",
     "出一张封面",
     "出一张概念图",
+    "出一张角色参考图",
+    "出一张人物参考图",
+    "出一张定妆图",
+    "出一张定妆照",
+    "出一张合照",
     "出图",
     "绘制图片",
     "绘制插画",
@@ -1177,6 +1271,8 @@ _MULTIMEDIA_MEDIA_TERMS = (
     "poster",
     "cover image",
     "concept art",
+    "character model sheet",
+    "model sheet",
     "storyboard",
     "sticker",
     "stickers",
@@ -1206,7 +1302,29 @@ _MULTIMEDIA_MEDIA_TERMS = (
     "概念图",
     "设定图",
     "设定板",
+    "角色参考设定表",
+    "角色参考图",
+    "人物参考图",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
+    "角色定妆照",
+    "定妆图",
+    "角色设定表",
     "角色设定",
+    "角色设定图",
+    "人设图",
+    "角色立绘",
+    "人物立绘",
+    "形象设定图",
+    "造型设定图",
+    "三视图",
+    "合照",
+    "同框",
+    "双人照",
+    "定妆照",
+    "设定表",
     "图片版",
     "分镜图",
     "分镜",
@@ -1235,11 +1353,25 @@ _MULTIMEDIA_MEDIA_TERMS = (
 )
 
 _MULTIMEDIA_GENERATION_NEGATIONS = (
+    "只规划",
+    "仅规划",
+    "规划流程",
+    "只出方案",
+    "仅出方案",
     "不需要",
     "无需",
     "不要",
     "不用",
     "暂不",
+    "不成片",
+    "不输出成片",
+    "不生成成片",
+    "不生成最终成片",
+    "不剪辑成片",
+    "plan only",
+    "planning only",
+    "only plan",
+    "do not compose",
     "not need",
     "do not",
     "don't",
@@ -1627,6 +1759,341 @@ _PROJECT_PACKAGE_GENERATION_NEGATIONS = (
 )
 
 
+_VIDEO_COMPOSITION_ACTION_TERMS = (
+    "compose_video",
+    "compose video",
+    "merge",
+    "stitch",
+    "concatenate",
+    "combine clips",
+    "combine videos",
+    "combine generated",
+    "join clips",
+    "edit these videos",
+    "合成",
+    "合并",
+    "拼接",
+    "串成",
+    "剪辑成",
+    "剪成",
+)
+_VIDEO_COMPOSITION_DELIVERY_TERMS = (
+    "downloadable",
+    "render",
+    "export",
+    "final mp4",
+    "final video",
+    "成片",
+    "导出",
+    "输出",
+)
+_VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS = (
+    "existing clip",
+    "existing clips",
+    "existing video",
+    "existing videos",
+    "existing image",
+    "existing images",
+    "approved artifact",
+    "approved artifacts",
+    "generated clip",
+    "generated clips",
+    "generated video",
+    "generated videos",
+    "generated image",
+    "generated images",
+    "source clip",
+    "source clips",
+    "source video",
+    "source videos",
+    "artifact",
+    "artifacts",
+    "storage_key",
+    "clip",
+    "clips",
+    "still",
+    "stills",
+    "素材",
+    "资产",
+    "现有素材",
+    "现有视频",
+    "现有图片",
+    "已有素材",
+    "已有视频",
+    "已有图片",
+    "这些素材",
+    "这些视频",
+    "这些图片",
+    "已审核资产",
+    "已审核素材",
+    "审核资产",
+    "审核素材",
+    "生成的视频",
+    "生成的图片",
+    "生成的素材",
+    "子 agent",
+    "子agent",
+)
+_VIDEO_COMPOSITION_MEDIA_TERMS = (
+    "clip",
+    "clips",
+    "video",
+    "videos",
+    "image",
+    "images",
+    "still",
+    "stills",
+    "reel",
+    "mp4",
+    "素材",
+    "资产",
+    "视频",
+    "图片",
+    "图像",
+    "成片",
+    "短片",
+)
+_VIDEO_COMPOSITION_NEGATIONS = (
+    "只规划",
+    "仅规划",
+    "规划流程",
+    "规划一下",
+    "只出方案",
+    "仅出方案",
+    "不成片",
+    "不需要生成成片",
+    "不生成成片",
+    "不需要成片",
+    "不要成片",
+    "无需成片",
+    "不输出成片",
+    "不导出成片",
+    "不生成最终成片",
+    "不剪辑成片",
+    "不需要导出",
+    "不要导出",
+    "无需导出",
+    "plan only",
+    "planning only",
+    "only plan",
+    "do not compose",
+    "do not edit into final",
+    "not generate",
+    "do not generate",
+    "don't generate",
+    "no need to generate",
+    "no downloadable",
+    "without rendering",
+    "do not render",
+)
+
+
+_DEFERRED_MEDIA_PIPELINE_MARKERS = (
+    "后续我",
+    "后续再",
+    "后续要",
+    "后续可以",
+    "后续可能",
+    "以后再",
+    "之后再",
+    "后面再",
+    "未来再",
+    "可能要",
+    "可能会",
+    "计划里保留",
+    "保留",
+    "随时",
+    "暂时不要",
+    "暂时不用",
+    "暂时不",
+    "暂不",
+    "先不",
+    "later",
+    "afterward",
+    "afterwards",
+    "maybe later",
+    "in future",
+)
+_DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS = (
+    "script",
+    "screenplay",
+    "story script",
+    "剧本",
+    "脚本",
+    "故事大纲",
+)
+_DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "storyboard",
+    "compose video",
+    "final video",
+    "角色参考设定表",
+    "角色参考图",
+    "人物参考图",
+    "角色定妆照",
+    "角色设定表",
+    "角色设定图",
+    "定妆参考图",
+    "角色定妆参考图",
+    "定妆设定图",
+    "角色定妆图",
+    "定妆图",
+    "定妆照",
+    "人设图",
+    "角色立绘",
+    "人物立绘",
+    "形象设定图",
+    "造型设定图",
+    "三视图",
+    "合照",
+    "同框",
+    "双人照",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜",
+    "分镜图",
+    "视频",
+    "剪辑",
+    "成片",
+)
+
+
+def _is_deferred_media_pipeline_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    return (
+        any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS)
+        and any(marker in normalized for marker in _DEFERRED_MEDIA_PIPELINE_MARKERS)
+        and any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS)
+    )
+
+
+_SCRIPT_MEDIA_REFERENCE_TERMS = (
+    "based on",
+    "from",
+    "基于",
+    "根据",
+)
+_CONCRETE_SCRIPT_CONTEXT_TERMS = (
+    "from the previous",
+    "previous script",
+    "existing script",
+    "above script",
+    "earlier script",
+    "the script above",
+    "刚才",
+    "上面",
+    "前面",
+    "已有",
+    "现有",
+    "这个剧本",
+    "这个脚本",
+    "这段剧本",
+    "这段脚本",
+    "该剧本",
+    "该脚本",
+    "本剧本",
+    "本脚本",
+    "本会话",
+)
+
+
+def _is_script_first_media_generation_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _has_generation_negation(normalized):
+        return False
+    for clause in _split_semantic_clauses(normalized):
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+            continue
+        if not any(term in clause for term in _SCRIPT_MEDIA_REFERENCE_TERMS):
+            continue
+        if any(term in clause for term in _CONCRETE_SCRIPT_CONTEXT_TERMS):
+            continue
+        return True
+    return False
+
+
+def _is_video_composition_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _explicit_tool_request(normalized, "compose_video", "compose video"):
+        return True
+    has_merge_intent = any(term in normalized for term in _VIDEO_COMPOSITION_ACTION_TERMS)
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS) and not has_merge_intent:
+        return False
+    has_media_context = any(term in normalized for term in _VIDEO_COMPOSITION_MEDIA_TERMS)
+    has_existing_context = any(
+        term in normalized for term in _VIDEO_COMPOSITION_EXISTING_CONTEXT_TERMS
+    )
+    if has_merge_intent and has_media_context:
+        return has_existing_context
+    has_delivery_intent = any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
+    return has_delivery_intent and has_media_context and has_existing_context
+
+
+_MEDIA_GENERATION_BEFORE_COMPOSITION_TERMS = (
+    "先生成",
+    "先制作",
+    "缺少",
+    "素材缺失",
+    "镜头素材",
+    "镜头视频",
+    "生成视频并",
+    "生成视频后",
+    "生成最小必要",
+    "根据分镜剪辑成片",
+    "分镜剪辑成片",
+    "然后剪辑成",
+    "然后合成",
+    "然后合并",
+    "再剪辑成",
+    "再合成",
+    "再合并",
+    "后再剪辑成片",
+    "后再合并剪辑",
+    "后合并剪辑",
+    "后剪辑成片",
+    "first generate",
+    "generate clips first",
+    "generate videos first",
+    "missing clips",
+    "missing shot",
+    "missing footage",
+    "generate video and edit",
+    "generate videos and edit",
+)
+
+
+def _requires_media_generation_before_composition(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_deferred_media_pipeline_request(task):
+        return False
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS):
+        return False
+    has_generation_before_composition = any(
+        term in normalized for term in _MEDIA_GENERATION_BEFORE_COMPOSITION_TERMS
+    )
+    if not has_generation_before_composition:
+        return False
+    has_composition_intent = any(term in normalized for term in _VIDEO_COMPOSITION_ACTION_TERMS) or (
+        any(term in normalized for term in _VIDEO_COMPOSITION_DELIVERY_TERMS)
+        and any(term in normalized for term in _VIDEO_COMPOSITION_MEDIA_TERMS)
+    )
+    return has_composition_intent and _is_multimedia_generation_request(task)
+
+
+def _is_final_media_delivery_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_deferred_media_pipeline_request(task):
+        return False
+    if any(term in normalized for term in _VIDEO_COMPOSITION_NEGATIONS):
+        return False
+    return _is_video_composition_request(task) or _requires_media_generation_before_composition(task)
+
+
 def _is_multimedia_generation_request(task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", task).casefold()
     if _has_generation_negation(normalized):
@@ -1688,7 +2155,11 @@ def _looks_like_multimedia_explanation(normalized: str) -> bool:
 
 def _is_standalone_multimedia_generation_request(task: str) -> bool:
     normalized = task.casefold()
+    if _is_video_composition_request(task):
+        return False
     if not _is_multimedia_generation_request(task):
+        return False
+    if _has_unnegated_script_authoring_clause(normalized):
         return False
     blocked_terms = (
         "代码",
@@ -1715,10 +2186,70 @@ def _is_standalone_multimedia_generation_request(task: str) -> bool:
         "prompt",
         "提示词",
         "文案",
-        "脚本",
-        "剧本",
+        "剪辑",
+        "合成",
+        "合并",
+        "拼接",
+        "素材",
+        "成片",
+        "mp4",
+        "merge",
+        "stitch",
+        "concatenate",
+        "combine clips",
+        "combine videos",
+        "edit these videos",
     )
-    return not any(term in normalized for term in blocked_terms)
+    if _has_unnegated_terms(
+        normalized,
+        blocked_terms,
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    ):
+        return False
+    return _has_positive_multimedia_generation_clause(
+        normalized,
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    )
+
+
+def _has_unnegated_script_authoring_clause(normalized: str) -> bool:
+    authoring_terms = (
+        "write",
+        "draft",
+        "create",
+        "generate",
+        "produce",
+        "写",
+        "撰写",
+        "创作",
+        "生成",
+        "产出",
+    )
+    reference_terms = (
+        "based on",
+        "from the previous",
+        "previous script",
+        "existing script",
+        "基于",
+        "根据",
+        "刚才",
+        "上面",
+        "前面",
+        "已有",
+        "现有",
+    )
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in _MULTIMEDIA_GENERATION_NEGATIONS):
+            continue
+        if not any(term in clause for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS):
+            continue
+        if any(term in clause for term in reference_terms) and any(
+            term in clause for term in _MULTIMEDIA_MEDIA_TERMS
+        ):
+            continue
+        if any(term in clause for term in authoring_terms):
+            return True
+    return False
 
 
 def _is_document_generation_request(task: str) -> bool:
@@ -1848,10 +2379,20 @@ def _has_generation_negation(normalized: str) -> bool:
         "只写提示词",
         "只生成提示词",
         "只给提示词",
+        "只规划",
+        "仅规划",
+        "规划流程",
+        "只出方案",
+        "仅出方案",
         "仅写提示词",
         "仅生成提示词",
         "仅分析",
         "只分析",
+        "不成片",
+        "不输出成片",
+        "不生成成片",
+        "不生成最终成片",
+        "不剪辑成片",
         "do not generate",
         "don't generate",
         "dont generate",
@@ -1869,9 +2410,49 @@ def _has_generation_negation(normalized: str) -> bool:
         "no need to make",
         "without generating",
         "prompt only",
+        "plan only",
+        "planning only",
+        "only plan",
         "analysis only",
     )
-    return any(negation in normalized for negation in scoped_negations)
+    return any(negation in normalized for negation in scoped_negations) and not (
+        _has_positive_multimedia_generation_clause(normalized, scoped_negations)
+    )
+
+
+def _has_positive_multimedia_generation_clause(
+    normalized: str,
+    negations: tuple[str, ...],
+) -> bool:
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in negations):
+            continue
+        if _has_delivery_action(clause) and any(
+            term in clause for term in _MULTIMEDIA_MEDIA_TERMS
+        ):
+            return True
+    return False
+
+
+def _has_unnegated_terms(
+    normalized: str,
+    terms: tuple[str, ...],
+    negations: tuple[str, ...],
+) -> bool:
+    for clause in _split_semantic_clauses(normalized):
+        if any(negation in clause for negation in negations):
+            continue
+        if any(term in clause for term in terms):
+            return True
+    return False
+
+
+def _split_semantic_clauses(normalized: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", normalized)
+        if clause.strip()
+    )
 
 
 def _has_office_generation_negation(normalized: str, negations: tuple[str, ...]) -> bool:
@@ -1911,6 +2492,10 @@ def _has_delivery_action(normalized: str) -> bool:
             "渲染",
             "合成",
             "给我",
+            "只要",
+            "只需要",
+            "仅要",
+            "仅需要",
         )
     )
 
@@ -1946,6 +2531,23 @@ def _require_text(name: str, value: str) -> None:
         raise ValueError(f"{name} must be nonblank, unpadded, and bounded")
     if any(_is_disallowed_control_character(character) for character in value):
         raise ValueError(f"{name} must not contain control characters")
+
+
+def _normalize_task_text(value: str, *, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    if any(_is_disallowed_control_character(character) for character in value):
+        raise ValueError("task must not contain control characters")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    if len(stripped) <= _MAX_TEXT:
+        return stripped
+    marker = f"\n[truncated for {label}; middle omitted]\n"
+    budget = _MAX_TEXT - len(marker)
+    head_length = budget // 2
+    tail_length = budget - head_length
+    return stripped[:head_length].rstrip() + marker + stripped[-tail_length:].lstrip()
 
 
 def _is_disallowed_control_character(character: str) -> bool:

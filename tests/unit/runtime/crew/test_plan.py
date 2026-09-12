@@ -82,6 +82,25 @@ def test_valid_plan_has_deterministic_layers_and_round_trip() -> None:
     assert len(plan.digest) == 64
 
 
+def test_step_user_review_gate_round_trips_and_defaults_to_false() -> None:
+    default_step = DispatchStep(id="draft", agent="writer", task="Draft")
+    gated_step = DispatchStep(
+        id="model_sheet",
+        agent="writer",
+        task="Generate character model sheet.",
+        requires_user_review=True,
+        final_synthesizer=True,
+    )
+    plan = DispatchPlan(
+        agents=(agent("writer"),),
+        steps=(gated_step,),
+        total_token_budget=4096,
+    )
+
+    assert default_step.requires_user_review is False
+    assert DispatchPlan.from_payload(plan.to_payload()).steps[0].requires_user_review is True
+
+
 def test_fixed_yaml_plan_loads_and_yaml_aliases_are_rejected() -> None:
     loaded = DispatchPlan.from_yaml(
         """

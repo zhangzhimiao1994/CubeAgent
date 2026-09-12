@@ -9,9 +9,17 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.crew.adapter import (
     CrewAgentDefinition,
     CrewDispatchRuntime,
@@ -21,8 +29,16 @@ from agent_hub.runtime.crew.adapter import (
     RuntimeExecutionError,
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
+    _artifact_review_feedback_from_routing,
+    _artifact_review_feedback_text,
+    _artifact_review_items_payload,
     _artifact_review_packet_payload,
+    _direct_compose_video_arguments,
+    _direct_multimedia_generation_prompt,
+    _fallback_review_response_from_text,
+    _normalize_compose_video_arguments_with_sources,
     _normalize_tool_call_arguments,
+    _usable_file_artifacts_payload,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -79,6 +95,38 @@ class ReviewAwareGateway:
         )
 
 
+class DocumentToolGateway:
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        return GatewayCompletion(
+            response=ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="call-docx",
+                        name="document.generate_docx",
+                        arguments={
+                            "title": "Long Report",
+                            "filename": "long-report.docx",
+                            "sections": (
+                                {
+                                    "heading": "Summary",
+                                    "paragraphs": ("Recovered compact document output.",),
+                                },
+                            ),
+                            "presentation": "final_attachment",
+                        },
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class EmptyThenSuccessGateway:
     def __init__(self) -> None:
         self.calls = 0
@@ -92,6 +140,45 @@ class EmptyThenSuccessGateway:
             logical_model=request.logical_model,
             provider_id="deepseek",
             provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class ControlCharsThenSuccessGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls += 1
+        text = "\x00\u200b\r" if self.calls == 1 else "recovered answer"
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class EmptyErrorThenSuccessGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelGatewayError(
+                "model response text is empty",
+                logical_models=("qwen",),
+                deployments=("qwen_1",),
+            )
+        return GatewayCompletion(
+            response=ModelResponse(text="recovered answer", usage=TokenUsage(1, 1, 2)),
+            deployment_id="qwen_1",
+            logical_model=request.logical_model,
+            provider_id="qwen",
+            provider_model="qwen/qwen-max",
             cost_usd=Decimal(0),
         )
 
@@ -208,6 +295,45 @@ class StepTimeoutOnceFactory(CrewObjectFactory):
         share_crew: bool,
         telemetry_disabled: bool,
     ) -> StepTimeoutOnceGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
+
+
+class StepTimeoutAfterModelCallGeneration:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, agent_id, storage_scope
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls == 1:
+            await bridge.complete([{"role": "user", "content": prompt}])
+            raise TimeoutError
+        return await bridge.complete([{"role": "user", "content": prompt}])
+
+
+class StepTimeoutAfterModelCallFactory(CrewObjectFactory):
+    def __init__(self) -> None:
+        self.generation = StepTimeoutAfterModelCallGeneration()
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> StepTimeoutAfterModelCallGeneration:
         del agents, tasks, share_crew, telemetry_disabled
         return self.generation
 
@@ -458,6 +584,35 @@ class DirectMultimediaCapabilities(MultimediaCapabilities):
         return "media_primary"
 
 
+class ReplaySafeDocumentCapabilities:
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, idempotency_key
+        assert name == "document.generate_docx"
+        assert arguments["presentation"] == "final_attachment"
+        return {
+            "presentation": "final_attachment",
+            "summary": "已生成恢复后的 DOCX 文档。",
+            "file": {
+                "filename": "long-report.docx",
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ),
+            },
+        }
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "document.generate_docx"
+
+
 def _one_step_plan(*, timeout_seconds: float = 60.0) -> DispatchPlan:
     return DispatchPlan(
         agents=(AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),),
@@ -595,6 +750,8 @@ def _optional_reviewer_step_plan() -> DispatchPlan:
 def _context(
     *,
     artifacts: tuple[Artifact, ...] = (),
+    checkpoint: RuntimeCheckpoint | None = None,
+    routing_decision: Mapping[str, JsonValue] | None = None,
     timeout_seconds: float = 60.0,
     request: str = "Write a short answer",
 ) -> TaskContext:
@@ -604,6 +761,8 @@ def _context(
         mode=TaskMode.DISPATCH,
         request=request,
         artifacts=artifacts,
+        checkpoint=checkpoint,
+        routing_decision={} if routing_decision is None else routing_decision,
         timeout_seconds=timeout_seconds,
         token_budget=1000,
     )
@@ -640,6 +799,43 @@ def test_text_only_empty_model_response_still_fails() -> None:
 
     with pytest.raises(RuntimeExecutionError, match="model response text is empty"):
         CrewDispatchRuntime._valid_response(completion)
+
+
+def test_text_artifact_sanitizes_unsafe_control_characters() -> None:
+    step = DispatchStep(id="director_step", agent="director", task="compose final video plan")
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text="first\x00line\n\tzero\u200bwidth",
+            usage=TokenUsage(10, 1, 11),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    artifact = CrewDispatchRuntime._artifact(step, completion, (), version=1)
+
+    assert dict(artifact.content) == {"text": "firstline\n\tzerowidth"}
+
+
+def test_model_response_artifact_sanitizes_text_before_evidence_storage() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text="first\x00line\r\n\tzero\u200bwidth",
+            usage=TokenUsage(10, 1, 11),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    artifact = CrewDispatchRuntime._model_artifact(completion, "director", ())
+
+    assert dict(artifact.content)["text"] == "firstline\n\tzerowidth"
 
 
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
@@ -734,14 +930,1108 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     assert completed.payload["logical_model"] == "media_primary"
 
 
+async def test_multimedia_generator_direct_character_sheet_splits_gender_lead_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="为男女主生成角色参考设定表，风格全是二次元，不要太细节也不要太简化")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "multimedia_generator"
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 2
+    assert "男主" in cast(str, artifact_prompts[0])
+    assert "女主" in cast(str, artifact_prompts[1])
+    for prompt in artifact_prompts:
+        prompt_text = cast(str, prompt)
+        assert "一张图只包含一个角色" in prompt_text
+        assert "同一画风" in prompt_text
+        assert "全二次元" in prompt_text
+        assert "中等复杂度" in prompt_text
+        assert "不要只输出头像或单张主图" in prompt_text
+        assert "禁止写实主图+二次元表情+线稿三视图" in prompt_text
+
+
+async def test_multimedia_generator_direct_character_design_splits_gender_lead_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="根据这个剧本，生成男女主角的角色设定图，风格全是写实")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "multimedia_generator"
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 2
+    assert "男主" in cast(str, artifact_prompts[0])
+    assert "女主" in cast(str, artifact_prompts[1])
+    for prompt in artifact_prompts:
+        prompt_text = cast(str, prompt)
+        assert "本张角色参考设定表/角色设定图的唯一目标角色" in prompt_text
+        assert "一张图只包含一个角色" in prompt_text
+        assert "全写实" in prompt_text
+
+
+async def test_multimedia_generator_direct_person_reference_splits_each_script_role() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "### 主角人设构建\n\n"
+                "## 女主：苏念（26岁）\n"
+                "- 职业：广告公司资深文案\n"
+                "- 外貌：黑长直，浅粉针织衫，温柔但有边界感。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 职业：品牌公司创始人\n"
+                "- 外貌：短黑发，灰色西装，冷静克制。\n\n"
+                "## 闺蜜：林小鹿（25岁）\n"
+                "- 职业：咖啡店主理人\n"
+                "- 外貌：短发，牛仔外套，活泼机灵。"
+            )
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="根据剧本生成各个角色的人物参考图和分镜图",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 4
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 4
+    assert "唯一目标角色：女主" in cast(str, artifact_prompts[0])
+    assert "苏念" in cast(str, artifact_prompts[0])
+    assert "浅粉针织衫" in cast(str, artifact_prompts[0])
+    assert "唯一目标角色：男主" in cast(str, artifact_prompts[1])
+    assert "陆沉" in cast(str, artifact_prompts[1])
+    assert "灰色西装" in cast(str, artifact_prompts[1])
+    assert "唯一目标角色：闺蜜" in cast(str, artifact_prompts[2])
+    assert "林小鹿" in cast(str, artifact_prompts[2])
+    assert "牛仔外套" in cast(str, artifact_prompts[2])
+    assert "分镜图" in cast(str, artifact_prompts[3])
+    assert "不要生成角色定妆照" in cast(str, artifact_prompts[3])
+    for prompt in artifact_prompts[:3]:
+        prompt_text = cast(str, prompt)
+        assert "一张图只包含一个角色" in prompt_text
+        assert "不要混入其他角色设定" in prompt_text
+        assert "不要只输出头像或单张主图" in prompt_text
+
+
+async def test_multimedia_generator_direct_person_reference_keeps_split_when_group_is_negated() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "## 女主：苏念（26岁）\n"
+                "- 外貌：黑长直，浅粉针织衫。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 外貌：短黑发，灰色西装。"
+            )
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="为每个角色单独生成角色设定图，不要同框合照",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    artifact_prompts = cast(tuple[str, ...], arguments["artifact_prompts"])
+    assert len(artifact_prompts) == 2
+    assert "唯一目标角色：女主" in artifact_prompts[0]
+    assert "唯一目标角色：男主" in artifact_prompts[1]
+
+
+async def test_multimedia_generator_direct_person_reference_reads_structured_script_roles() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "result": {
+                "script": {
+                    "characters": (
+                        {
+                            "role": "女主",
+                            "name": "苏念",
+                            "age": "26岁",
+                            "occupation": "广告公司资深文案",
+                            "appearance": "黑长直，浅粉针织衫",
+                        },
+                        {
+                            "role": "男主",
+                            "name": "陆沉",
+                            "age": "29岁",
+                            "occupation": "品牌公司创始人",
+                            "appearance": "短黑发，灰色西装",
+                        },
+                    )
+                }
+            }
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="给所有人物做人设图",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    artifact_prompts = cast(tuple[str, ...], arguments["artifact_prompts"])
+    assert len(artifact_prompts) == 2
+    assert "苏念" in artifact_prompts[0]
+    assert "陆沉" in artifact_prompts[1]
+
+
+async def test_multimedia_generator_direct_gender_lead_group_photo_keeps_single_artifact() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="根据这个剧本，生成男女主角同框合照，风格全是写实")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert "artifact_count" not in arguments
+    assert "artifact_prompts" not in arguments
+
+
+async def test_multimedia_generator_direct_video_comparison_creates_reference_and_no_reference_prompts() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "filename": "male-lead-sheet.png",
+                        "mime_type": "image/png",
+                        "storage_key": "tenant/run/artifact/male-lead-sheet.png",
+                    },
+                ),
+            }
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="生成两版 5 秒视频对比：一版带参考图锁定人物，一版不带参考图。",
+                artifacts=(source,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "video"
+    assert arguments["artifact_count"] == 2
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    assert "带参考图" in cast(str, artifact_prompts[0])
+    assert "锁定人物" in cast(str, artifact_prompts[0])
+    assert "male-lead-sheet.png" in cast(str, artifact_prompts[0])
+    assert "不带参考图" in cast(str, artifact_prompts[1])
+
+
+async def test_video_compositor_directly_composes_upstream_file_handles_without_text_model() -> None:
+    class FailingTextGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            self.calls += 1
+            raise AssertionError("text gateway must not be called for direct video composition")
+
+    class DirectComposeCapabilities(DirectMultimediaCapabilities):
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, idempotency_key
+            self.calls.append((actor, name, arguments))
+            assert name == "compose_video"
+            return {
+                "job_id": "compose-test",
+                "status": "completed",
+                "executor_id": actor,
+                "summary": "Composed final video.",
+                "artifacts": (
+                    {
+                        "filename": "final.mp4",
+                        "mime_type": "video/mp4",
+                        "download_url": "/api/v1/admin/compositions/compose-test/artifacts/0/download",
+                    },
+                ),
+                "presentation": "final_attachment",
+            }
+
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "generate_multimedia"
+
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "artifact_id": "source-video-artifact",
+                        "download_url": "/api/v1/admin/runs/run/artifacts/source-video-artifact/download",
+                        "filename": "shot-001.mp4",
+                        "mime_type": "video/mp4",
+                        "storage_key": "tenant/run/source/shot-001.mp4",
+                    },
+                ),
+            }
+        },
+        source_ids=(),
+    )
+    gateway = FailingTextGateway()
+    capabilities = DirectComposeCapabilities()
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="video_compositor",
+                role="Video Compositor",
+                goal="合并剪辑上游镜头并输出最终成片",
+                logical_model="general",
+                allowed_tools=("compose_video",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="compose",
+                agent="video_compositor",
+                task="将上游镜头剪辑成最终 5 秒 MP4",
+                tools=("compose_video",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("compose_video",),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                artifacts=(source,),
+                request="请把已经生成的上游视频剪辑成片，输出 5 秒 MP4",
+            )
+        )
+    ]
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    final = next(artifact for artifact in artifacts if artifact.type == "text")
+
+    assert gateway.calls == 0
+    assert len(capabilities.calls) == 1
+    actor, name, arguments = capabilities.calls[0]
+    assert actor == "video_compositor"
+    assert name == "compose_video"
+    clips = arguments["clips"]
+    assert isinstance(clips, tuple)
+    first_clip = cast(Mapping[str, JsonValue], clips[0])
+    assert first_clip["storage_key"] == "tenant/run/source/shot-001.mp4"
+    assert first_clip["mime_type"] == "video/mp4"
+    assert first_clip["filename"] == "shot-001.mp4"
+    assert "final.mp4" in cast(str, final.content["text"])
+    assert any(
+        event.kind is EventKind.TOOL_STARTED
+        and event.tool_name == "compose_video"
+        and event.payload.get("direct_dispatch") is True
+        for event in events
+    )
+
+
+async def test_video_compositor_uses_file_handles_from_same_run_generation_lineage() -> None:
+    class FailingTextGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            self.calls += 1
+            raise AssertionError("text gateway must not be called for direct media chain")
+
+    class DirectMediaChainCapabilities(DirectMultimediaCapabilities):
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, idempotency_key
+            self.calls.append((actor, name, arguments))
+            if name == "generate_multimedia":
+                return {
+                    "job_id": "media-test",
+                    "kind": arguments["kind"],
+                    "logical_model": arguments["logical_model"],
+                    "status": "completed",
+                    "executor_id": actor,
+                    "summary": "Generated video artifact with media_primary.",
+                    "artifacts": (
+                        {
+                            "artifact_id": "source-video-artifact",
+                            "download_url": (
+                                "/api/v1/admin/runs/run/artifacts/"
+                                "source-video-artifact/download"
+                            ),
+                            "filename": "shot-001.mp4",
+                            "mime_type": "video/mp4",
+                            "storage_key": "tenant/run/source/shot-001.mp4",
+                        },
+                    ),
+                    "presentation": "final_attachment",
+                }
+            assert name == "compose_video"
+            return {
+                "job_id": "compose-test",
+                "status": "completed",
+                "executor_id": actor,
+                "summary": "Composed final video.",
+                "artifacts": (
+                    {
+                        "filename": "final.mp4",
+                        "mime_type": "video/mp4",
+                        "download_url": "/api/v1/admin/compositions/compose-test/artifacts/0/download",
+                    },
+                ),
+                "presentation": "final_attachment",
+            }
+
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "generate_multimedia"
+
+    gateway = FailingTextGateway()
+    capabilities = DirectMediaChainCapabilities()
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="生成视频镜头",
+                logical_model="general",
+                allowed_tools=("generate_multimedia",),
+            ),
+            AgentSpec(
+                id="video_compositor",
+                role="Video Compositor",
+                goal="合并剪辑上游镜头并输出最终成片",
+                logical_model="general",
+                allowed_tools=("compose_video",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="generate",
+                agent="multimedia_generator",
+                task="生成 5 秒视频镜头",
+                tools=("generate_multimedia",),
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="compose",
+                agent="video_compositor",
+                task="将上游镜头剪辑成最终 5 秒 MP4",
+                depends_on=("generate",),
+                tools=("compose_video",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("generate_multimedia", "compose_video"),
+        total_token_budget=200,
+    )
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="请生成一个 5 秒视频镜头，然后剪辑成最终 MP4")
+        )
+    ]
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    final = next(
+        artifact
+        for artifact in artifacts
+        if artifact.type == "text" and artifact.producer == "video_compositor"
+    )
+
+    assert gateway.calls == 0
+    assert [call[1] for call in capabilities.calls] == [
+        "generate_multimedia",
+        "compose_video",
+    ]
+    compose_arguments = capabilities.calls[-1][2]
+    clips = compose_arguments["clips"]
+    assert isinstance(clips, tuple)
+    first_clip = cast(Mapping[str, JsonValue], clips[0])
+    assert first_clip["storage_key"] == "tenant/run/source/shot-001.mp4"
+    assert "final.mp4" in cast(str, final.content["text"])
+
+
+async def test_user_review_gate_requests_approval_before_downstream_step() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="character_designer",
+                role="Character Designer",
+                goal="Generate character references",
+                logical_model="general",
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Finish after approval",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="character_designer",
+                task="Generate Character Model Sheet.",
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Continue only after the model sheet is approved.",
+                depends_on=("character_model_sheet",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色设定后再剪辑成片"))]
+
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    assert approval.action == "artifact_review"
+    assert approval.actor == "character_designer"
+    assert approval.payload["stage_id"] == "character_model_sheet"
+    assert approval.payload["artifact_id"]
+    assert not any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in events
+    )
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
+async def test_user_review_gate_requests_approval_for_single_media_delivery() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+                allowed_tools=("generate_multimedia",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="multimedia_generator_step",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                tools=("generate_multimedia",),
+                requires_user_review=True,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("generate_multimedia",),
+        total_token_budget=100,
+    )
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色参考设定表图片"))]
+
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    assert approval.action == "artifact_review"
+    assert approval.actor == "multimedia_generator"
+    assert approval.payload["stage_id"] == "multimedia_generator_step"
+    assert approval.payload["artifact_id"]
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
+async def test_rejected_single_media_delivery_reruns_stage_before_completion() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+                allowed_tools=("generate_multimedia",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="multimedia_generator_step",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                tools=("generate_multimedia",),
+                requires_user_review=True,
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("generate_multimedia",),
+        total_token_budget=100,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色参考设定表图片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    rejected_artifact_id = cast(str, approval.payload["artifact_id"])
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    feedback = "角色脸型和服装不一致，退回重新生成角色参考设定表。"
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        capability_gateway=DirectMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="生成角色参考设定表图片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "multimedia_generator_step",
+                        "artifact_id": rejected_artifact_id,
+                        "feedback": feedback,
+                    }
+                },
+            )
+        )
+    ]
+
+    retry = next(event for event in restored_events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.step_id == "multimedia_generator_step"
+    assert retry.reason == "user rejected artifact review; regenerating stage"
+    assert retry.sequence > approval.sequence
+    refreshed_approval = next(
+        event for event in restored_events if event.kind is EventKind.APPROVAL_REQUESTED
+    )
+    assert refreshed_approval.payload["stage_id"] == "multimedia_generator_step"
+    assert refreshed_approval.payload["artifact_id"] != rejected_artifact_id
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in restored_events)
+
+
+async def test_rejected_user_review_checkpoint_reruns_stage_before_downstream_step() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="character_designer",
+                role="Character Designer",
+                goal="Generate character references",
+                logical_model="general",
+            ),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Finish after approval",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="character_designer",
+                task="Generate Character Model Sheet.",
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Continue only after the model sheet is approved.",
+                depends_on=("character_model_sheet",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="生成角色设定后再剪辑成片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    rejected_artifact_id = cast(str, approval.payload["artifact_id"])
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    feedback = "角色脸部一致性不足，重新生成完整 Character Model Sheet。"
+    restored_factory = CapturingFactory()
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=restored_factory,
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="生成角色设定后再剪辑成片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "character_model_sheet",
+                        "artifact_id": rejected_artifact_id,
+                        "feedback": feedback,
+                    }
+                },
+            )
+        )
+    ]
+
+    started_steps = [
+        event.step_id for event in restored_events if event.kind is EventKind.STEP_STARTED
+    ]
+    assert started_steps == ["character_model_sheet"]
+    retry = next(event for event in restored_events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.step_id == "character_model_sheet"
+    assert retry.reason == "user rejected artifact review; regenerating stage"
+    assert retry.payload["attempt"] == 1
+    assert retry.payload["artifact_id"] == rejected_artifact_id
+    assert retry.payload["feedback"] == feedback
+    regenerated = next(
+        event.artifact
+        for event in restored_events
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.actor == "character_designer"
+        and event.artifact is not None
+    )
+    assert str(regenerated.id) != rejected_artifact_id
+    assert feedback in restored_factory.generation.prompts[0]
+    refreshed_approval = next(
+        event for event in restored_events if event.kind is EventKind.APPROVAL_REQUESTED
+    )
+    assert refreshed_approval.payload["artifact_id"] == str(regenerated.id)
+    assert refreshed_approval.payload["stage_id"] == "character_model_sheet"
+    assert not any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in restored_events
+    )
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in restored_events)
+
+    regenerated_checkpoint = next(
+        event.checkpoint
+        for event in reversed(restored_events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert regenerated_checkpoint is not None
+    all_artifacts = (
+        *stored_artifacts,
+        *(
+            event.artifact
+            for event in restored_events
+            if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+        ),
+    )
+    approved = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await approved.restore_checkpoint(regenerated_checkpoint)
+
+    approved_events = [
+        event
+        async for event in approved.run(
+            _context(
+                checkpoint=regenerated_checkpoint,
+                artifacts=all_artifacts,
+                request="生成角色设定后再剪辑成片",
+                routing_decision={
+                    "media_pipeline_plan": {
+                        "approved_artifacts": (
+                            {
+                                "stage_id": "character_model_sheet",
+                                "artifact_id": str(regenerated.id),
+                            }
+                        ),
+                    }
+                },
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_STARTED and event.step_id == "final_response"
+        for event in approved_events
+    )
+    assert approved_events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_user_rejection_after_reviewer_revision_reruns_stage_cleanly() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="Writer", goal="Draft asset", logical_model="general"),
+            AgentSpec(id="critic", role="Critic", goal="Review asset", logical_model="general"),
+            AgentSpec(id="final", role="Final", goal="Finish", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="storyboard",
+                agent="writer",
+                task="Draft storyboard.",
+                reviewer="critic",
+                reviewer_retries=1,
+                requires_user_review=True,
+                token_budget=100,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final",
+                task="Finish after approved storyboard.",
+                depends_on=("storyboard",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=300,
+    )
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                '{"verdict":"revise","feedback":"补齐缺失镜头。"}',
+                '{"verdict":"approve"}',
+            )
+        ),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context(request="先出分镜图，再剪辑成片"))]
+    approval = next(event for event in events if event.kind is EventKind.APPROVAL_REQUESTED)
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    assert any(
+        event.kind is EventKind.REVIEW_COMPLETED
+        and event.payload.get("verdict") == "revise"
+        for event in events
+    )
+    assert checkpoint.state["retries"] == {"storyboard": 1}
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    restored_factory = CapturingFactory()
+    restored = CrewDispatchRuntime(
+        ReviewAwareGateway(('{"verdict":"approve"}',)),
+        plan,
+        crew_factory=restored_factory,
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(
+                checkpoint=checkpoint,
+                artifacts=stored_artifacts,
+                request="先出分镜图，再剪辑成片",
+                routing_decision={
+                    "artifact_review_feedback": {
+                        "stage_id": "storyboard",
+                        "artifact_id": cast(str, approval.payload["artifact_id"]),
+                        "feedback": "分镜节奏不对，重新生成。",
+                    }
+                },
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.STEP_STARTED
+        and event.step_id == "storyboard"
+        and event.payload["attempt"] == 1
+        for event in restored_events
+    )
+    assert "分镜节奏不对" in restored_factory.generation.prompts[0]
+    refreshed_checkpoint = next(
+        event.checkpoint
+        for event in reversed(restored_events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert refreshed_checkpoint is not None
+    assert refreshed_checkpoint.state["retries"] == {"storyboard": 0}
+    assert any(event.kind is EventKind.APPROVAL_REQUESTED for event in restored_events)
+    await CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    ).restore_checkpoint(refreshed_checkpoint)
+
+
+def test_direct_multimedia_generation_prompt_includes_user_review_feedback() -> None:
+    step = DispatchStep(
+        id="character_model_sheet",
+        agent="multimedia_generator",
+        task="生成角色 Character Model Sheet 图片。",
+        token_budget=100,
+    )
+
+    prompt = _direct_multimedia_generation_prompt(
+        _context(request="生成女主角定妆设定表"),
+        step,
+        (),
+        "服装和脸型不一致，按原角色设定重新生成。",
+    )
+
+    assert "用户审核退回意见" in prompt
+    assert "服装和脸型不一致" in prompt
+
+
+def test_direct_multimedia_generation_prompt_constrains_character_model_sheet() -> None:
+    step = DispatchStep(
+        id="character_model_sheet",
+        agent="multimedia_generator",
+        task="生成 Character Model Sheet 形式的角色参考设定表图片。",
+        token_budget=100,
+    )
+
+    prompt = _direct_multimedia_generation_prompt(
+        _context(request="生成女主角角色参考设定表，风格参考定妆照，不要太细节"),
+        step,
+        (),
+    )
+
+    assert "角色定妆照" in prompt
+    assert "一张图只包含一个角色" in prompt
+    assert "不要把多个角色放在同一张设定表" in prompt
+    assert "不要过度堆叠小物件" in prompt
+
+
 @pytest.mark.parametrize(
     ("task_text", "expected_kind"),
     [
         ("给我做一张图片版设定板。", "image"),
+        ("根据剧情以Character Model Sheet的形式生成角色参考设定表。", "image"),
+        ("根据这段视频剧情生成 Character Model Sheet 形式的角色参考设定表。", "image"),
+        (
+            (
+                "基于刚才剧本，只生成 Character Model Sheet 形式的角色参考设定表和角色服装设定板图片，"
+                "不要生成视频，不要剪辑成片。"
+            ),
+            "image",
+        ),
+        ("生成角色设定表。", "image"),
+        ("根据剧本为每个角色生成角色参考图。", "image"),
+        ("根据剧本为每个人物生成定妆图。", "image"),
+        ("根据剧本生成男女主角同框合照。", "image"),
         ("出一张赛博朋克产品概念图。", "image"),
         ("生成三张可下载表情包贴纸。", "image"),
         ("做一张商品 3D 渲染图。", "image"),
         ("把这个故事做成 8 秒动画短片成片。", "video"),
+        ("根据分镜剪辑成片。", "video"),
+        ("先生成角色参考设定表、服装设定板和分镜图，最终剪辑成片。", "video"),
         ("为这段开场白合成一段旁白配音。", "audio"),
         ("给品牌发布会做一段 BGM 背景音乐。", "audio"),
     ],
@@ -925,6 +2215,67 @@ async def test_dispatch_step_timeout_retries_with_compact_recovery_prompt() -> N
     )
 
 
+async def test_dispatch_tool_step_timeout_retries_with_compact_recovery_prompt() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="researcher",
+        content={"text": "source material for a long report " * 500},
+    )
+    factory = StepTimeoutOnceFactory()
+    runtime = CrewDispatchRuntime(
+        DocumentToolGateway(),
+        _one_step_tool_plan(tools=("document.generate_docx",)),
+        crew_factory=factory,
+        capability_gateway=ReplaySafeDocumentCapabilities(),
+    )
+
+    events = [event async for event in runtime.run(_context(artifacts=(artifact,)))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "step execution timed out; retrying with compact recovery"
+    assert retry.payload["attempt"] == 2
+    assert retry.payload["strategy"] == "compact_retry"
+    assert retry.payload["input_policy"] == "compact_source_previews"
+    assert retry.payload["error_code"] == "crew.step_timeout"
+    assert "compact_retry" in factory.generation.prompts[1]
+    assert len(factory.generation.prompts[1].encode("utf-8")) < len(
+        factory.generation.prompts[0].encode("utf-8")
+    )
+
+
+async def test_dispatch_step_timeout_after_model_call_drops_stale_attempt_ledger() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="researcher",
+        content={"text": "large source context " * 500},
+    )
+    factory = StepTimeoutAfterModelCallFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        _one_step_plan(),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context(artifacts=(artifact,)))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    assert any(
+        event.kind is EventKind.STEP_RETRYING
+        and event.reason == "step execution timed out; retrying with compact recovery"
+        for event in events
+    )
+    assert not any(
+        event.reason is not None and "model request changed after checkpoint" in event.reason
+        for event in events
+    )
+
+
 async def test_dispatch_step_timeout_recovery_keeps_each_attempt_on_step_deadline() -> None:
     factory = SlowThenFastStepFactory()
     runtime = CrewDispatchRuntime(
@@ -958,6 +2309,83 @@ async def test_dispatch_step_empty_model_response_retries_before_failing() -> No
     assert retry.reason == "model returned empty response; retrying with explicit output request"
     assert retry.payload["strategy"] == "empty_response_retry"
     assert retry.payload["error_code"] == "model.empty_response"
+
+
+async def test_dispatch_step_sanitized_empty_model_response_retries_before_failing() -> None:
+    gateway = ControlCharsThenSuccessGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "model returned empty response; retrying with explicit output request"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    assert retry.payload["error_code"] == "model.empty_response"
+
+
+async def test_dispatch_step_gateway_empty_response_error_retries_before_failing() -> None:
+    gateway = EmptyErrorThenSuccessGateway()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "model returned empty response; retrying with explicit output request"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    assert retry.payload["error_code"] == "model.empty_response"
+    assert retry.payload["logical_models"] == "qwen"
+    assert retry.payload["deployments"] == "qwen_1"
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoint is not None
+    model_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert len(model_states) == 1
+    assert next(iter(model_states.values()))["status"] == "succeeded"
+    restored_gateway = EmptyErrorThenSuccessGateway()
+    restored = CrewDispatchRuntime(
+        restored_gateway,
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+        artifact_repository=repository,
+    )
+    await restored.restore_checkpoint(checkpoint)
+    stored_artifacts = tuple(
+        event.artifact
+        for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    restored_events = [
+        event
+        async for event in restored.run(
+            _context(checkpoint=checkpoint, artifacts=stored_artifacts)
+        )
+    ]
+    assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
+    assert restored_gateway.calls == 0
+    await CrewDispatchRuntime(
+        EmptyErrorThenSuccessGateway(),
+        _one_step_plan(),
+        crew_factory=CapturingFactory(),
+    ).restore_checkpoint(checkpoint)
 
 
 async def test_optional_reviewer_agent_step_model_failure_is_skipped_with_model_context() -> None:
@@ -1066,6 +2494,117 @@ async def test_reviewer_prompt_uses_review_packet_for_candidate_artifact() -> No
     assert '"content"' not in reviewer_prompt
 
 
+async def test_reviewer_prompt_adds_character_sheet_acceptance_criteria() -> None:
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+            ),
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                reviewer="critic",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    factory = CapturingFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=factory,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="为男女主生成角色参考设定表，风格全是写实，不要太细节也不要太简化")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reviewer_prompt = next(prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt)
+    assert "角色参考设定表审核标准" in reviewer_prompt
+    assert "至少应有 2 张独立角色图片" in reviewer_prompt
+    assert "一张图片只允许一个角色" in reviewer_prompt
+    assert "同一人物身份必须一致" in reviewer_prompt
+    assert "同一画风" in reviewer_prompt
+    assert "全写实" in reviewer_prompt
+
+
+async def test_reviewer_prompt_adds_source_character_targets_to_acceptance_criteria() -> None:
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "## 女主：苏念（26岁）\n"
+                "- 外貌：黑长直，浅粉针织衫。\n\n"
+                "## 男主：陆沉（29岁）\n"
+                "- 外貌：短黑发，灰色西装。\n\n"
+                "## 闺蜜：林小鹿（25岁）\n"
+                "- 外貌：短发，牛仔外套。"
+            )
+        },
+    )
+    plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="multimedia_generator",
+                role="Multimedia Generator",
+                goal="Generate reviewed media",
+                logical_model="general",
+            ),
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="character_model_sheet",
+                agent="multimedia_generator",
+                task="Generate Character Model Sheet.",
+                reviewer="critic",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+    factory = CapturingFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        plan,
+        crew_factory=factory,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(
+                request="为每个角色生成角色参考设定表，风格全是写实",
+                artifacts=(script,),
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reviewer_prompt = next(prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt)
+    assert "至少应有 3 张独立角色图片" in reviewer_prompt
+    assert "女主" in reviewer_prompt
+    assert "男主" in reviewer_prompt
+    assert "闺蜜" in reviewer_prompt
+    assert "中等复杂度" in reviewer_prompt
+
+
 async def test_reviewer_timeout_is_recorded_and_dispatch_continues() -> None:
     runtime = CrewDispatchRuntime(
         UnusedGateway(),
@@ -1126,6 +2665,90 @@ async def test_reviewer_invalid_json_retries_with_optimized_prompt_before_skip()
     assert retry.payload["strategy"] == "optimized_retry"
     review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review.payload["verdict"] == "approve"
+
+
+async def test_reviewer_chinese_consensus_rejection_requests_step_revision() -> None:
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                (
+                    "# Skeptic 审查结论\n\n"
+                    "## [CONSENSUS] 不通过——现有交付物为残缺品，拒绝放行\n\n"
+                    "核心问题：产物被截断，剧本不完整。需要退回重新生成完整剧本。"
+                ),
+                '{"verdict":"approve"}',
+            )
+        ),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    revisions = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("verdict") == "revise"
+    ]
+    assert len(revisions) == 1
+    assert "产物被截断" in str(revisions[0].payload["feedback"])
+    retry = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_RETRYING
+        and event.actor == "writer"
+        and event.reason == "review requested revision"
+    )
+    assert retry.payload["attempt"] == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_reviewer_plain_chinese_rejection_requests_step_revision() -> None:
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(
+            (
+                "未通过，需要重新生成角色参考图。主定妆照和表情图不像同一个人。",
+                '{"verdict":"approve"}',
+            )
+        ),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    revisions = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("verdict") == "revise"
+    ]
+    assert len(revisions) == 1
+    assert "不像同一个人" in str(revisions[0].payload["feedback"])
+    skipped = [
+        event
+        for event in events
+        if event.kind is EventKind.REVIEW_COMPLETED
+        and event.actor == "critic"
+        and event.payload.get("review_status") == "skipped"
+    ]
+    assert skipped == []
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+def test_plain_chinese_review_rejection_fallback_does_not_require_marker() -> None:
+    fallback = _fallback_review_response_from_text(
+        "未通过，需要重新生成角色参考图。主定妆照和表情图不像同一个人。"
+    )
+
+    assert fallback is not None
+    verdict, feedback = fallback
+    assert verdict == "revise"
+    assert feedback is not None
+    assert "不像同一个人" in feedback
 
 
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:
@@ -1197,3 +2820,231 @@ def test_artifact_review_packet_payload_uses_bounded_preview_without_full_text()
     assert packet["preview"] != original_text
     assert "[truncated:" in packet["preview"]
     assert artifact.content["text"] == original_text
+
+
+def test_artifact_review_items_payload_exposes_each_generated_file_for_review() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="character_designer",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "storage_key": "tenant/run/artifact/male.png",
+                        "mime_type": "image/png",
+                        "filename": "male-lead-model-sheet.png",
+                        "sha256": "a" * 64,
+                        "title": "男主角色参考设定表",
+                    },
+                    {
+                        "storage_key": "tenant/run/artifact/female.png",
+                        "mime_type": "image/png",
+                        "filename": "female-lead-model-sheet.png",
+                        "sha256": "b" * 64,
+                        "title": "女主角色参考设定表",
+                    },
+                ),
+            },
+        },
+    )
+
+    payload = _artifact_review_items_payload(artifact)
+
+    assert payload == (
+        {
+            "id": f"{artifact.id}:1",
+            "artifact_id": str(artifact.id),
+            "mime_type": "image/png",
+            "filename": "male-lead-model-sheet.png",
+            "sha256": "a" * 64,
+            "title": "男主角色参考设定表",
+        },
+        {
+            "id": f"{artifact.id}:2",
+            "artifact_id": str(artifact.id),
+            "mime_type": "image/png",
+            "filename": "female-lead-model-sheet.png",
+            "sha256": "b" * 64,
+            "title": "女主角色参考设定表",
+        },
+    )
+
+
+def test_artifact_review_feedback_text_includes_rejected_file_items() -> None:
+    artifact_id = uuid4()
+    feedback = _artifact_review_feedback_from_routing(
+        {
+            "artifact_review_feedback": {
+                "stage_id": "character_model_sheet",
+                "artifact_id": str(artifact_id),
+                "feedback": "部分角色设定图需要重做。",
+                "review_items": (
+                    {
+                        "id": f"{artifact_id}:2",
+                        "artifact_id": str(artifact_id),
+                        "filename": "female-lead-model-sheet.png",
+                        "sha256": "b" * 64,
+                        "title": "女主角色参考设定表",
+                        "feedback": "女主没有按设定生成单人参考表。",
+                    },
+                ),
+            },
+        }
+    )
+
+    assert feedback is not None
+    text = _artifact_review_feedback_text(feedback)
+    assert "部分角色设定图需要重做" in text
+    assert "female-lead-model-sheet.png" in text
+    assert "女主没有按设定生成单人参考表" in text
+
+
+def test_usable_file_artifacts_payload_exposes_generated_file_handles() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "file": {
+                    "storage_key": "tenant/run/artifact/shot.mp4",
+                    "mime_type": "video/mp4",
+                    "filename": "shot.mp4",
+                    "download_url": "/api/v1/admin/runs/run/artifacts/artifact/download",
+                    "artifact_id": "artifact-001",
+                },
+                "metadata": {
+                    "storage_key": "tenant/run/artifact/shot.mp4",
+                    "mime_type": "video/mp4",
+                    "filename": "shot.mp4",
+                },
+                "artifacts": (
+                    {
+                        "file": {
+                            "storage_key": "tenant/run/artifact/storyboard.png",
+                            "mime_type": "image/png",
+                            "filename": "storyboard.png",
+                        },
+                    },
+                ),
+            },
+        },
+    )
+
+    payload = _usable_file_artifacts_payload((artifact,))
+
+    assert payload == (
+        {
+            "source_artifact_id": str(artifact.id),
+            "source_producer": "multimedia_generator",
+            "storage_key": "tenant/run/artifact/shot.mp4",
+            "mime_type": "video/mp4",
+            "filename": "shot.mp4",
+            "artifact_id": "artifact-001",
+            "download_url": "/api/v1/admin/runs/run/artifacts/artifact/download",
+        },
+        {
+            "source_artifact_id": str(artifact.id),
+            "source_producer": "multimedia_generator",
+            "storage_key": "tenant/run/artifact/storyboard.png",
+            "mime_type": "image/png",
+            "filename": "storyboard.png",
+        },
+    )
+
+
+def test_compose_video_arguments_use_upstream_file_handles() -> None:
+    source = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "file": {
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/run/artifact/"
+                        "kling_kling-v3-omni-video-generation.mp4"
+                    ),
+                    "mime_type": "video/mp4",
+                    "filename": "kling_kling-v3-omni-video-generation.mp4",
+                    "artifact_id": "video-artifact",
+                    "download_url": "/api/v1/admin/runs/run/artifacts/video-artifact/download",
+                }
+            }
+        },
+    )
+    arguments: Mapping[str, JsonValue] = {
+        "title": "test cut",
+        "filename": "test-cut.mp4",
+        "clips": (
+            {
+                "storage_key": str(source.id),
+                "mime_type": "video/mp4",
+                "filename": "guessed.mp4",
+                "duration_seconds": 5,
+            },
+        ),
+    }
+
+    normalized = _normalize_compose_video_arguments_with_sources(arguments, (source,))
+    clips = cast(tuple[Mapping[str, JsonValue], ...], normalized["clips"])
+
+    assert clips[0]["storage_key"] == (
+        "00000000-0000-4000-8000-000000000001/run/artifact/"
+        "kling_kling-v3-omni-video-generation.mp4"
+    )
+    assert clips[0]["mime_type"] == "video/mp4"
+    assert clips[0]["filename"] == "kling_kling-v3-omni-video-generation.mp4"
+    assert clips[0]["duration_seconds"] == 5
+
+
+def test_direct_compose_video_arguments_resolves_file_handles_from_lineage_pool() -> None:
+    tool_artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="multimedia_generator",
+        content={
+            "result": {
+                "artifacts": (
+                    {
+                        "artifact_id": "source-video-artifact",
+                        "download_url": "/api/v1/admin/runs/run/artifacts/source-video-artifact/download",
+                        "filename": "shot-001.mp4",
+                        "mime_type": "video/mp4",
+                        "storage_key": "tenant/run/source/shot-001.mp4",
+                    },
+                ),
+            }
+        },
+        source_ids=(),
+    )
+    dependency_output = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="multimedia_generator",
+        content={"text": "Generated downloadable artifact shot-001.mp4 (video/mp4)."},
+        source_ids=(str(tool_artifact.id),),
+    )
+    step = DispatchStep(
+        id="compose",
+        agent="video_compositor",
+        task="将上游镜头剪辑成最终 5 秒 MP4",
+        tools=("compose_video",),
+        final_synthesizer=True,
+        token_budget=100,
+    )
+
+    arguments = _direct_compose_video_arguments(
+        step,
+        (dependency_output,),
+        available_artifacts=(dependency_output, tool_artifact),
+    )
+
+    assert arguments is not None
+    clips = arguments["clips"]
+    assert isinstance(clips, tuple)
+    first_clip = cast(Mapping[str, JsonValue], clips[0])
+    assert first_clip["storage_key"] == "tenant/run/source/shot-001.mp4"
+    assert first_clip["mime_type"] == "video/mp4"
+    assert first_clip["filename"] == "shot-001.mp4"

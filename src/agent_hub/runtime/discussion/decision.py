@@ -93,7 +93,7 @@ class ResolutionRequest:
     verified_option_id: str | None = None
 
     def __post_init__(self) -> None:
-        _require_bounded_text("task", self.task, allow_newlines=True, allow_tabs=True)
+        task = _normalize_task_text(self.task, label="discussion decision")
         if type(self.disagreement_kind) is not DisagreementKind:
             raise ValueError("disagreement_kind is invalid")
         if type(self.high_risk) is not bool:
@@ -110,6 +110,7 @@ class ResolutionRequest:
             _require_identifier("verified_option_id", self.verified_option_id)
             if self.verified_option_id not in {position.option_id for position in positions}:
                 raise ValueError("verified_option_id must match a proposed option")
+        object.__setattr__(self, "task", task)
         object.__setattr__(self, "positions", positions)
 
 
@@ -347,6 +348,24 @@ def _require_bounded_text(
         allowed_controls.add("\t")
     if any(_is_disallowed_control_character(character, allowed_controls) for character in value):
         raise ValueError(f"{name} must not contain control characters")
+
+
+def _normalize_task_text(value: str, *, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    allowed_controls = {"\n", "\t"}
+    if any(_is_disallowed_control_character(character, allowed_controls) for character in value):
+        raise ValueError("task must not contain control characters")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("task must be nonblank, unpadded, and bounded")
+    if len(stripped) <= _MAX_TEXT:
+        return stripped
+    marker = f"\n[truncated for {label}; middle omitted]\n"
+    budget = _MAX_TEXT - len(marker)
+    head_length = budget // 2
+    tail_length = budget - head_length
+    return stripped[:head_length].rstrip() + marker + stripped[-tail_length:].lstrip()
 
 
 def _is_disallowed_control_character(character: str, allowed_controls: set[str]) -> bool:

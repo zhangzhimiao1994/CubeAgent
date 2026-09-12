@@ -64,11 +64,13 @@ class StubRunService:
             str | None,
             tuple[str, ...],
             bool,
+            dict[str, str] | None,
         ]
     ]
     enqueue_count: int = 0
     direct_models: list[str | None] | None = None
     vibe_coding_flags: list[bool] | None = None
+    submit_error: ValueError | None = None
 
     async def submit(
         self,
@@ -86,9 +88,14 @@ class StubRunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
+        channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        del skip_schedule_proposal
+        if self.submit_error is not None:
+            raise self.submit_error
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
@@ -106,6 +113,7 @@ class StubRunService:
                 reference_conversation_id,
                 attachment_ids,
                 skip_evolution_proposal,
+                channel_context,
             )
         )
         if not skip_evolution_proposal and "进化 darwin-skill" in message:
@@ -284,6 +292,48 @@ class StubRunService:
             temporary_agent_proposal=None,
         )
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
+    async def reject_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+        review_items: tuple[dict[str, str], ...] = (),
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version, feedback, review_items
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         return RunSummary(
             id=run_id,
@@ -381,6 +431,7 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
             None,
             (),
             False,
+            None,
         )
     ]
     assert service.enqueue_count == 0
@@ -452,8 +503,66 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             None,
             (),
             False,
+            None,
         )
     ]
+
+
+def test_run_submission_rejects_blank_message_before_service_call() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": " \n\t ", "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
+def test_run_submission_rejects_message_above_runtime_byte_limit() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "长" * 22_000, "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
+def test_run_submission_rejects_hidden_control_characters_before_service_call() -> None:
+    client, service, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "帮我分析这段材料\u200b", "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert service.submitted == []
+
+
+def test_run_submission_maps_service_message_validation_to_422() -> None:
+    client, service, _ = _client()
+    service.submit_error = ValueError(
+        "message must be at most 16000 characters; upload long documents as attachments"
+    )
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "背景材料" * 5000, "mode": "direct"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+    assert response.json()["error"]["details"]["reason"].startswith("message must be at most")
+    assert service.submitted == []
 
 
 def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
@@ -485,6 +594,7 @@ def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
             None,
             (),
             True,
+            None,
         )
     ]
 
@@ -535,6 +645,7 @@ def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> 
             None,
             (),
             False,
+            None,
         )
     ]
 
@@ -660,6 +771,7 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             "conv-previous",
             (),
             False,
+            None,
         )
     ]
 
@@ -879,6 +991,78 @@ def test_submission_forwards_attachment_ids() -> None:
             None,
             ("att_0123456789abcdef0123456789abcdef",),
             False,
+            None,
+        )
+    ]
+
+
+def test_submission_forwards_requested_skill_and_plugin_mentions() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "用 @deep-research 和 $plugin:runway 处理这个任务",
+            "mode": "auto",
+            "requested_skills": ["deep-research"],
+            "requested_plugins": ["runway"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "用 @deep-research 和 $plugin:runway 处理这个任务",
+            TaskMode.AUTO,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+            False,
+            {
+                "requested_skills": "deep-research",
+                "requested_plugins": "runway",
+            },
+        )
+    ]
+
+
+def test_submission_accepts_full_requested_plugin_id() -> None:
+    client, service, principal = _client()
+    plugin_id = "app-6a05e3b201788191be12b590b43e6ce3@openai-curated-remote"
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": f"用 $plugin:{plugin_id} 处理这个任务",
+            "mode": "auto",
+            "requested_plugins": [plugin_id],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            f"用 $plugin:{plugin_id} 处理这个任务",
+            TaskMode.AUTO,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+            False,
+            {
+                "requested_plugins": plugin_id,
+            },
         )
     ]
 
@@ -931,6 +1115,57 @@ def test_revise_temporary_agent_accepts_user_feedback_and_queues_run() -> None:
             "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
             "version": 1,
             "feedback": "不要加工程师，先让产品经理重新拆任务。",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_approve_artifact_review_queues_waiting_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/approve",
+        headers=bearer(),
+        json={"version": 3},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_reject_artifact_review_accepts_feedback_and_queues_waiting_run() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/reject",
+        headers=bearer(),
+        json={"version": 3, "feedback": "角色形象不一致，退回重新生成。"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_reject_artifact_review_accepts_file_level_feedback() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/artifact-reviews/artifact-review-test/reject",
+        headers=bearer(),
+        json={
+            "version": 3,
+            "rejected_items": [
+                {"id": "artifact-sheet:1", "feedback": "男主定妆图和角色设定不一致。"},
+                {"id": "artifact-sheet:2", "feedback": "女主需要单独生成参考设定表。"},
+            ],
         },
     )
 

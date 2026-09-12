@@ -42,6 +42,13 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_deploy_matrix_native_dry_run_uses_smoke_wrapper() -> None:
+    workflow = read(".github/workflows/deploy-matrix.yml")
+
+    assert "bash tests/install/smoke.sh --mode auto --dry-run" in workflow
+    assert "env AGENT_HUB_TEST=1 bash install.sh --mode auto --dry-run --yes" not in workflow
+
+
 def test_auto_mode_prefers_native_on_supported_systemd_hosts() -> None:
     detect = read("scripts/lib/detect.sh")
     install = read("install.sh")
@@ -69,9 +76,34 @@ def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:
     assert '"$INSTALL_ROOT/releases/"*)' in script
     assert 'rm -rf -- "$resolved_release"' in script
 
-    link_current = script.index('ln -sfn "$release" "$INSTALL_ROOT/current"')
-    prune = script.index("prune_native_releases")
-    assert link_current < prune
+    deploy_function = script.split("deploy_native_release() {", maxsplit=1)[1].split(
+        "\n}\n\nfix_native_web_permissions",
+        maxsplit=1,
+    )[0]
+    install_function = script.split("install_native_mode() {", maxsplit=1)[1]
+    assert 'ln -sfn "$release" "$INSTALL_ROOT/current"' in deploy_function
+    assert "prune_native_releases" not in deploy_function
+    api_ready = install_function.index('require_native_http_ready "Agent Hub API readiness"')
+    prune = install_function.index("prune_native_releases")
+    assert api_ready < prune
+
+
+def test_native_release_pruning_keeps_current_and_current_venv_dependencies() -> None:
+    script = read("scripts/lib/install_native.sh")
+    prune = script.split("prune_native_releases() {", maxsplit=1)[1].split(
+        "\n}\n\ninstall_native_tls_assets",
+        maxsplit=1,
+    )[0]
+
+    assert 'keep="${AGENT_HUB_RELEASES_TO_KEEP:-1}"' in prune
+    assert 'current_venv_release="$(_native_release_dir_for_child "$current_release/.venv")"' in prune
+    assert (
+        'current_litellm_release="$(_native_release_dir_for_child "$current_release/.litellm-venv")"'
+        in prune
+    )
+    assert '[[ "$resolved_release" == "$current_venv_release" ]]' in prune
+    assert '[[ "$resolved_release" == "$current_litellm_release" ]]' in prune
+    assert 'rm -rf -- "$resolved_release"' in prune
 
 
 def test_installer_failure_output_includes_context_and_hints() -> None:
@@ -133,6 +165,14 @@ def test_install_verification_uses_public_url_for_docker_mode() -> None:
     assert "litellm.proxy.proxy_server" in verify
     assert 'verify_url "$base_url/health/live"' in verify
     assert 'verify_url "$base_url/health/ready"' in verify
+
+
+def test_compose_api_healthcheck_has_startup_grace_period() -> None:
+    compose = read("deploy/compose/docker-compose.yml")
+    api_service = compose.split("\n  api:", maxsplit=1)[1].split("\n  worker:", maxsplit=1)[0]
+
+    assert "healthcheck:" in api_service
+    assert "start_period: 60s" in api_service
 
 
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:
