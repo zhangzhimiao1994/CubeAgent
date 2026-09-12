@@ -1056,6 +1056,21 @@ def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
     )
 
 
+def _step_timeout_recovery_allowed(
+    step: DispatchStep,
+    capabilities: CapabilityGateway | None,
+    *,
+    attempt_has_side_effects: bool,
+) -> bool:
+    if not step.tools:
+        return True
+    if attempt_has_side_effects:
+        return False
+    if capabilities is None:
+        return False
+    return all(capabilities.is_replay_safe(tool) for tool in step.tools)
+
+
 _OPTIONAL_REVIEW_AGENT_MARKERS = frozenset(
     (
         "review",
@@ -3998,7 +4013,11 @@ class CrewDispatchRuntime:
                 if (
                     framework_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
                     and remaining > retry_threshold
-                    and not step.tools
+                    and _step_timeout_recovery_allowed(
+                        step,
+                        self._capabilities,
+                        attempt_has_side_effects=last_completion is not None or bool(evidence),
+                    )
                 ):
                     await attempt_state_drop_boundary(step.id, retries)
                     framework_attempt += 1

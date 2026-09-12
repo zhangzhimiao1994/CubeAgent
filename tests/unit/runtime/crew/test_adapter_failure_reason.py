@@ -95,6 +95,38 @@ class ReviewAwareGateway:
         )
 
 
+class DocumentToolGateway:
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        return GatewayCompletion(
+            response=ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="call-docx",
+                        name="document.generate_docx",
+                        arguments={
+                            "title": "Long Report",
+                            "filename": "long-report.docx",
+                            "sections": (
+                                {
+                                    "heading": "Summary",
+                                    "paragraphs": ("Recovered compact document output.",),
+                                },
+                            ),
+                            "presentation": "final_attachment",
+                        },
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class EmptyThenSuccessGateway:
     def __init__(self) -> None:
         self.calls = 0
@@ -550,6 +582,35 @@ class DirectMultimediaCapabilities(MultimediaCapabilities):
         assert tenant_id == TENANT_ID
         assert kind in {"image", "video", "audio"}
         return "media_primary"
+
+
+class ReplaySafeDocumentCapabilities:
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, idempotency_key
+        assert name == "document.generate_docx"
+        assert arguments["presentation"] == "final_attachment"
+        return {
+            "presentation": "final_attachment",
+            "summary": "已生成恢复后的 DOCX 文档。",
+            "file": {
+                "filename": "long-report.docx",
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ),
+            },
+        }
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "document.generate_docx"
 
 
 def _one_step_plan(*, timeout_seconds: float = 60.0) -> DispatchPlan:
@@ -2148,6 +2209,38 @@ async def test_dispatch_step_timeout_retries_with_compact_recovery_prompt() -> N
     assert retry.payload["error_code"] == "crew.step_timeout"
     assert retry.payload["step_id"] == "final"
     assert retry.payload["actor"] == "writer"
+    assert "compact_retry" in factory.generation.prompts[1]
+    assert len(factory.generation.prompts[1].encode("utf-8")) < len(
+        factory.generation.prompts[0].encode("utf-8")
+    )
+
+
+async def test_dispatch_tool_step_timeout_retries_with_compact_recovery_prompt() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="researcher",
+        content={"text": "source material for a long report " * 500},
+    )
+    factory = StepTimeoutOnceFactory()
+    runtime = CrewDispatchRuntime(
+        DocumentToolGateway(),
+        _one_step_tool_plan(tools=("document.generate_docx",)),
+        crew_factory=factory,
+        capability_gateway=ReplaySafeDocumentCapabilities(),
+    )
+
+    events = [event async for event in runtime.run(_context(artifacts=(artifact,)))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "step execution timed out; retrying with compact recovery"
+    assert retry.payload["attempt"] == 2
+    assert retry.payload["strategy"] == "compact_retry"
+    assert retry.payload["input_policy"] == "compact_source_previews"
+    assert retry.payload["error_code"] == "crew.step_timeout"
     assert "compact_retry" in factory.generation.prompts[1]
     assert len(factory.generation.prompts[1].encode("utf-8")) < len(
         factory.generation.prompts[0].encode("utf-8")
