@@ -957,6 +957,33 @@ def _fallback_review_response_from_text(text: str) -> tuple[str, str | None] | N
     return None
 
 
+def _validate_direct_multimedia_result_count(
+    capability_name: str,
+    arguments: Mapping[str, JsonValue],
+    result: Mapping[str, JsonValue],
+) -> None:
+    if capability_name != "generate_multimedia":
+        return
+    expected = arguments.get("artifact_count")
+    if type(expected) is not int or expected <= 1:
+        return
+    actual = _direct_multimedia_result_artifact_count(result)
+    if actual < expected:
+        _fail(
+            "generated multimedia artifact count is incomplete "
+            f"(expected={expected}; actual={actual})"
+        )
+
+
+def _direct_multimedia_result_artifact_count(result: Mapping[str, JsonValue]) -> int:
+    artifacts = result.get("artifacts")
+    if isinstance(artifacts, tuple | list):
+        return sum(1 for artifact in artifacts if isinstance(artifact, Mapping))
+    if isinstance(result.get("file"), Mapping) or isinstance(result.get("metadata"), Mapping):
+        return 1
+    return 0
+
+
 def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
     for item in reversed(results):
         result = item.get("result")
@@ -975,6 +1002,9 @@ def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
                 return f"Generated downloadable artifact {filename} ({mime_type})."
         media_artifacts = result.get("artifacts")
         if isinstance(media_artifacts, tuple | list):
+            downloadable: list[str] = []
+            media_count = 0
+            summary = result.get("summary")
             for artifact in media_artifacts:
                 if not isinstance(artifact, Mapping):
                     continue
@@ -983,23 +1013,23 @@ def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
                 download_url = artifact.get("download_url")
                 if type(filename) is not str or type(mime_type) is not str:
                     continue
+                media_count += 1
                 link_label = _download_link_label(mime_type)
                 expiry_note = _download_expiry_note(artifact)
-                summary = result.get("summary")
-                if type(summary) is str and summary.strip():
-                    if type(download_url) is str and download_url.strip():
-                        return (
-                            f"{summary.strip()} "
-                            f"[{link_label}：{filename}]({download_url.strip()})"
-                            f"（{mime_type}，{expiry_note}）。"
-                        )
-                    return f"{summary.strip()} 已生成文件：{filename}（{mime_type}，{expiry_note}）。"
                 if type(download_url) is str and download_url.strip():
-                    return (
-                        f"已生成可下载的多媒体文件："
+                    downloadable.append(
                         f"[{link_label}：{filename}]({download_url.strip()})"
-                        f"（{mime_type}，{expiry_note}）。"
+                        f"（{mime_type}，{expiry_note}）"
                     )
+                else:
+                    downloadable.append(f"{filename}（{mime_type}，{expiry_note}）")
+            if downloadable:
+                prefix = (
+                    summary.strip()
+                    if type(summary) is str and summary.strip()
+                    else f"已生成 {media_count} 个可下载的多媒体文件。"
+                )
+                return f"{prefix} 文件：{'；'.join(downloadable)}。"
     return None
 
 
@@ -1301,9 +1331,11 @@ _CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT = (
     "保持同一人物身份一致：主定妆照、三视图、表情和服装细节必须像同一个人。"
     "保持同一画风，不得混用写实照片、二次元头像和线稿三视图；"
     "用户指定二次元时全二次元，指定写实时全写实。"
-    "采用中等复杂度：画面以主定妆照为核心，包含简化三视图、3-5 个表情/头部变化、"
-    "服装整体展示和 3-6 个关键服装/道具细节；不要过度堆叠小物件、文字说明或复杂资产格，"
-    "也不要只输出头像或单张主图。"
+    "采用中等复杂度：画面以主定妆照为核心，必须包含正面主定妆照、简化三视图、"
+    "3-5 个表情/头部变化、服装整体展示、色彩基调和 3-6 个关键服装/身份道具细节；"
+    "服装、发型、年龄感、职业气质必须来自角色设定。"
+    "不要过度堆叠小物件、文字说明或复杂资产格，也不要只输出头像、单张主图、"
+    "重复近景头像或与角色设定无关的食物/商品/摆拍道具。"
     "禁止写实主图+二次元表情+线稿三视图的混合拼贴。"
 )
 
@@ -4333,6 +4365,7 @@ class CrewDispatchRuntime:
                 encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
                 if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
                     _fail("capability result exceeds limit")
+                _validate_direct_multimedia_result_count(capability_name, arguments, result)
             except asyncio.CancelledError:
                 if not replay_safe:
                     uncertain = dict(running_tool)

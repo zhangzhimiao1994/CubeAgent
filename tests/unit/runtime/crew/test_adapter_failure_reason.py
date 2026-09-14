@@ -21,6 +21,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.crew.adapter import (
+    CapabilityOutcomeUncertain,
     CrewAgentDefinition,
     CrewDispatchRuntime,
     CrewLLMBridge,
@@ -36,6 +37,7 @@ from agent_hub.runtime.crew.adapter import (
     _direct_compose_video_arguments,
     _direct_multimedia_generation_prompt,
     _fallback_review_response_from_text,
+    _final_attachment_summary,
     _normalize_compose_video_arguments_with_sources,
     _normalize_tool_call_arguments,
     _usable_file_artifacts_payload,
@@ -556,19 +558,28 @@ class MultimediaCapabilities:
     ) -> Mapping[str, JsonValue]:
         del tenant_id, run_id, idempotency_key
         self.calls.append((actor, name, arguments))
+        raw_count = arguments.get("artifact_count")
+        artifact_count = raw_count if type(raw_count) is int and raw_count > 0 else 1
         return {
             "job_id": "media-test",
             "kind": arguments["kind"],
             "logical_model": arguments["logical_model"],
             "status": "completed",
             "executor_id": actor,
-            "summary": "Generated image artifact with media_primary.",
-            "artifacts": (
+            "summary": (
+                "Generated image artifact with media_primary."
+                if artifact_count == 1
+                else f"Generated {artifact_count} image artifacts with media_primary."
+            ),
+            "artifacts": tuple(
                 {
-                    "filename": "poster.png",
+                    "filename": f"poster-{index}.png" if artifact_count > 1 else "poster.png",
                     "mime_type": "image/png",
-                    "download_url": "/api/v1/admin/multimedia/jobs/media-test/artifacts/0/download",
-                },
+                    "download_url": (
+                        f"/api/v1/admin/multimedia/jobs/media-test/artifacts/{index}/download"
+                    ),
+                }
+                for index in range(artifact_count)
             ),
             "presentation": "final_attachment",
         }
@@ -582,6 +593,44 @@ class DirectMultimediaCapabilities(MultimediaCapabilities):
         assert tenant_id == TENANT_ID
         assert kind in {"image", "video", "audio"}
         return "media_primary"
+
+
+def test_final_attachment_summary_lists_all_multimedia_files() -> None:
+    summary = _final_attachment_summary(
+        [
+            {
+                "name": "generate_multimedia",
+                "result": {
+                    "presentation": "final_attachment",
+                    "summary": "Generated 2 image artifacts with media_primary.",
+                    "artifacts": (
+                        {
+                            "filename": "male-lead-model-sheet.png",
+                            "mime_type": "image/png",
+                            "download_url": (
+                                "/api/v1/admin/multimedia/jobs/media-test/artifacts/0/download"
+                            ),
+                            "expires_at": "2026-09-15T00:00:00+00:00",
+                        },
+                        {
+                            "filename": "female-lead-model-sheet.png",
+                            "mime_type": "image/png",
+                            "download_url": (
+                                "/api/v1/admin/multimedia/jobs/media-test-2/artifacts/0/download"
+                            ),
+                            "expires_at": "2026-09-15T00:00:00+00:00",
+                        },
+                    ),
+                },
+            }
+        ]
+    )
+
+    assert summary is not None
+    assert "Generated 2 image artifacts" in summary
+    assert "male-lead-model-sheet.png" in summary
+    assert "female-lead-model-sheet.png" in summary
+    assert summary.count("下载图片") == 2
 
 
 class ReplaySafeDocumentCapabilities:
@@ -968,7 +1017,8 @@ async def test_multimedia_generator_direct_character_sheet_splits_gender_lead_pr
         assert "同一画风" in prompt_text
         assert "全二次元" in prompt_text
         assert "中等复杂度" in prompt_text
-        assert "不要只输出头像或单张主图" in prompt_text
+        assert "重复近景头像" in prompt_text
+        assert "与角色设定无关的食物" in prompt_text
         assert "禁止写实主图+二次元表情+线稿三视图" in prompt_text
 
 
@@ -1009,6 +1059,50 @@ async def test_multimedia_generator_direct_character_design_splits_gender_lead_p
         assert "本张角色参考设定表/角色设定图的唯一目标角色" in prompt_text
         assert "一张图只包含一个角色" in prompt_text
         assert "全写实" in prompt_text
+
+
+async def test_multimedia_generator_rejects_incomplete_character_sheet_count() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct media generation")
+
+    class IncompleteMultimediaCapabilities(DirectMultimediaCapabilities):
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
+            return {
+                "job_id": "media-test",
+                "kind": "image",
+                "logical_model": "media_primary",
+                "status": "completed",
+                "executor_id": "multimedia_generator",
+                "summary": "Generated image artifact with media_primary.",
+                "artifacts": (
+                    {
+                        "filename": "only-one-model-sheet.png",
+                        "mime_type": "image/png",
+                        "download_url": (
+                            "/api/v1/admin/multimedia/jobs/media-test/artifacts/0/download"
+                        ),
+                    },
+                ),
+                "presentation": "final_attachment",
+            }
+
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        _one_step_tool_plan(tools=("generate_multimedia",), multimedia=True),
+        capability_gateway=IncompleteMultimediaCapabilities(),
+        crew_factory=CapturingFactory(),
+    )
+
+    with pytest.raises(CapabilityOutcomeUncertain, match="artifact count is incomplete"):
+        async for _event in runtime.run(
+            _context(request="为男女主生成角色参考设定表，风格全是写实")
+        ):
+            pass
 
 
 async def test_multimedia_generator_direct_person_reference_splits_each_script_role() -> None:
@@ -1076,7 +1170,8 @@ async def test_multimedia_generator_direct_person_reference_splits_each_script_r
         prompt_text = cast(str, prompt)
         assert "一张图只包含一个角色" in prompt_text
         assert "不要混入其他角色设定" in prompt_text
-        assert "不要只输出头像或单张主图" in prompt_text
+        assert "重复近景头像" in prompt_text
+        assert "与角色设定无关的食物" in prompt_text
 
 
 async def test_multimedia_generator_direct_person_reference_keeps_split_when_group_is_negated() -> None:
@@ -2007,6 +2102,8 @@ def test_direct_multimedia_generation_prompt_constrains_character_model_sheet() 
     assert "一张图只包含一个角色" in prompt
     assert "不要把多个角色放在同一张设定表" in prompt
     assert "不要过度堆叠小物件" in prompt
+    assert "重复近景头像" in prompt
+    assert "与角色设定无关的食物" in prompt
 
 
 @pytest.mark.parametrize(
