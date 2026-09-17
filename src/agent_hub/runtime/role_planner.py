@@ -220,17 +220,18 @@ class RolePlanner:
         if request.mode is not TaskMode.DISCUSS and _is_asset_locked_video_pipeline_request(
             request.task
         ):
+            stage_role_ids = {
+                "asset_generator",
+                "storyboard_artist",
+                "shot_video_generator",
+                "video_compositor",
+            }
+            if not _has_concrete_script_context(request.task):
+                stage_role_ids.add("copywriter")
             role_specs = tuple(
                 spec
                 for spec in catalog_specs
-                if spec[0]
-                in {
-                    "copywriter",
-                    "asset_generator",
-                    "storyboard_artist",
-                    "shot_video_generator",
-                    "video_compositor",
-                }
+                if spec[0] in stage_role_ids
             )
             roles = tuple(_assignment(spec, request) for spec in role_specs)
             return RolePlan(
@@ -242,14 +243,13 @@ class RolePlanner:
         if request.mode is not TaskMode.DISCUSS and _is_script_first_asset_image_request(
             request.task
         ):
+            stage_role_ids = {"asset_generator"}
+            if not _has_concrete_script_context(request.task):
+                stage_role_ids.add("copywriter")
             role_specs = tuple(
                 spec
                 for spec in catalog_specs
-                if spec[0]
-                in {
-                    "copywriter",
-                    "asset_generator",
-                }
+                if spec[0] in stage_role_ids
             )
             roles = tuple(_assignment(spec, request) for spec in role_specs)
             return RolePlan(
@@ -2003,6 +2003,10 @@ _SCRIPT_MEDIA_REFERENCE_TERMS = (
 )
 _CONCRETE_SCRIPT_CONTEXT_TERMS = (
     "from the previous",
+    "provided script",
+    "script provided",
+    "script below",
+    "following script",
     "previous script",
     "existing script",
     "above script",
@@ -2013,6 +2017,20 @@ _CONCRETE_SCRIPT_CONTEXT_TERMS = (
     "前面",
     "已有",
     "现有",
+    "我提供",
+    "用户提供",
+    "提供的剧本",
+    "提供的脚本",
+    "上传的剧本",
+    "上传的脚本",
+    "以下剧本",
+    "以下脚本",
+    "以下是剧本",
+    "以下是脚本",
+    "剧本如下",
+    "脚本如下",
+    "剧本正文",
+    "脚本正文",
     "这个剧本",
     "这个脚本",
     "这段剧本",
@@ -2023,6 +2041,11 @@ _CONCRETE_SCRIPT_CONTEXT_TERMS = (
     "本脚本",
     "本会话",
 )
+
+
+def _has_concrete_script_context(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    return any(term in normalized for term in _CONCRETE_SCRIPT_CONTEXT_TERMS)
 
 
 def _is_script_first_media_generation_request(task: str) -> bool:
@@ -2036,7 +2059,7 @@ def _is_script_first_media_generation_request(task: str) -> bool:
             continue
         if not any(term in clause for term in _SCRIPT_MEDIA_REFERENCE_TERMS):
             continue
-        if any(term in clause for term in _CONCRETE_SCRIPT_CONTEXT_TERMS):
+        if _has_concrete_script_context(clause):
             continue
         return True
     return False

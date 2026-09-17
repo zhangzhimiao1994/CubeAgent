@@ -506,9 +506,50 @@ def test_unresolved_script_character_makeup_reference_generates_script_before_im
     role_ids = {role.id for role in plan.roles}
 
     assert "copywriter" in role_ids
-    assert "multimedia_generator" in role_ids
-    assert "generate_multimedia" in plan.role("multimedia_generator").allowed_tools
+    assert "asset_generator" in role_ids
+    assert "generate_multimedia" in plan.role("asset_generator").allowed_tools
     assert "video_compositor" not in role_ids
+
+
+def test_provided_script_asset_locked_video_pipeline_starts_from_assets() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "我提供剧本如下：\n"
+                "第一场，雨夜咖啡店，女主苏念发现一把发蓝光的旧钥匙。"
+                "男主陆沉追来，两人争执后钥匙触发蓝色电弧特效。\n"
+                "请根据这个剧本拆解全量资产图，资产确认后生成分镜图，"
+                "再根据分镜制作 AI 视频，最后剪辑成片。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == [
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    ]
+
+
+def test_provided_script_asset_image_request_starts_from_asset_generator() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "以下是剧本：第一场，女主在办公室收到神秘短信；"
+                "第二场，男主带她去天台确认线索。"
+                "请根据这个剧本提取并生成完整资产图，暂时不要生成视频。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["asset_generator"]
 
 
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
