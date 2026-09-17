@@ -217,7 +217,7 @@ class RolePlanner:
         else:
             role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
-        if request.mode is not TaskMode.DISCUSS and _is_script_first_media_generation_request(
+        if request.mode is not TaskMode.DISCUSS and _is_asset_locked_video_pipeline_request(
             request.task
         ):
             role_specs = tuple(
@@ -226,7 +226,29 @@ class RolePlanner:
                 if spec[0]
                 in {
                     "copywriter",
-                    "multimedia_generator",
+                    "asset_generator",
+                    "storyboard_artist",
+                    "shot_video_generator",
+                    "video_compositor",
+                }
+            )
+            roles = tuple(_assignment(spec, request) for spec in role_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
+        if request.mode is not TaskMode.DISCUSS and _is_script_first_asset_image_request(
+            request.task
+        ):
+            role_specs = tuple(
+                spec
+                for spec in catalog_specs
+                if spec[0]
+                in {
+                    "copywriter",
+                    "asset_generator",
                 }
             )
             roles = tuple(_assignment(spec, request) for spec in role_specs)
@@ -256,6 +278,9 @@ class RolePlanner:
                 in {
                     "director",
                     "video_compositor",
+                    "asset_generator",
+                    "storyboard_artist",
+                    "shot_video_generator",
                     "multimedia_generator",
                 }
             )
@@ -2015,6 +2040,77 @@ def _is_script_first_media_generation_request(task: str) -> bool:
             continue
         return True
     return False
+
+
+def _is_asset_locked_video_pipeline_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_deferred_media_pipeline_request(task):
+        return False
+    if _has_generation_negation(normalized):
+        return False
+    has_video_intent = _has_unnegated_terms(
+        normalized,
+        (
+            "ai 视频",
+            "ai视频",
+            "生成视频",
+            "制作视频",
+            "视频",
+            "短视频",
+            "短片",
+            "成片",
+            "mp4",
+            "video",
+            "clip",
+        ),
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    )
+    has_short_drama_video_intent = "短剧" in normalized and _has_unnegated_terms(
+        normalized,
+        ("成片", "剪辑", "视频", "mp4", "video"),
+        _MULTIMEDIA_GENERATION_NEGATIONS,
+    )
+    has_video_intent = has_video_intent or has_short_drama_video_intent
+    if not has_video_intent:
+        return False
+    existing_composition_only = (
+        _is_video_composition_request(task)
+        and not _requires_media_generation_before_composition(task)
+        and not _is_script_first_media_generation_request(task)
+    )
+    if existing_composition_only:
+        return False
+    return True
+
+
+def _is_script_first_asset_image_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if _is_asset_locked_video_pipeline_request(task):
+        return False
+    has_script = any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS) or (
+        "短剧" in normalized
+    )
+    has_reference = any(term in normalized for term in _SCRIPT_MEDIA_REFERENCE_TERMS) or any(
+        marker in normalized for marker in ("然后", "之后", "确认后", "after", "then", "next")
+    )
+    has_asset_image = any(
+        term in normalized
+        for term in (
+            "全量资产",
+            "专业资产",
+            "图片",
+            "图像",
+            "资产图",
+            "素材图",
+            "设定图",
+            "参考图",
+            "image",
+            "images",
+            "asset",
+            "assets",
+        )
+    )
+    return has_script and has_reference and has_asset_image
 
 
 def _is_video_composition_request(task: str) -> bool:

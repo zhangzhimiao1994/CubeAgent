@@ -164,6 +164,19 @@ _FINAL_MEDIA_DELIVERY_TERMS = (
     "成片",
     "mp4",
 )
+_FULL_PRODUCTION_ASSET_SCOPE = (
+    "全量专业资产图要求：必须从剧本提取并生成可审核的完整制作资产包，覆盖"
+    "角色、服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏、风格锁定；"
+    "不要只生成单独角色图或角色头像。资产确认后才允许进入分镜/视频。"
+)
+_LOCKED_STORYBOARD_SCOPE = (
+    "分镜图要求：必须基于已确认剧本和已锁定资产生成，延续角色、服装妆造、场景、"
+    "道具、动作、特效、镜头语言、情绪表演和风格锁定，不得重新设计资产。"
+)
+_LOCKED_SHOT_VIDEO_SCOPE = (
+    "AI 镜头视频要求：必须同时参考剧本、全量锁定资产图和分镜图生成；"
+    "角色、服装、场景、道具、动作和特效需与锁定资产一致。"
+)
 _VIDEO_PRODUCTION_ROLE_TERMS = (
     "video",
     "视频",
@@ -857,12 +870,11 @@ def _dispatch_plan(
         DispatchStep(
             id=f"{role.id}_step",
             agent=role.id,
-            task=(
-                f"Role mission: {role.mission}\n"
-                f"User task: {request_text}\n"
-                f"{memory_guidance}"
-                f"{plugin_guidance}"
-                "Return only the role-specific result, evidence, risks, and verification."
+            task=_dispatch_role_task(
+                role,
+                request_text=request_text,
+                memory_guidance=memory_guidance,
+                plugin_guidance=plugin_guidance,
             ),
             depends_on=_dispatch_role_dependencies(
                 role,
@@ -935,6 +947,15 @@ def _dispatch_role_dependencies(
 ) -> tuple[str, ...]:
     if _is_post_product_role(role):
         return producer_step_ids
+    role_ids = {candidate.id for candidate in selected_roles}
+    if role.id == "asset_generator" and "copywriter" in role_ids:
+        return ("copywriter_step",)
+    if role.id == "storyboard_artist" and "asset_generator" in role_ids:
+        return ("asset_generator_step",)
+    if role.id == "shot_video_generator" and "storyboard_artist" in role_ids:
+        return ("storyboard_artist_step",)
+    if role.id == "video_compositor" and "shot_video_generator" in role_ids:
+        return ("shot_video_generator_step",)
     if _requires_script_artifact_before_media(role, selected_roles, request):
         return tuple(
             f"{candidate.id}_step"
@@ -948,6 +969,38 @@ def _dispatch_role_dependencies(
             if candidate.id != role.id and not _is_post_product_role(candidate)
         )
     return ()
+
+
+def _dispatch_role_task(
+    role: RoleAssignment,
+    *,
+    request_text: str,
+    memory_guidance: str,
+    plugin_guidance: str,
+) -> str:
+    extra = ""
+    if role.id == "copywriter":
+        extra = (
+            "先生成完整剧本；该剧本是后续资产、分镜、AI 视频和剪辑的唯一文本基准。"
+            "输出后等待用户审核确认，不要提前生成图片或视频。"
+        )
+    elif role.id == "asset_generator":
+        extra = _FULL_PRODUCTION_ASSET_SCOPE
+    elif role.id == "storyboard_artist":
+        extra = _LOCKED_STORYBOARD_SCOPE
+    elif role.id == "shot_video_generator":
+        extra = _LOCKED_SHOT_VIDEO_SCOPE
+    elif role.id == "video_compositor":
+        extra = "最终剪辑要求：只使用已审核镜头视频/图片素材合成可下载 MP4，不重新生成资产。"
+    extra_block = f"\n阶段规则：{extra}\n" if extra else ""
+    return (
+        f"Role mission: {role.mission}\n"
+        f"User task: {request_text}\n"
+        f"{memory_guidance}"
+        f"{plugin_guidance}"
+        f"{extra_block}"
+        "Return only the role-specific result, evidence, risks, and verification."
+    )
 
 
 def _requires_script_artifact_before_media(
@@ -1002,6 +1055,10 @@ def _role_requires_user_review(
     requires_intermediate_review = isinstance(
         context.routing_decision.get("media_pipeline_plan"), Mapping
     ) or _request_requires_intermediate_media_review(context.request)
+    if _is_asset_locked_pipeline_role(role) and _request_requires_asset_locked_pipeline_review(
+        context.request
+    ):
+        return True
     if single_delivery_role_is_final and not requires_intermediate_review:
         return False
     if not requires_intermediate_review:
@@ -1013,6 +1070,41 @@ def _role_requires_user_review(
         "storyboard_artist",
         "shot_video_generator",
     }
+
+
+def _is_asset_locked_pipeline_role(role: RoleAssignment) -> bool:
+    return role.id in {
+        "copywriter",
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+    }
+
+
+def _request_requires_asset_locked_pipeline_review(request: str) -> bool:
+    text = request.casefold()
+    has_script = any(term in text for term in ("剧本", "脚本", "script", "screenplay", "短剧"))
+    has_media_asset = any(
+        term in text
+        for term in (
+            "资产图",
+            "素材图",
+            "图片资产",
+            "全量资产",
+            "分镜",
+            "视频",
+            "成片",
+            "mp4",
+            "asset",
+            "storyboard",
+            "video",
+        )
+    )
+    if has_script and has_media_asset:
+        return True
+    return isinstance(request, str) and any(
+        term in text for term in ("media_pipeline_plan", "全量专业资产", "锁定资产")
+    )
 
 
 def _request_requires_intermediate_media_review(request: str) -> bool:
@@ -1351,8 +1443,11 @@ def _should_use_standalone_multimedia_roles(
     if _is_standalone_multimedia_role_plan(planner_roles):
         return True
     media_role_ids = {
+        "asset_generator",
         "director",
         "multimedia_generator",
+        "shot_video_generator",
+        "storyboard_artist",
         "video_compositor",
         "video_editor",
     }

@@ -1174,6 +1174,86 @@ async def test_multimedia_generator_direct_person_reference_splits_each_script_r
         assert "与角色设定无关的食物" in prompt_text
 
 
+async def test_multimedia_generator_direct_script_image_assets_generate_full_asset_pack() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct asset generation")
+
+    script = Artifact(
+        id=uuid4(),
+        type="script",
+        producer="copywriter",
+        content={
+            "text": (
+                "## 剧本\n"
+                "女主苏念在咖啡店发现会发光的旧钥匙，男主陆沉追来。"
+                "窗外暴雨，钥匙引发蓝色电弧特效，两人奔跑穿过街巷。"
+            )
+        },
+    )
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        DispatchPlan(
+            agents=(
+                AgentSpec(
+                    id="asset_generator",
+                    role="Asset Generator",
+                    goal="Generate the full locked production asset image pack.",
+                    logical_model="general",
+                    allowed_tools=("generate_multimedia",),
+                ),
+            ),
+            steps=(
+                DispatchStep(
+                    id="assets",
+                    agent="asset_generator",
+                    task="根据剧本生成全量专业资产图。",
+                    tools=("generate_multimedia",),
+                    final_synthesizer=True,
+                    token_budget=100,
+                ),
+            ),
+            allowed_tools=("generate_multimedia",),
+            total_token_budget=100,
+        ),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="先生成剧本，然后根据剧本生成图片资产，不要生成视频。", artifacts=(script,))
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, name, arguments = capabilities.calls[0]
+    assert name == "generate_multimedia"
+    assert arguments["kind"] == "image"
+    assert arguments["artifact_count"] == 9
+    artifact_prompts = arguments["artifact_prompts"]
+    assert isinstance(artifact_prompts, tuple)
+    joined = "\n".join(cast(str, prompt) for prompt in artifact_prompts)
+    for required in (
+        "角色资产",
+        "服装妆造资产",
+        "场景资产",
+        "道具资产",
+        "动作资产",
+        "特效资产",
+        "镜头资产",
+        "情绪/表演资产",
+        "声音节奏与风格锁定资产",
+    ):
+        assert required in joined
+    assert "不要只生成角色图" in joined
+    assert "旧钥匙" in joined
+    assert "蓝色电弧特效" in joined
+
+
 async def test_multimedia_generator_direct_person_reference_keeps_split_when_group_is_negated() -> None:
     class FailingTextGateway:
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:

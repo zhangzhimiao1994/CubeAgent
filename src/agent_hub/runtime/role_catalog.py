@@ -147,6 +147,77 @@ def _daily_work_roles() -> tuple[RoleDefinition, ...]:
         _role("copywriter", "Copywriter", "execute", "Produce practical copy, scripts, titles, posts, and message variants.", ("What copy was produced?", "Which version is recommended?", "What needs review?"), ("copywriting",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         _role("video_editor", "Video Editor", "execute", "Produce edit structure, pacing, shot order, transitions, captions, and asset notes.", ("What prompt or edit structure was produced?", "Which sequence is recommended?", "What visual asset is missing?"), ("editing",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         RoleDefinition(
+            id="asset_generator",
+            role="Asset Generator",
+            purpose="execute",
+            mission=(
+                "Generate the full locked production asset image pack from the script: "
+                "characters, costume/makeup, scenes, props, actions, effects, camera language, "
+                "performance/emotion, sound-rhythm references, and style-lock sheets."
+            ),
+            must_answer=(
+                "Which production asset categories were generated?",
+                "Which script details lock each asset category?",
+                "What image artifacts were produced for review?",
+            ),
+            allowed_tools=("read_context", "generate_multimedia"),
+            forbidden_actions=(
+                "do not reduce script-based image generation to only character portraits",
+                "do not generate final video clips",
+                "do not proceed without exposing reviewable asset images",
+            ),
+            skills=("multimedia", "visual-development"),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
+            id="storyboard_artist",
+            role="Storyboard Artist",
+            purpose="execute",
+            mission=(
+                "Generate storyboard images from the approved script and locked production assets; "
+                "keep characters, actions, effects, scenes, and style consistent with those assets."
+            ),
+            must_answer=(
+                "Which script beats became storyboard panels?",
+                "Which locked assets were used?",
+                "What storyboard image artifact was produced for review?",
+            ),
+            allowed_tools=("read_context", "generate_multimedia"),
+            forbidden_actions=(
+                "do not redesign characters, props, scenes, actions, or effects after asset lock",
+                "do not generate final video clips",
+            ),
+            skills=("multimedia", "storyboarding"),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
+            id="shot_video_generator",
+            role="Shot Video Generator",
+            purpose="execute",
+            mission=(
+                "Generate AI video shots using the script, locked production asset images, and "
+                "approved storyboard panels as references."
+            ),
+            must_answer=(
+                "Which shots were generated?",
+                "Which locked assets and storyboard panels were used?",
+                "What video artifacts were produced for review?",
+            ),
+            allowed_tools=("read_context", "generate_multimedia"),
+            forbidden_actions=(
+                "do not ignore locked asset images or storyboard references",
+                "do not compose the final MP4",
+            ),
+            skills=("multimedia", "video-generation"),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
             id="video_compositor",
             role="Video Compositor",
             purpose="execute",

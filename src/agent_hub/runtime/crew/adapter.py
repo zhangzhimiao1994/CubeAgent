@@ -1185,6 +1185,10 @@ _IMAGE_GENERATION_HINTS = frozenset(
         "概念图",
         "设定图",
         "设定板",
+        "资产图",
+        "素材图",
+        "图片资产",
+        "制作资产",
         "角色参考设定表",
         "角色参考图",
         "人物参考图",
@@ -1217,6 +1221,9 @@ _IMAGE_GENERATION_HINTS = frozenset(
         "poster",
         "cover",
         "concept art",
+        "production asset",
+        "asset sheet",
+        "asset pack",
         "character model sheet",
         "model sheet",
         "storyboard",
@@ -1247,11 +1254,18 @@ _IMAGE_DELIVERABLE_PRIORITY_HINTS = frozenset(
         "三视图",
         "设定表",
         "设定板",
+        "资产图",
+        "素材图",
+        "图片资产",
+        "制作资产",
         "合照",
         "同框",
         "双人照",
         "图片版",
         "分镜图",
+        "production asset",
+        "asset sheet",
+        "asset pack",
     )
 )
 _VIDEO_DELIVERABLE_PRIORITY_HINTS = frozenset(
@@ -1443,6 +1457,34 @@ def _lineage_expanded_artifacts(
 
 
 def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
+    step_text = unicodedata.normalize("NFKC", f"{step.agent} {step.task}").casefold()
+    if any(
+        term in step_text
+        for term in (
+            "asset_generator",
+            "asset generator",
+            "storyboard_artist",
+            "storyboard artist",
+            "资产图",
+            "素材图",
+            "图片资产",
+            "制作资产",
+            "分镜图",
+            "storyboard",
+        )
+    ):
+        return "image"
+    if any(
+        term in step_text
+        for term in (
+            "shot_video_generator",
+            "shot video generator",
+            "镜头视频",
+            "ai 视频",
+            "ai视频",
+        )
+    ):
+        return "video"
     request_text = context.request.casefold()
     request_kind = _infer_direct_multimedia_kind_from_text(request_text)
     if request_kind is not None:
@@ -1789,6 +1831,99 @@ def _direct_storyboard_generation_prompt(
     return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
 
 
+_FULL_PRODUCTION_ASSET_PROMPT_SPECS: tuple[tuple[str, str], ...] = (
+    (
+        "角色资产",
+        "为每个重要角色生成独立角色资产图，包含定妆、体态、发型、表情和身份气质；"
+        "角色必须来自剧本，不要只生成头像。",
+    ),
+    (
+        "服装妆造资产",
+        "生成主服装、场景服装、配饰、妆发、材质和色彩基调资产图；"
+        "每套服装要对应角色身份和剧情场景。",
+    ),
+    (
+        "场景资产",
+        "生成主要地点和关键空间资产图，包含室内/室外、时代城市感、天气、光线和氛围。",
+    ),
+    (
+        "道具资产",
+        "生成剧情关键物、随身物、识别性物件和特殊物件资产图；"
+        "道具必须能服务剧情推进。",
+    ),
+    (
+        "动作资产",
+        "生成关键动作姿态参考图，例如奔跑、转身、递物、拥抱、打斗、施法或躲避等；"
+        "动作必须来自剧本。",
+    ),
+    (
+        "特效资产",
+        "生成法术、能量、爆炸、烟雾、光效、屏幕特效、转场特效等视觉效果资产图；"
+        "特效形态和颜色要可复用。",
+    ),
+    (
+        "镜头资产",
+        "生成景别、机位、镜头运动、构图和节奏参考图；"
+        "服务后续分镜和 AI 视频镜头生成。",
+    ),
+    (
+        "情绪/表演资产",
+        "生成关键表情、眼神、肢体状态和表演强度参考图；"
+        "覆盖剧情转折处的情绪变化。",
+    ),
+    (
+        "声音节奏与风格锁定资产",
+        "生成声音节奏、旁白/对白节拍、音效点位、BGM 氛围和整体画风/色彩/质感锁定参考图；"
+        "用于剪辑节奏和统一视觉风格。",
+    ),
+)
+
+
+def _is_full_production_asset_image_prompt(request: str, task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    if any(term in normalized for term in ("asset_generator", "asset generator")):
+        return True
+    has_script = any(term in normalized for term in ("剧本", "脚本", "script", "screenplay", "短剧"))
+    has_asset_image = any(
+        term in normalized
+        for term in (
+            "全量资产",
+            "专业资产",
+            "资产图",
+            "素材图",
+            "图片资产",
+            "制作资产",
+            "asset pack",
+            "asset sheet",
+            "production asset",
+        )
+    )
+    return has_script and has_asset_image
+
+
+def _direct_full_production_asset_prompts(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    feedback: str | None,
+) -> tuple[str, ...]:
+    base_prompt = _direct_multimedia_generation_prompt(context, step, sources, feedback)
+    prompts: list[str] = []
+    for title, requirement in _FULL_PRODUCTION_ASSET_PROMPT_SPECS:
+        prompt = (
+            f"{base_prompt}\n\n"
+            f"本张图片资产类别：{title}。\n"
+            f"{requirement}\n"
+            "全量专业资产包规则：必须从剧本提取资产，不要只生成角色图；"
+            "不要跳过服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏或风格锁定。"
+            "本图只聚焦当前资产类别，供用户审核确认并作为后续分镜/视频的锁定参考。"
+        )
+        prompts.append(
+            _truncate_prompt_text(prompt, max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+        )
+    return tuple(prompts)
+
+
 def _is_video_reference_comparison_prompt(request: str, task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
     has_video = any(term in normalized for term in ("视频", "短片", "成片", "video", "clip"))
@@ -1866,6 +2001,8 @@ def _direct_multimedia_artifact_prompts(
 ) -> tuple[str, ...]:
     if _is_video_reference_comparison_prompt(context.request, step.task):
         return _direct_video_reference_comparison_prompts(context, step, sources, feedback)
+    if _is_full_production_asset_image_prompt(context.request, step.task):
+        return _direct_full_production_asset_prompts(context, step, sources, feedback)
     prompts: list[str] = []
     if _is_character_model_sheet_prompt(
         context.request, step.task

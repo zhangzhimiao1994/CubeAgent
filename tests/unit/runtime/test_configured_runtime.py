@@ -735,7 +735,7 @@ async def test_selected_dispatch_agents_do_not_hide_required_multimedia_generati
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
         capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=FakeTransport(),
-        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
     )
 
     events = [
@@ -825,8 +825,146 @@ async def test_media_pipeline_generation_step_requires_user_review_when_intermed
     ]
 
     steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
-    media_step = next(step for step in steps if step["agent"] == "multimedia_generator")
-    assert media_step["requires_user_review"] is True
+    asset_step = next(step for step in steps if step["agent"] == "asset_generator")
+    storyboard_step = next(step for step in steps if step["agent"] == "storyboard_artist")
+    shot_step = next(step for step in steps if step["agent"] == "shot_video_generator")
+    assert asset_step["requires_user_review"] is True
+    assert storyboard_step["requires_user_review"] is True
+    assert shot_step["requires_user_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_final_video_request_plans_script_asset_storyboard_shot_and_compose_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="生成一个都市甜宠短剧，先写剧本，再生成全量资产图，确认后生成分镜并制作视频，最后剪辑成片。",
+                routing_decision={"main_agent_model": "main"},
+            )
+        )
+    ]
+
+    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    role_ids = {role["id"] for role in roles}
+    steps_by_agent = {cast(str, step["agent"]): step for step in steps}
+
+    assert role_ids >= {
+        "copywriter",
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    }
+    assert steps_by_agent["copywriter"]["requires_user_review"] is True
+    assert steps_by_agent["asset_generator"]["depends_on"] == ("copywriter_step",)
+    assert steps_by_agent["asset_generator"]["requires_user_review"] is True
+    assert steps_by_agent["storyboard_artist"]["depends_on"] == ("asset_generator_step",)
+    assert steps_by_agent["storyboard_artist"]["requires_user_review"] is True
+    assert steps_by_agent["shot_video_generator"]["depends_on"] == ("storyboard_artist_step",)
+    assert steps_by_agent["shot_video_generator"]["requires_user_review"] is True
+    assert steps_by_agent["video_compositor"]["depends_on"] == ("shot_video_generator_step",)
+    assert steps_by_agent["video_compositor"]["tools"] == ("read_context", "compose_video")
+
+
+@pytest.mark.asyncio
+async def test_script_then_image_request_stops_at_reviewable_full_asset_pack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="先生成一个都市短剧剧本，然后根据剧本生成图片资产，不要生成视频。",
+                routing_decision={"main_agent_model": "main"},
+            )
+        )
+    ]
+
+    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    role_ids = {role["id"] for role in roles}
+    steps_by_agent = {cast(str, step["agent"]): step for step in steps}
+
+    assert role_ids >= {"copywriter", "asset_generator"}
+    assert "storyboard_artist" not in role_ids
+    assert "shot_video_generator" not in role_ids
+    assert "video_compositor" not in role_ids
+    assert steps_by_agent["copywriter"]["requires_user_review"] is True
+    assert steps_by_agent["asset_generator"]["depends_on"] == ("copywriter_step",)
+    assert steps_by_agent["asset_generator"]["requires_user_review"] is True
+    assert "全量专业资产图" in cast(str, steps_by_agent["asset_generator"]["task"])
 
 
 @pytest.mark.asyncio
@@ -969,9 +1107,13 @@ async def test_selected_hybrid_agents_do_not_hide_required_multimedia_generation
     hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[0])
     dispatch_plan = hybrid.dispatch._plan
 
-    assert {agent.id for agent in dispatch_plan.agents} >= {"copywriter", "multimedia_generator"}
-    media_step = next(step for step in dispatch_plan.steps if step.agent == "multimedia_generator")
-    assert media_step.tools == ("read_context", "generate_multimedia")
+    assert "copywriter" in {agent.id for agent in dispatch_plan.agents}
+    media_steps = [
+        step
+        for step in dispatch_plan.steps
+        if "generate_multimedia" in step.tools
+    ]
+    assert media_steps
 
 
 @pytest.mark.asyncio
@@ -2188,6 +2330,167 @@ def test_dispatch_plan_composes_after_generated_media_step() -> None:
 
     assert generator_step.id in compositor_step.depends_on
     assert "compose_video" in compositor_step.tools
+
+
+def test_final_video_request_uses_full_asset_locked_pipeline() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the short drama script.",
+            must_answer=("What script was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="asset_generator",
+            role="Asset Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate the full locked production asset image pack.",
+            must_answer=("What asset sheets were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not generate video clips.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="storyboard_artist",
+            role="Storyboard Artist",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate storyboard images from the script and locked assets.",
+            must_answer=("What storyboard was produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not generate final video.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="shot_video_generator",
+            role="Shot Video Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate AI video shots using locked assets and storyboard references.",
+            must_answer=("What video shots were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not compose the final MP4.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="video_compositor",
+            role="Video Compositor",
+            purpose=RolePurpose.EXECUTE,
+            mission="Compose approved shot videos into the final downloadable MP4.",
+            must_answer=("What final video was produced?",),
+            allowed_tools=("compose_video",),
+            forbidden_actions=("Do not generate new assets.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个都市甜宠短剧，先写剧本，再做全量资产图、分镜图，最后生成 AI 视频并剪辑成片。",
+            routing_decision={
+                "media_pipeline_plan": {
+                    "plan_id": "media-plan-asset-locked",
+                    "status": "planned",
+                },
+            },
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+
+    assert steps["copywriter"].requires_user_review is True
+    assert steps["asset_generator"].depends_on == ("copywriter_step",)
+    assert "全量专业资产图" in steps["asset_generator"].task
+    assert "角色、服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏、风格锁定" in steps[
+        "asset_generator"
+    ].task
+    assert steps["asset_generator"].requires_user_review is True
+    assert steps["storyboard_artist"].depends_on == ("asset_generator_step",)
+    assert "已锁定资产" in steps["storyboard_artist"].task
+    assert steps["storyboard_artist"].requires_user_review is True
+    assert steps["shot_video_generator"].depends_on == ("storyboard_artist_step",)
+    assert "剧本、全量锁定资产图和分镜图" in steps["shot_video_generator"].task
+    assert steps["shot_video_generator"].requires_user_review is True
+    assert steps["video_compositor"].depends_on == ("shot_video_generator_step",)
+    assert "compose_video" in steps["video_compositor"].tools
+
+
+def test_script_to_image_request_generates_full_asset_pack_without_video_steps() -> None:
+    roles = (
+        RoleAssignment(
+            id="copywriter",
+            role="Copywriter",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the short drama script.",
+            must_answer=("What script was produced?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not generate media artifacts.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="asset_generator",
+            role="Asset Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate the full locked production asset image pack.",
+            must_answer=("What asset sheets were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not generate video clips.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="先生成一个都市短剧剧本，然后根据剧本生成图片资产，不要生成视频。",
+            routing_decision={
+                "media_pipeline_plan": {
+                    "plan_id": "media-plan-image-assets",
+                    "status": "planned",
+                },
+            },
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia"}),
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+
+    assert steps["copywriter"].requires_user_review is True
+    assert steps["asset_generator"].depends_on == ("copywriter_step",)
+    assert "全量专业资产图" in steps["asset_generator"].task
+    assert "角色、服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏、风格锁定" in steps[
+        "asset_generator"
+    ].task
+    assert steps["asset_generator"].requires_user_review is True
+    assert "storyboard_artist" not in steps
+    assert "shot_video_generator" not in steps
+    assert "video_compositor" not in steps
 
 
 def test_dispatch_plan_generates_character_media_after_script_step() -> None:
