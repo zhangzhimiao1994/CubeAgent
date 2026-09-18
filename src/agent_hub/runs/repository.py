@@ -53,6 +53,23 @@ class ConversationContextItem:
     run_id: UUID
     request: str
     artifacts: tuple[dict[str, object], ...]
+    routing_decision: dict[str, object] | None = None
+
+
+def _status_can_seed_conversation_mode(status: RunStatus) -> bool:
+    return status in {
+        RunStatus.QUEUED,
+        RunStatus.PLANNING,
+        RunStatus.RUNNING,
+        RunStatus.RETRYING,
+        RunStatus.SYNTHESIZING,
+        RunStatus.COMPLETED,
+    }
+
+
+_CONVERSATION_MODE_SEED_STATUS_VALUES = tuple(
+    status.value for status in RunStatus if _status_can_seed_conversation_mode(status)
+)
 
 
 class RunNotFound(RuntimeError):
@@ -88,6 +105,25 @@ def _safe_temporary_agent_model(proposal: dict[object, object]) -> str:
         if isinstance(value, str) and _SAFE_MODEL_ID.fullmatch(value):
             return value
     raise RunConflict("temporary agent proposal has no safe model")
+
+
+def _checkpoint_state_completes_artifact_review(
+    state: object, stage_id: str, artifact_id: str
+) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    if state.get("phase") != "completed" or state.get("terminal") is not True:
+        return False
+    frontier = state.get("frontier")
+    if isinstance(frontier, (list, tuple)) and frontier:
+        return False
+    artifact_refs = state.get("artifact_refs")
+    if not isinstance(artifact_refs, Mapping):
+        return False
+    reference = artifact_refs.get(stage_id)
+    if not isinstance(reference, Mapping):
+        return False
+    return reference.get("id") == artifact_id
 
 
 class RunRepository:
@@ -201,7 +237,7 @@ class RunRepository:
                 .where(RunRow.actor_id == actor_id)
                 .where(RunRow.mode.is_not(None))
                 .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
-                .where(RunRow.status != RunStatus.WAITING_USER_MODE.value)
+                .where(RunRow.status.in_(_CONVERSATION_MODE_SEED_STATUS_VALUES))
                 .order_by(RunRow.created_at.desc(), RunRow.id.desc())
                 .limit(1)
             )
@@ -418,6 +454,181 @@ class RunRepository:
                     run_id=run_id,
                     task_name="agent_hub.runs.execute",
                     idempotency_key=f"{tenant_id}:{run_id}:temporary-agent-revision:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
+    async def approve_artifact_review_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for artifact review")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "runtime_artifact_review":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("approval_id") != approval_id:
+                raise RunConflict("artifact review approval id is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            stage_id = routing_decision.get("approval_stage_id")
+            artifact_id = routing_decision.get("approval_artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                raise RunConflict("artifact review payload is invalid")
+            media_pipeline_plan = routing_decision.get("media_pipeline_plan")
+            plan = dict(media_pipeline_plan) if isinstance(media_pipeline_plan, dict) else None
+            raw_plan_approved = plan.get("approved_artifacts") if plan is not None else None
+            approved_artifacts = _merged_artifact_review_entries(
+                raw_plan_approved,
+                routing_decision.get("approved_artifacts"),
+            )
+            approved_artifacts.append({"stage_id": stage_id, "artifact_id": artifact_id})
+            approved_artifacts = _merged_artifact_review_entries(approved_artifacts)
+            updated_routing = {
+                **{
+                    key: value
+                    for key, value in routing_decision.items()
+                    if key
+                    not in {
+                        "reason",
+                        "approval_kind",
+                        "approval_id",
+                        "approval_action",
+                        "approval_stage_id",
+                        "approval_artifact_id",
+                        "approval_review_items",
+                        "approved_artifacts",
+                        "artifact_review_feedback",
+                    }
+                },
+            }
+            if plan is None:
+                updated_routing["approved_artifacts"] = approved_artifacts
+            else:
+                updated_routing["media_pipeline_plan"] = {
+                    **plan,
+                    "approved_artifacts": approved_artifacts,
+                }
+            row.routing_decision = updated_routing
+            terminal_review = await self._latest_checkpoint_completes_artifact_review(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                stage_id=stage_id,
+                artifact_id=artifact_id,
+            )
+            row.status = (
+                RunStatus.COMPLETED.value if terminal_review else RunStatus.QUEUED.value
+            )
+            row.version += 1
+            await session.flush()
+            if not terminal_review:
+                session.add(
+                    RunOutboxRow(
+                        id=uuid4(),
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        task_name="agent_hub.runs.execute",
+                        idempotency_key=f"{tenant_id}:{run_id}:artifact-review:{version}",
+                        payload={"run_id": str(run_id)},
+                    )
+                )
+                await session.flush()
+            return self._record(row)
+
+    async def reject_artifact_review_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+        review_items: tuple[Mapping[str, str], ...] = (),
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for artifact review")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "runtime_artifact_review":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("approval_id") != approval_id:
+                raise RunConflict("artifact review approval id is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            stage_id = routing_decision.get("approval_stage_id")
+            artifact_id = routing_decision.get("approval_artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                raise RunConflict("artifact review payload is invalid")
+            media_pipeline_plan = routing_decision.get("media_pipeline_plan")
+            plan = dict(media_pipeline_plan) if isinstance(media_pipeline_plan, dict) else None
+            raw_plan_rejected = plan.get("rejected_artifacts") if plan is not None else None
+            rejected_artifacts = _merged_rejected_artifact_review_entries(
+                raw_plan_rejected,
+                routing_decision.get("rejected_artifacts"),
+            )
+            rejected_review_items = _artifact_review_item_rejections(
+                review_items,
+                routing_decision.get("approval_review_items"),
+            )
+            review_feedback: dict[str, object] = {
+                "stage_id": stage_id,
+                "artifact_id": artifact_id,
+                "feedback": feedback,
+            }
+            if rejected_review_items:
+                review_feedback["review_items"] = rejected_review_items
+            rejected_artifacts.append(review_feedback)
+            rejected_artifacts = _merged_rejected_artifact_review_entries(rejected_artifacts)
+            updated_routing = {
+                **{
+                    key: value
+                    for key, value in routing_decision.items()
+                    if key
+                    not in {
+                        "reason",
+                        "approval_kind",
+                        "approval_id",
+                        "approval_action",
+                        "approval_stage_id",
+                        "approval_artifact_id",
+                        "approval_review_items",
+                        "rejected_artifacts",
+                    }
+                },
+                "artifact_review_feedback": review_feedback,
+            }
+            if plan is None:
+                updated_routing["rejected_artifacts"] = rejected_artifacts
+            else:
+                updated_routing["media_pipeline_plan"] = {
+                    **plan,
+                    "rejected_artifacts": rejected_artifacts,
+                }
+            row.routing_decision = updated_routing
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:artifact-review-revision:{version}",
                     payload={"run_id": str(run_id)},
                 )
             )
@@ -727,6 +938,25 @@ class RunRepository:
             ).all()
             return tuple(dict(row.payload) for row in rows)
 
+    @staticmethod
+    async def _latest_checkpoint_completes_artifact_review(
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        stage_id: str,
+        artifact_id: str,
+    ) -> bool:
+        row = await session.scalar(
+            select(RunCheckpointRow)
+            .where(RunCheckpointRow.tenant_id == tenant_id, RunCheckpointRow.run_id == run_id)
+            .order_by(RunCheckpointRow.sequence.desc())
+            .limit(1)
+        )
+        if row is None:
+            return False
+        return _checkpoint_state_completes_artifact_review(row.state, stage_id, artifact_id)
+
     async def conversation_context(
         self,
         tenant_id: UUID,
@@ -785,6 +1015,9 @@ class RunRepository:
                     run_id=row.id,
                     request=row.request,
                     artifacts=tuple(artifacts_by_run.get(row.id, ())),
+                    routing_decision=None
+                    if row.routing_decision is None
+                    else dict(row.routing_decision),
                 )
                 for row in ordered_rows
             )
@@ -1015,6 +1248,119 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     return {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }
+
+
+def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            if not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+                continue
+            key = (stage_id, artifact_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"stage_id": stage_id, "artifact_id": artifact_id})
+    return entries
+
+
+def _merged_rejected_artifact_review_entries(*values: object) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, tuple[tuple[tuple[str, str], ...], ...]]] = set()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stage_id = item.get("stage_id")
+            artifact_id = item.get("artifact_id")
+            feedback = item.get("feedback")
+            if (
+                not isinstance(stage_id, str)
+                or not isinstance(artifact_id, str)
+                or not isinstance(feedback, str)
+            ):
+                continue
+            review_items = _artifact_review_items(item.get("review_items"))
+            key = (
+                stage_id,
+                artifact_id,
+                feedback,
+                tuple(
+                    tuple(sorted(review_item.items()))
+                    for review_item in review_items
+                ),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            entry: dict[str, object] = {
+                "stage_id": stage_id,
+                "artifact_id": artifact_id,
+                "feedback": feedback,
+            }
+            if review_items:
+                entry["review_items"] = review_items
+            entries.append(entry)
+    return entries
+
+
+def _artifact_review_item_rejections(
+    review_items: tuple[Mapping[str, str], ...],
+    allowed_items: object,
+) -> list[dict[str, str]]:
+    if not review_items:
+        return []
+    allowed = {item["id"]: item for item in _artifact_review_items(allowed_items)}
+    if not allowed:
+        raise RunConflict("artifact review item payload is unavailable")
+    rejected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in review_items:
+        item_id = item.get("id")
+        feedback = item.get("feedback")
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise RunConflict("artifact review item id is invalid")
+        if not isinstance(feedback, str) or not feedback.strip():
+            raise RunConflict("artifact review item feedback is invalid")
+        item_id = item_id.strip()
+        if item_id in seen:
+            continue
+        allowed_item = allowed.get(item_id)
+        if allowed_item is None:
+            raise RunConflict("artifact review item is not part of this approval")
+        seen.add(item_id)
+        rejected.append({**allowed_item, "feedback": feedback.strip()})
+    return rejected
+
+
+def _artifact_review_items(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list | tuple):
+        return []
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id.strip() or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned: dict[str, str] = {"id": item_id.strip()}
+        for field_name in ("artifact_id", "filename", "sha256", "mime_type", "kind", "title", "feedback"):
+            field_value = item.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                cleaned[field_name] = field_value.strip()
+        items.append(cleaned)
+    return items
 
 
 def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:

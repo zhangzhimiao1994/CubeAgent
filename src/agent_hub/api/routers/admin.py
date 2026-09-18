@@ -332,11 +332,14 @@ class RunEventResponse(BaseModel):
     step_id: str | None = None
     action: str | None = None
     decision: str | None = None
+    approval_id: str | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
     artifact: RunArtifactResponse | None = None
+    artifacts: list[RunArtifactResponse] = Field(default_factory=list)
 
 
 class RunDetailResponse(RunListItem):
+    version: int = Field(default=1, ge=1)
     request: str
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
@@ -4442,8 +4445,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         artifacts = await self._admin_run_artifacts(record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
+            version=record.version,
             events=[_admin_run_event(event, run_id=record.id) for event in events],
-            artifacts=[_admin_run_artifact(artifact, run_id=record.id) for artifact in artifacts],
+            artifacts=_admin_run_artifacts_response(artifacts, run_id=record.id),
             explicit_details={
                 "source": "database",
                 "version": str(record.version),
@@ -8204,6 +8208,11 @@ def _admin_run_event(
     message = event.get("reason") or event.get("message") or kind
     payload = event.get("payload")
     artifact = event.get("artifact")
+    artifacts = (
+        _admin_run_artifacts_response((artifact,), run_id=run_id)
+        if isinstance(artifact, dict) and run_id is not None
+        else []
+    )
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind if type(kind) is str else "event",
@@ -8215,8 +8224,10 @@ def _admin_run_event(
         step_id=_optional_event_string(event.get("step_id")),
         action=_optional_event_string(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
+        approval_id=_optional_event_string(event.get("approval_id")),
         payload=_event_payload(payload),
         artifact=_admin_run_artifact(artifact, run_id=run_id) if isinstance(artifact, dict) else None,
+        artifacts=artifacts,
     )
 
 
@@ -8347,6 +8358,91 @@ def _admin_run_artifact(
         download_url=None if file_metadata is None else file_metadata["download_url"],
         expires_at=None if file_metadata is None else file_metadata.get("expires_at"),
     )
+
+
+def _admin_run_artifacts_response(
+    artifacts: Iterable[dict[str, object]],
+    *,
+    run_id: UUID,
+) -> list[RunArtifactResponse]:
+    responses: list[RunArtifactResponse] = []
+    for artifact in artifacts:
+        expanded = _expanded_multimedia_run_artifacts(artifact, run_id=run_id)
+        if expanded:
+            responses.extend(expanded)
+        else:
+            responses.append(_admin_run_artifact(artifact, run_id=run_id))
+    return responses
+
+
+def _expanded_multimedia_run_artifacts(
+    artifact: dict[str, object],
+    *,
+    run_id: UUID,
+) -> list[RunArtifactResponse]:
+    artifact_id = artifact.get("id")
+    content = artifact.get("content")
+    if not isinstance(content, Mapping):
+        return []
+    result = content.get("result")
+    if not isinstance(result, Mapping):
+        return []
+    raw_items = result.get("artifacts")
+    if not isinstance(raw_items, list | tuple):
+        return []
+    expanded: list[RunArtifactResponse] = []
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        metadata = _public_file_metadata_from_multimedia_item(
+            item,
+            run_id=run_id,
+            fallback_artifact_id=_optional_event_string(item.get("artifact_id")),
+        )
+        if metadata is None:
+            continue
+        title = item.get("filename") or artifact.get("producer") or artifact_id
+        expanded.append(
+            RunArtifactResponse(
+                id=f"{artifact_id or 'artifact'}:{index}",
+                kind=str(item.get("kind") or artifact.get("type") or "artifact"),
+                title=str(title or "artifact"),
+                text=item.get("text") if type(item.get("text")) is str else None,
+                filename=metadata["filename"],
+                mime_type=metadata["mime_type"],
+                size_bytes=metadata["size_bytes"],
+                sha256=metadata["sha256"],
+                download_url=metadata["download_url"],
+                expires_at=metadata.get("expires_at"),
+            )
+        )
+    return expanded if len(expanded) > 1 else []
+
+
+def _public_file_metadata_from_multimedia_item(
+    item: Mapping[str, object],
+    *,
+    run_id: UUID,
+    fallback_artifact_id: str | None,
+) -> PublicFileMetadata | None:
+    generated_metadata = _validated_file_metadata(
+        item,
+        run_id=run_id,
+        fallback_artifact_id=fallback_artifact_id,
+    )
+    if generated_metadata is not None:
+        public_metadata = PublicFileMetadata(
+            filename=generated_metadata["filename"],
+            mime_type=generated_metadata["mime_type"],
+            size_bytes=generated_metadata["size_bytes"],
+            sha256=generated_metadata["sha256"],
+            download_url=generated_metadata["download_url"],
+        )
+        expires_at = generated_metadata.get("expires_at")
+        if expires_at is not None:
+            public_metadata["expires_at"] = expires_at
+        return public_metadata
+    return _validated_multimedia_file_metadata(item)
 
 
 def _find_file_metadata(

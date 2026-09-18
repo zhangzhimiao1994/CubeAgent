@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import keyword
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
@@ -41,6 +42,10 @@ from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.plugin_context import (
+    requested_plugin_context_payload,
+    requested_plugin_context_text,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
@@ -118,6 +123,84 @@ _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
     "questions_for_user": "string[]",
     "verification_needed": "string[]",
 }
+_INTERMEDIATE_MEDIA_REVIEW_TERMS = (
+    "character model sheet",
+    "model sheet",
+    "costume sheet",
+    "storyboard",
+    "角色参考设定表",
+    "角色参考图",
+    "人物参考图",
+    "角色定妆照",
+    "角色定妆图",
+    "定妆参考图",
+    "定妆图",
+    "角色设定表",
+    "角色设定",
+    "角色设定图",
+    "人设图",
+    "角色立绘",
+    "人物立绘",
+    "形象设定图",
+    "造型设定图",
+    "三视图",
+    "定妆照",
+    "设定表",
+    "设定板",
+    "服装设定",
+    "服装设定板",
+    "资产图",
+    "分镜图",
+    "分镜",
+)
+_FINAL_MEDIA_DELIVERY_TERMS = (
+    "final video",
+    "final mp4",
+    "final deliverable",
+    "最终结果",
+    "最终产物",
+    "最终成片",
+    "剪辑成片",
+    "成片",
+    "mp4",
+)
+_FULL_PRODUCTION_ASSET_SCOPE = (
+    "全量专业资产图要求：必须从剧本提取并生成可审核的完整制作资产包，覆盖"
+    "角色、服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏、风格锁定；"
+    "不要只生成单独角色图或角色头像。资产确认后才允许进入分镜/视频。"
+)
+_LOCKED_STORYBOARD_SCOPE = (
+    "分镜图要求：必须基于已确认剧本和已锁定资产生成，延续角色、服装妆造、场景、"
+    "道具、动作、特效、镜头语言、情绪表演和风格锁定，不得重新设计资产。"
+)
+_LOCKED_SHOT_VIDEO_SCOPE = (
+    "AI 镜头视频要求：必须同时参考剧本、全量锁定资产图和分镜图生成；"
+    "角色、服装、场景、道具、动作和特效需与锁定资产一致。"
+)
+_VIDEO_PRODUCTION_ROLE_TERMS = (
+    "video",
+    "视频",
+    "剪辑",
+    "分镜",
+    "导演",
+    "compositor",
+    "editor",
+    "director",
+    "multimedia",
+    "media",
+)
+_MEDIA_REVIEW_NEGATIONS = (
+    "不需要",
+    "无需",
+    "不要",
+    "不用",
+    "暂不",
+    "not need",
+    "do not",
+    "don't",
+    "without",
+    "no need",
+)
 
 
 class UnavailableRuntime:
@@ -179,6 +262,7 @@ class _PlannedRuntime:
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         sequence_offset = 1
         if context.checkpoint is None:
+            plugin_context = requested_plugin_context_payload(context.routing_decision)
             yield RunEvent(
                 kind=EventKind.STEP_STARTED,
                 sequence=1,
@@ -193,6 +277,7 @@ class _PlannedRuntime:
                     "summary": "Main Agent selected the runtime mode, roles, and models.",
                     "roles": self._roles,
                     "steps": self._steps,
+                    **({"requested_plugin_context": plugin_context} if plugin_context else {}),
                 },
             )
         async for event in self._child.run(context):
@@ -272,7 +357,11 @@ class ConfigBackedDirectRuntime:
             fallbacks=_fallbacks(config),
             capacity_wait_timeout=60,
         )
-        return DirectRuntime(gateway, logical_model=logical_model)
+        return DirectRuntime(
+            gateway,
+            logical_model=logical_model,
+            fallback_logical_models=_fallback_chain(config, logical_model),
+        )
 
 
 class ConfigBackedDispatchRuntime:
@@ -758,6 +847,12 @@ def _dispatch_plan(
         if hermes_context
         else ""
     )
+    plugin_context = requested_plugin_context_text(context.routing_decision)
+    plugin_guidance = (
+        f"\nRequested plugin guidance:\n{plugin_context}\n"
+        if plugin_context
+        else ""
+    )
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
@@ -775,17 +870,27 @@ def _dispatch_plan(
         DispatchStep(
             id=f"{role.id}_step",
             agent=role.id,
-            task=(
-                f"Role mission: {role.mission}\n"
-                f"User task: {request_text}\n"
-                f"{memory_guidance}"
-                "Return only the role-specific result, evidence, risks, and verification."
+            task=_dispatch_role_task(
+                role,
+                request_text=request_text,
+                memory_guidance=memory_guidance,
+                plugin_guidance=plugin_guidance,
             ),
-            depends_on=producer_step_ids if _is_post_product_role(role) else (),
+            depends_on=_dispatch_role_dependencies(
+                role,
+                selected_roles,
+                producer_step_ids,
+                context.request,
+            ),
             tools=_role_allowed_tools(
                 role,
                 context,
                 capability_gateway=capability_gateway,
+            ),
+            requires_user_review=_role_requires_user_review(
+                role,
+                context,
+                single_delivery_role_is_final=single_delivery_role_is_final,
             ),
             token_budget=role_token_budget,
             timeout_seconds=(
@@ -813,6 +918,7 @@ def _dispatch_plan(
         task=(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
+            f"{plugin_guidance}"
             "Resolve conflicts explicitly and state any user decision required."
         ),
         depends_on=final_dependencies,
@@ -833,6 +939,103 @@ def _dispatch_plan(
     )
 
 
+def _dispatch_role_dependencies(
+    role: RoleAssignment,
+    selected_roles: tuple[RoleAssignment, ...],
+    producer_step_ids: tuple[str, ...],
+    request: str,
+) -> tuple[str, ...]:
+    if _is_post_product_role(role):
+        return producer_step_ids
+    role_ids = {candidate.id for candidate in selected_roles}
+    if role.id == "asset_generator" and "copywriter" in role_ids:
+        return ("copywriter_step",)
+    if role.id == "storyboard_artist" and "asset_generator" in role_ids:
+        return ("asset_generator_step",)
+    if role.id == "shot_video_generator" and "storyboard_artist" in role_ids:
+        return ("storyboard_artist_step",)
+    if role.id == "video_compositor" and "shot_video_generator" in role_ids:
+        return ("shot_video_generator_step",)
+    if _requires_script_artifact_before_media(role, selected_roles, request):
+        return tuple(
+            f"{candidate.id}_step"
+            for candidate in selected_roles
+            if candidate.id == "copywriter"
+        )
+    if role.id == "video_compositor" and "compose_video" in role.allowed_tools:
+        return tuple(
+            f"{candidate.id}_step"
+            for candidate in selected_roles
+            if candidate.id != role.id and not _is_post_product_role(candidate)
+        )
+    return ()
+
+
+def _dispatch_role_task(
+    role: RoleAssignment,
+    *,
+    request_text: str,
+    memory_guidance: str,
+    plugin_guidance: str,
+) -> str:
+    extra = ""
+    if role.id == "copywriter":
+        extra = (
+            "先生成完整剧本；该剧本是后续资产、分镜、AI 视频和剪辑的唯一文本基准。"
+            "输出后等待用户审核确认，不要提前生成图片或视频。"
+        )
+    elif role.id == "asset_generator":
+        extra = _FULL_PRODUCTION_ASSET_SCOPE
+    elif role.id == "storyboard_artist":
+        extra = _LOCKED_STORYBOARD_SCOPE
+    elif role.id == "shot_video_generator":
+        extra = _LOCKED_SHOT_VIDEO_SCOPE
+    elif role.id == "video_compositor":
+        extra = "最终剪辑要求：只使用已审核镜头视频/图片素材合成可下载 MP4，不重新生成资产。"
+    extra_block = f"\n阶段规则：{extra}\n" if extra else ""
+    return (
+        f"Role mission: {role.mission}\n"
+        f"User task: {request_text}\n"
+        f"{memory_guidance}"
+        f"{plugin_guidance}"
+        f"{extra_block}"
+        "Return only the role-specific result, evidence, risks, and verification."
+    )
+
+
+def _requires_script_artifact_before_media(
+    role: RoleAssignment,
+    selected_roles: tuple[RoleAssignment, ...],
+    request: str,
+) -> bool:
+    if role.id != "multimedia_generator" or "generate_multimedia" not in role.allowed_tools:
+        return False
+    if not any(candidate.id == "copywriter" for candidate in selected_roles):
+        return False
+    normalized = request.casefold()
+    has_script = any(term in normalized for term in ("script", "screenplay", "剧本", "脚本"))
+    has_reference = any(term in normalized for term in ("based on", "from", "基于", "根据"))
+    has_media = any(
+        term in normalized
+        for term in (
+            "image",
+            "video",
+            "storyboard",
+            "图片",
+            "图像",
+            "参考图",
+            "定妆图",
+            "定妆照",
+            "人设图",
+            "立绘",
+            "分镜图",
+            "分镜",
+            "视频",
+        )
+    )
+    return has_script and has_reference and has_media
+
+
 def _is_post_product_role(role: RoleAssignment) -> bool:
     return role.purpose in {
         RolePurpose.CRITIQUE,
@@ -841,6 +1044,90 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.VERIFY,
         RolePurpose.RELEASE,
     }
+
+
+def _role_requires_user_review(
+    role: RoleAssignment,
+    context: TaskContext,
+    *,
+    single_delivery_role_is_final: bool,
+) -> bool:
+    requires_intermediate_review = isinstance(
+        context.routing_decision.get("media_pipeline_plan"), Mapping
+    ) or _request_requires_intermediate_media_review(context.request)
+    if _is_asset_locked_pipeline_role(role) and _request_requires_asset_locked_pipeline_review(
+        context.request
+    ):
+        return True
+    if single_delivery_role_is_final and not requires_intermediate_review:
+        return False
+    if not requires_intermediate_review:
+        return False
+    if "generate_multimedia" in role.allowed_tools:
+        return True
+    return role.id in {
+        "character_designer",
+        "storyboard_artist",
+        "shot_video_generator",
+    }
+
+
+def _is_asset_locked_pipeline_role(role: RoleAssignment) -> bool:
+    return role.id in {
+        "copywriter",
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+    }
+
+
+def _request_requires_asset_locked_pipeline_review(request: str) -> bool:
+    text = request.casefold()
+    has_script = any(term in text for term in ("剧本", "脚本", "script", "screenplay", "短剧"))
+    has_media_asset = any(
+        term in text
+        for term in (
+            "资产图",
+            "素材图",
+            "图片资产",
+            "全量资产",
+            "分镜",
+            "视频",
+            "成片",
+            "mp4",
+            "asset",
+            "storyboard",
+            "video",
+        )
+    )
+    if has_script and has_media_asset:
+        return True
+    return isinstance(request, str) and any(
+        term in text for term in ("media_pipeline_plan", "全量专业资产", "锁定资产")
+    )
+
+
+def _request_requires_intermediate_media_review(request: str) -> bool:
+    text = request.casefold()
+    return _has_unnegated_media_review_term(
+        text, _INTERMEDIATE_MEDIA_REVIEW_TERMS
+    ) and not _has_unnegated_media_review_term(text, _FINAL_MEDIA_DELIVERY_TERMS)
+
+
+def _has_unnegated_media_review_term(text: str, terms: tuple[str, ...]) -> bool:
+    return any(
+        any(term in clause for term in terms)
+        for clause in _split_media_review_clauses(text)
+        if not any(negation in clause for negation in _MEDIA_REVIEW_NEGATIONS)
+    )
+
+
+def _split_media_review_clauses(text: str) -> tuple[str, ...]:
+    return tuple(
+        clause.strip()
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
+        if clause.strip()
+    )
 
 
 def _producer_step_timeout(
@@ -909,15 +1196,22 @@ def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue],
 
 def _dispatch_step_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     return tuple(
-        {
-            "id": step.id,
-            "agent": step.agent,
-            "depends_on": step.depends_on,
-            "final_synthesizer": step.final_synthesizer,
-            "tools": step.tools,
-        }
+        _dispatch_step_summary(step)
         for step in plan.steps
     )
+
+
+def _dispatch_step_summary(step: DispatchStep) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "id": step.id,
+        "agent": step.agent,
+        "depends_on": step.depends_on,
+        "final_synthesizer": step.final_synthesizer,
+        "tools": step.tools,
+    }
+    if step.requires_user_review:
+        payload["requires_user_review"] = True
+    return payload
 
 
 def _discussion_role_payload(plan: DiscussionPlan) -> tuple[Mapping[str, JsonValue], ...]:
@@ -963,6 +1257,12 @@ def _role_allowed_tools(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
+    if (
+        context is not None
+        and role.id == "copywriter"
+        and _is_deferred_media_script_plan_context(context)
+    ):
+        requested = tuple(tool for tool in requested if tool != "read_context")
     if not requested or context is None or capability_gateway is None:
         return ()
     is_available = getattr(capability_gateway, "is_available", None)
@@ -978,6 +1278,29 @@ def _role_allowed_tools(
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
     return tuple(dict.fromkeys(filtered))
+
+
+def _is_deferred_media_script_plan_context(context: TaskContext) -> bool:
+    if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
+        return False
+    text = context.request.casefold()
+    has_script_plan = any(term in text for term in ("script", "screenplay", "剧本", "脚本"))
+    has_plan_intent = any(term in text for term in ("plan", "计划", "规划"))
+    has_deferred_generation = any(
+        term in text
+        for term in (
+            "暂时不要生成",
+            "暂时不生成",
+            "暂不生成",
+            "不要生成图片",
+            "不要生成视频",
+            "不要剪辑成片",
+            "do not generate",
+            "later",
+            "in future",
+        )
+    )
+    return has_script_plan and has_plan_intent and has_deferred_generation
 
 
 def _plan_allowed_tools(
@@ -1071,6 +1394,7 @@ def _selected_config_agent_purpose(
 _DELIVERY_TOOL_NAMES = frozenset(
     {
         "document.generate_docx",
+        "compose_video",
         "generate_multimedia",
         "presentation.generate_pptx",
         "project.generate_zip",
@@ -1105,8 +1429,6 @@ def _should_use_standalone_multimedia_roles(
     selected_roles: tuple[RoleAssignment, ...],
     planner_roles: tuple[RoleAssignment, ...],
 ) -> bool:
-    if not _is_standalone_multimedia_role_plan(planner_roles):
-        return False
     generic_role_ids = {
         "architect",
         "implementer",
@@ -1116,7 +1438,24 @@ def _should_use_standalone_multimedia_roles(
         "reviewer",
         "quality_reviewer",
     }
-    return bool(selected_roles) and all(role.id in generic_role_ids for role in selected_roles)
+    if not bool(selected_roles) or any(role.id not in generic_role_ids for role in selected_roles):
+        return False
+    if _is_standalone_multimedia_role_plan(planner_roles):
+        return True
+    media_role_ids = {
+        "asset_generator",
+        "director",
+        "multimedia_generator",
+        "shot_video_generator",
+        "storyboard_artist",
+        "video_compositor",
+        "video_editor",
+    }
+    return any(
+        role.id in media_role_ids
+        or bool({"compose_video", "generate_multimedia"}.intersection(role.allowed_tools))
+        for role in planner_roles
+    )
 
 
 def _temporary_role_assignments(
@@ -1280,6 +1619,7 @@ def _rank_logical_models_for_role(
             " ".join(role.must_answer),
         )
     ).lower()
+    role_text = f"{role.id} {role.role}".lower()
     preferred = role.model if role.model in config.models and role.model != default_model else ""
     scored: list[tuple[int, int, str]] = []
     for logical_model, definition in config.models.items():
@@ -1330,6 +1670,13 @@ def _rank_logical_models_for_role(
                 "story",
             )
         ):
+            capabilities = _logical_model_capabilities(definition)
+            if (
+                "text" in capabilities
+                and "video_generation" in capabilities
+                and any(keyword in role_text for keyword in _VIDEO_PRODUCTION_ROLE_TERMS)
+            ):
+                score += 36
             if any(
                 keyword in haystack
                 for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")
@@ -1385,6 +1732,14 @@ def _rank_logical_models_for_role(
         scored.append((score, -len(logical_model), logical_model))
     scored.sort(reverse=True)
     return scored
+
+
+def _logical_model_capabilities(definition: LogicalModelDefinition) -> frozenset[str]:
+    return frozenset(
+        str(capability).lower()
+        for deployment in definition.deployments
+        for capability in deployment.capabilities
+    )
 
 
 def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
@@ -1593,7 +1948,7 @@ def _task_profile(task: object) -> TaskProfile:
     text = str(task).lower()
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         return TaskProfile.DEPLOYMENT
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _is_software_task_text(text):
         return TaskProfile.SOFTWARE
     if any(keyword in text for keyword in ("research", "调研", "分析", "报告", "市场")):
         return TaskProfile.RESEARCH
@@ -1607,7 +1962,7 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _is_software_task_text(text):
         profiles.append(TaskProfile.SOFTWARE)
     if any(
         keyword in text for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
@@ -1618,6 +1973,45 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     if not profiles or TaskProfile.GENERAL not in profiles:
         profiles.append(TaskProfile.GENERAL)
     return tuple(profiles)
+
+
+def _is_software_task_text(text: str) -> bool:
+    if _looks_like_media_test_delivery_text(text):
+        return any(
+            keyword in text
+            for keyword in (
+                "code",
+                "代码",
+                "源码",
+                "python",
+                "javascript",
+                "typescript",
+                "api",
+                "github",
+                ".py",
+                ".js",
+                ".ts",
+            )
+        )
+    return any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS)
+
+
+def _looks_like_media_test_delivery_text(text: str) -> bool:
+    has_test_word = "test" in text or "测试" in text
+    if not has_test_word:
+        return False
+    media_terms = (
+        "mp4",
+        "video",
+        "clip",
+        "reel",
+        "视频",
+        "短片",
+        "成片",
+        "镜头",
+        "剪辑",
+    )
+    return any(term in text for term in media_terms)
 
 
 def _dispatch_parallelism(
@@ -1688,6 +2082,20 @@ def _fallbacks(config: PlatformConfig) -> dict[str, str]:
         for logical_model, definition in config.models.items()
         if definition.fallback_model is not None
     }
+
+
+def _fallback_chain(config: PlatformConfig, logical_model: str) -> tuple[str, ...]:
+    fallbacks = _fallbacks(config)
+    chain: list[str] = []
+    seen = {logical_model}
+    current = logical_model
+    while True:
+        fallback = fallbacks.get(current)
+        if fallback is None or fallback in seen:
+            return tuple(chain)
+        seen.add(fallback)
+        chain.append(fallback)
+        current = fallback
 
 
 def default_runtime_registry() -> RuntimeRegistry:

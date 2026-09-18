@@ -11,6 +11,7 @@ class ContextCompactor:
         if max_summary_tokens < 1:
             raise ValueError("max_summary_tokens must be positive")
         protected: list[str] = []
+        protected.append(f"CURRENT_USER_REQUEST: {value.current_user_request}")
         protected.extend(f"UNRESOLVED_APPROVAL: {item}" for item in value.unresolved_approvals)
         protected.extend(f"CURRENT_CONSTRAINT: {item}" for item in value.current_constraints)
         preserved: list[str] = list(protected)
@@ -34,6 +35,7 @@ class ContextCompactor:
             producer="context_compactor",
             content={
                 "text": summary or "No prior context.",
+                "current_user_request": value.current_user_request,
                 "unresolved_approvals": value.unresolved_approvals,
                 "current_constraints": value.current_constraints,
             },

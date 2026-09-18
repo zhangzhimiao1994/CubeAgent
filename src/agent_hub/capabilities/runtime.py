@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -21,7 +22,11 @@ from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
     ALLOWED_GENERATED_FILE_MIME_TYPES,
     DOCX_MIME_TYPE,
+    JPEG_MIME_TYPE,
+    MP4_MIME_TYPE,
+    PNG_MIME_TYPE,
     PPTX_MIME_TYPE,
+    WEBP_MIME_TYPE,
     ZIP_MIME_TYPE,
     GeneratedFileStore,
     safe_generated_filename,
@@ -34,16 +39,31 @@ from agent_hub.multimodal.generation import (
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
+from agent_hub.video.composer import (
+    VideoClipInput,
+    VideoComposer,
+    VideoComposeRequest,
+    VideoCompositionError,
+)
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
 _MULTIMEDIA_TOOL = "generate_multimedia"
+_COMPOSE_VIDEO_TOOL = "compose_video"
 _MULTIMEDIA_ARTIFACT_TTL = timedelta(hours=24)
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
+_MAX_VIDEO_CLIPS = 32
+_MAX_MULTIMEDIA_ARTIFACT_COUNT = 8
+_VIDEO_CLIP_EXTENSIONS = {
+    MP4_MIME_TYPE: (".mp4",),
+    PNG_MIME_TYPE: (".png",),
+    JPEG_MIME_TYPE: (".jpg", ".jpeg"),
+    WEBP_MIME_TYPE: (".webp",),
+}
 _DOTTED_BUILT_INS = frozenset({_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL})
 _REPLAY_SAFE = frozenset({
     "calculator",
@@ -54,7 +74,9 @@ _REPLAY_SAFE = frozenset({
     _PPTX_TOOL,
     _PROJECT_ZIP_TOOL,
     _MULTIMEDIA_TOOL,
+    _COMPOSE_VIDEO_TOOL,
 })
+_VIDEO_CLIP_MIME_TYPES = frozenset({MP4_MIME_TYPE, PNG_MIME_TYPE, JPEG_MIME_TYPE, WEBP_MIME_TYPE})
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -84,6 +106,10 @@ class RuntimeMultimediaGenerationExecutor(Protocol):
     ) -> MultimediaGenerationJob: ...
 
 
+class RuntimeVideoComposer(Protocol):
+    def compose(self, request: VideoComposeRequest, output_dir: Path) -> Path: ...
+
+
 class RuntimeCapabilityGateway:
     """Production capability executor for non-dangerous built-ins and approved skills."""
 
@@ -96,6 +122,7 @@ class RuntimeCapabilityGateway:
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
         multimedia_generation_executor: RuntimeMultimediaGenerationExecutor | None = None,
+        video_composer: RuntimeVideoComposer | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -105,6 +132,7 @@ class RuntimeCapabilityGateway:
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
         self._multimedia_generation_executor = multimedia_generation_executor
+        self._video_composer = video_composer or VideoComposer()
 
     def is_replay_safe(self, name: str) -> bool:
         return name in _REPLAY_SAFE
@@ -112,6 +140,8 @@ class RuntimeCapabilityGateway:
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         if name == _MULTIMEDIA_TOOL:
             return self._multimedia_generation_executor is not None
+        if name == _COMPOSE_VIDEO_TOOL:
+            return True
         if name in _REPLAY_SAFE:
             return True
         if _SAFE_CAPABILITY_NAME.fullmatch(name) is None:
@@ -145,6 +175,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if name == _MULTIMEDIA_TOOL:
             return await self._execute_generate_multimedia(tenant_id, run_id, actor, arguments)
+        if name == _COMPOSE_VIDEO_TOOL:
+            return await self._execute_compose_video(tenant_id, run_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -338,46 +370,109 @@ class RuntimeCapabilityGateway:
         logical_model = _required_string(arguments, "logical_model").strip()
         prompt_field = "generation_prompt" if "generation_prompt" in arguments else "prompt"
         prompt = _required_string(arguments, prompt_field).strip()
-        job = executor.submit(kind=kind, logical_model=logical_model, prompt=prompt)
-        completed = await executor.run_job(job.id, executor_id=actor)
+        prompts = _multimedia_generation_prompts(arguments, fallback_prompt=prompt)
         media_results: list[Mapping[str, JsonValue]] = []
         first_file_metadata: dict[str, JsonValue] | None = None
-        expires_at = (
-            completed.expires_at.isoformat() if completed.expires_at is not None else None
-        )
-        for index, artifact in enumerate(completed.artifacts):
-            file_metadata = _stored_multimedia_file_metadata(
-                self._generated_file_store,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                artifact=artifact,
-                expires_at=expires_at,
+        completed_jobs: list[MultimediaGenerationJob] = []
+        for item_prompt in prompts:
+            job = executor.submit(kind=kind, logical_model=logical_model, prompt=item_prompt)
+            completed = await executor.run_job(job.id, executor_id=actor)
+            completed_jobs.append(completed)
+            expires_at = (
+                completed.expires_at.isoformat() if completed.expires_at is not None else None
             )
-            if file_metadata is not None and first_file_metadata is None:
-                first_file_metadata = file_metadata
-            media_results.append(
-                _multimedia_artifact_result(
-                    artifact,
-                    job_id=completed.id,
-                    artifact_index=index,
+            for index, artifact in enumerate(completed.artifacts):
+                file_metadata = _stored_multimedia_file_metadata(
+                    self._generated_file_store,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    artifact=artifact,
                     expires_at=expires_at,
-                    file_metadata=file_metadata,
                 )
-            )
+                if file_metadata is not None and first_file_metadata is None:
+                    first_file_metadata = file_metadata
+                media_results.append(
+                    _multimedia_artifact_result(
+                        artifact,
+                        job_id=completed.id,
+                        artifact_index=index,
+                        expires_at=expires_at,
+                        file_metadata=file_metadata,
+                    )
+                )
+        first_completed = completed_jobs[0]
+        artifact_total = max(1, len(media_results))
+        summary = (
+            f"Generated {kind.value} artifact with {logical_model}."
+            if artifact_total == 1
+            else f"Generated {artifact_total} {kind.value} artifacts with {logical_model}."
+        )
         result: dict[str, JsonValue] = {
-            "job_id": completed.id,
-            "kind": completed.kind.value,
-            "logical_model": completed.logical_model,
-            "status": completed.status.value,
-            "executor_id": completed.executor_id,
-            "summary": f"Generated {completed.kind.value} artifact with {completed.logical_model}.",
+            "job_id": first_completed.id,
+            "kind": first_completed.kind.value,
+            "logical_model": first_completed.logical_model,
+            "status": first_completed.status.value,
+            "executor_id": first_completed.executor_id,
+            "summary": summary,
             "artifacts": tuple(media_results),
             "presentation": "final_attachment",
         }
+        if len(completed_jobs) > 1:
+            result["job_ids"] = tuple(job.id for job in completed_jobs)
         if first_file_metadata is not None:
             result["artifact_id"] = first_file_metadata["artifact_id"]
             result["file"] = first_file_metadata
             result["metadata"] = first_file_metadata
+        return result
+
+    async def _execute_compose_video(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        filename = _filename(arguments, title=title, extension=".mp4")
+        clips = _video_clip_inputs(arguments, store=store, tenant_id=tenant_id, run_id=run_id)
+        request = VideoComposeRequest(
+            title=title,
+            clips=clips,
+            output_filename=filename,
+            aspect_ratio=_optional_string(arguments, "aspect_ratio") or "original",
+            image_duration_seconds=_optional_int(
+                arguments,
+                "image_duration_seconds",
+                default=3,
+            ),
+        )
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-video-") as temporary_dir:
+            output_dir = Path(temporary_dir)
+            try:
+                output = await asyncio.to_thread(self._video_composer.compose, request, output_dir)
+            except VideoCompositionError as error:
+                raise RuntimeCapabilityError(str(error)) from None
+            try:
+                data = output.read_bytes()
+            except OSError:
+                raise RuntimeCapabilityError("composed video output is unavailable") from None
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=MP4_MIME_TYPE,
+                data=data,
+            )
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Composed video artifact {metadata.filename}.",
+            )
+        )
+        result["presentation"] = _generated_file_presentation(arguments, default="final_attachment")
         return result
 
     def _require_generated_file_store(self) -> GeneratedFileStore:
@@ -493,6 +588,20 @@ def _optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str
     return value
 
 
+def _optional_int(
+    arguments: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    default: int,
+) -> int:
+    value = arguments.get(field_name)
+    if value is None:
+        return default
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
+
+
 def _optional_mapping_list(
     arguments: Mapping[str, JsonValue],
     field_name: str,
@@ -508,6 +617,129 @@ def _optional_mapping_list(
             raise RuntimeCapabilityError(f"{field_name} items must be objects")
         items.append(dict(item))
     return items
+
+
+def _video_clip_inputs(
+    arguments: Mapping[str, JsonValue],
+    *,
+    store: GeneratedFileStore,
+    tenant_id: UUID,
+    run_id: UUID,
+) -> tuple[VideoClipInput, ...]:
+    value = arguments.get("clips")
+    if not isinstance(value, list | tuple) or not value or len(value) > _MAX_VIDEO_CLIPS:
+        raise RuntimeCapabilityError("clips must contain 1 to 32 entries")
+    clips: list[VideoClipInput] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise RuntimeCapabilityError("clips items must be objects")
+        storage_key = _clip_required_string(item, "storage_key")
+        mime_type = _clip_required_string(item, "mime_type")
+        if mime_type not in _VIDEO_CLIP_MIME_TYPES:
+            raise RuntimeCapabilityError("unsupported clip MIME type")
+        _validate_clip_storage_filename(storage_key, mime_type)
+        path = _resolve_generated_clip_path(
+            store,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            storage_key=storage_key,
+        )
+        clips.append(
+            VideoClipInput(
+                storage_key=storage_key,
+                path=path,
+                mime_type=mime_type,
+                duration_seconds=_clip_optional_int(item, "duration_seconds"),
+                filename=_clip_optional_string(item, "filename"),
+            )
+        )
+    return tuple(clips)
+
+
+def _validate_clip_storage_filename(storage_key: str, mime_type: str) -> None:
+    filename = PurePosixPath(storage_key).name.casefold()
+    expected_extensions = _VIDEO_CLIP_EXTENSIONS.get(mime_type, ())
+    if not expected_extensions or not filename.endswith(expected_extensions):
+        raise RuntimeCapabilityError("mime_type does not match clip filename")
+
+
+def _resolve_generated_clip_path(
+    store: GeneratedFileStore,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    storage_key: str,
+) -> Path:
+    try:
+        parts = PurePosixPath(storage_key).parts
+        if len(parts) != 4:
+            raise ValueError
+        stored_tenant_id = UUID(parts[0])
+        stored_run_id = UUID(parts[1])
+        artifact_id = UUID(parts[2])
+        if stored_tenant_id != tenant_id or stored_run_id != run_id:
+            raise ValueError
+        return store.resolve_for(tenant_id, run_id, artifact_id, storage_key)
+    except (FileNotFoundError, ValueError):
+        raise RuntimeCapabilityError("clip storage_key is invalid or unavailable") from None
+
+
+def _clip_required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:
+    value = arguments.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_int(arguments: Mapping[str, JsonValue], field_name: str) -> int | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
+
+
+def _multimedia_generation_prompts(
+    arguments: Mapping[str, JsonValue],
+    *,
+    fallback_prompt: str,
+) -> tuple[str, ...]:
+    raw_prompts = arguments.get("artifact_prompts")
+    raw_count = arguments.get("artifact_count")
+    if raw_prompts is not None:
+        if not isinstance(raw_prompts, list | tuple):
+            raise RuntimeCapabilityError("artifact_prompts must be a list")
+        prompts = tuple(_nonblank_prompt(item, "artifact_prompts item") for item in raw_prompts)
+        if not 1 <= len(prompts) <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+            raise RuntimeCapabilityError("artifact_prompts must contain 1 to 8 entries")
+        if raw_count is not None and raw_count != len(prompts):
+            raise RuntimeCapabilityError("artifact_count must match artifact_prompts length")
+        return prompts
+    count = _optional_int(arguments, "artifact_count", default=1)
+    if not 1 <= count <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+        raise RuntimeCapabilityError("artifact_count must be between 1 and 8")
+    if count == 1:
+        return (fallback_prompt,)
+    return tuple(
+        f"{fallback_prompt}\n\n输出第 {index}/{count} 个独立产物。"
+        for index in range(1, count + 1)
+    )
+
+
+def _nonblank_prompt(value: object, field_name: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
 
 
 def _multimedia_kind(arguments: Mapping[str, JsonValue]) -> MultimediaGenerationKind:

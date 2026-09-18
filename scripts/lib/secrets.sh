@@ -171,6 +171,9 @@ ensure_secret_defaults() {
   ensure_numeric_secret_default \
     AGENT_HUB_RUNTIME_TOKEN_BUDGET \
     "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
+  ensure_secret_default \
+    AGENT_HUB_WORKSPACE_READ_ROOTS \
+    "${AGENT_HUB_WORKSPACE_READ_ROOTS:-[]}"
 }
 
 generate_or_keep_secrets() {
@@ -211,6 +214,7 @@ generate_or_keep_secrets() {
     printf 'AGENT_HUB_LOG_LEVEL=%s\n' "${AGENT_HUB_LOG_LEVEL:-WARNING}"
     printf 'AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=%s\n' "${AGENT_HUB_RUNTIME_TIMEOUT_SECONDS:-300}"
     printf 'AGENT_HUB_RUNTIME_TOKEN_BUDGET=%s\n' "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
+    printf 'AGENT_HUB_WORKSPACE_READ_ROOTS=%s\n' "${AGENT_HUB_WORKSPACE_READ_ROOTS:-[]}"
   } > "$tmp"
   chmod 0600 "$tmp"
   mv "$tmp" "$SECRETS_FILE"

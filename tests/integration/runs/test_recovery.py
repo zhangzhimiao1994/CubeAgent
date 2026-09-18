@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -31,6 +31,7 @@ from agent_hub.runs.tasks import CeleryRunQueue
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -103,6 +104,137 @@ class FakeRuntime:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class ArtifactReviewResumeRuntime:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.restored: list[RuntimeCheckpoint] = []
+        self.context_artifact_ids: list[tuple[str, ...]] = []
+        self.review_artifact = Artifact(
+            id=uuid4(),
+            type="text",
+            producer="multimedia_generator",
+            content={"text": "Generated image artifact with kilin-ima."},
+        )
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.calls += 1
+        self.context_artifact_ids.append(tuple(str(artifact.id) for artifact in context.artifacts))
+        if context.checkpoint is not None:
+            if str(self.review_artifact.id) not in self.context_artifact_ids[-1]:
+                raise RuntimeError("persisted run artifacts were not hydrated")
+            regenerated = Artifact(
+                id=uuid4(),
+                type="text",
+                producer="multimedia_generator",
+                content={"text": "Regenerated image artifact with kilin-ima."},
+            )
+            yield RunEvent(
+                kind=EventKind.STEP_RETRYING,
+                sequence=6,
+                run_id=context.run_id,
+                step_id="multimedia_generator_step",
+                actor="multimedia_generator",
+                reason="user rejected artifact review; regenerating stage",
+                payload=cast(
+                    Mapping[str, JsonValue],
+                    context.routing_decision["artifact_review_feedback"],
+                ),
+            )
+            yield RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=7,
+                run_id=context.run_id,
+                actor="multimedia_generator",
+                artifact=regenerated,
+            )
+            yield RunEvent(
+                kind=EventKind.CHECKPOINT_SAVED,
+                sequence=8,
+                run_id=context.run_id,
+                checkpoint=self._checkpoint(context, regenerated, phase="completed"),
+            )
+            yield self._approval_event(context, regenerated, sequence=9)
+            return
+
+        yield RunEvent(
+            kind=EventKind.ARTIFACT_CREATED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="multimedia_generator",
+            artifact=self.review_artifact,
+        )
+        yield RunEvent(
+            kind=EventKind.STEP_COMPLETED,
+            sequence=2,
+            run_id=context.run_id,
+            step_id="multimedia_generator_step",
+            actor="multimedia_generator",
+            payload={"artifact_id": str(self.review_artifact.id)},
+        )
+        yield RunEvent(
+            kind=EventKind.CHECKPOINT_SAVED,
+            sequence=3,
+            run_id=context.run_id,
+            checkpoint=self._checkpoint(context, self.review_artifact, phase="completed"),
+        )
+        yield self._approval_event(context, self.review_artifact, sequence=4)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("service persists checkpoint events directly")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        self.restored.append(checkpoint)
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+    def _checkpoint(
+        self, context: TaskContext, artifact: Artifact, *, phase: str
+    ) -> RuntimeCheckpoint:
+        return RuntimeCheckpoint(
+            id=uuid4(),
+            runtime_type="fake-review-dispatch",
+            runtime_version="1",
+            run_id=context.run_id,
+            tenant_id=context.tenant_id,
+            mode=TaskMode.DISPATCH,
+            state={
+                "phase": phase,
+                "terminal": phase == "completed",
+                "frontier": (),
+                "artifact_registry": {str(artifact.id): artifact.content_sha256},
+                "artifact_refs": {
+                    "multimedia_generator_step": {
+                        "id": str(artifact.id),
+                        "sha256": artifact.content_sha256,
+                    }
+                },
+            },
+        )
+
+    def _approval_event(
+        self, context: TaskContext, artifact: Artifact, *, sequence: int
+    ) -> RunEvent:
+        return RunEvent(
+            kind=EventKind.APPROVAL_REQUESTED,
+            sequence=sequence,
+            run_id=context.run_id,
+            actor="multimedia_generator",
+            approval_id="artifact-review-test",
+            action="artifact_review",
+            reason="user review required for intermediate artifact",
+            payload={
+                "approval_kind": "runtime_artifact_review",
+                "stage_id": "multimedia_generator_step",
+                "artifact_id": str(artifact.id),
+                "next_action": "approve_or_revise_artifact",
+                "requires_user_review": True,
+            },
+        )
 
 
 class WaitingModeRouter:
@@ -391,6 +523,58 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
     assert runtime.calls == 2
     assert len(runtime.restored) == 1
+
+
+async def test_artifact_review_rejection_hydrates_persisted_run_artifacts(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    runtime = ArtifactReviewResumeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="只生成 Character Model Sheet 形式的角色参考设定表图片，不要生成视频",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="artifact-review-reject-hydrates-artifacts",
+    )
+    waiting = await service.execute(submitted.id)
+    waiting_record = await repository.get(tenant_id, submitted.id)
+    assert waiting_record.routing_decision is not None
+
+    rejected = await service.reject_artifact_review(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=submitted.id,
+        approval_id=cast(str, waiting_record.routing_decision["approval_id"]),
+        version=waiting.version,
+        feedback="角色脸型和服装不一致，退回重新生成角色参考设定表。",
+    )
+    rerun = await service.execute(rejected.id)
+    rerun_record = await repository.get(tenant_id, submitted.id)
+    assert rerun_record.routing_decision is not None
+    approved = await service.approve_artifact_review(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=submitted.id,
+        approval_id=cast(str, rerun_record.routing_decision["approval_id"]),
+        version=rerun.version,
+    )
+    events = await service.events(tenant_id, submitted.id)
+
+    assert rerun.status is RunStatus.WAITING_APPROVAL
+    assert approved.status is RunStatus.COMPLETED
+    assert runtime.calls == 2
+    assert str(runtime.review_artifact.id) in runtime.context_artifact_ids[1]
+    assert any(event["kind"] == "step.retrying" for event in events)
+    assert not any(event["kind"] == "runtime.failed" for event in events)
 
 
 async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_window(
@@ -1107,6 +1291,39 @@ async def test_auto_submission_reuses_recent_conversation_mode_for_continuation(
     assert continued.mode is TaskMode.HYBRID
     assert continued.clarification_reason is None
     assert router.calls == 0
+
+
+@pytest.mark.parametrize(
+    "ignored_status",
+    (RunStatus.WAITING_APPROVAL, RunStatus.CANCELLED, RunStatus.FAILED),
+)
+async def test_conversation_mode_lookup_ignores_pending_approval_and_cancelled_runs(
+    run_session_factory: async_sessionmaker[AsyncSession],
+    ignored_status: RunStatus,
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    conversation_id = f"conv-mode-{ignored_status.value}"
+    repository = RunRepository(run_session_factory)
+
+    await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        request="schedule proposal or cancelled interruption",
+        mode=TaskMode.DISPATCH,
+        status=ignored_status,
+        idempotency_key=f"client-request-{ignored_status.value}",
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+
+    mode = await repository.latest_resolved_mode_for_conversation(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        conversation_id=conversation_id,
+    )
+
+    assert mode is None
 
 
 async def test_outbox_is_not_marked_delivered_when_queue_enqueue_fails(

@@ -25,6 +25,7 @@ from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.runs.attachments import FileSystemAttachmentArtifactLoader
 from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.resource_context import ResourceContextArtifactLoader
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
 from agent_hub.security.secrets import SecretCipher, SecretService
@@ -144,7 +145,11 @@ def build_worker_service(
             redis_client=redis_client,
             capability_gateway=RuntimeCapabilityGateway(
                 skill_store_dir=settings.skill_store_dir,
-                workspace_root=settings.attachment_store_dir,
+                workspace_root=(
+                    settings.workspace_read_roots[0]
+                    if settings.workspace_read_roots
+                    else settings.attachment_store_dir
+                ),
                 generated_artifact_dir=settings.generated_artifact_dir,
                 multimedia_generation_executor=multimedia_generation_executor,
             ),
@@ -156,6 +161,11 @@ def build_worker_service(
         runtime_token_budget=settings.runtime_token_budget,
         attachment_artifact_loader=FileSystemAttachmentArtifactLoader(
             settings.attachment_store_dir
+        ),
+        resource_context_loader=ResourceContextArtifactLoader(
+            skill_store_dir=settings.skill_store_dir,
+            workspace_roots=settings.workspace_read_roots,
+            list_skills=admin_resource_service.list_skills,
         ),
         terminal_run_hooks=(
             *_evolution_terminal_hooks(

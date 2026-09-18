@@ -470,6 +470,18 @@ class EmptyPrimaryTransport:
         return ModelResponse(text="backup ok")
 
 
+class AlwaysEmptyTransport:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del model_request, api_key
+        self.events.append(("transport", deployment.id))
+        return ModelResponse(text="")
+
+
 async def test_empty_model_response_tries_fallback_model_when_available() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
@@ -487,6 +499,28 @@ async def test_empty_model_response_tries_fallback_model_when_available() -> Non
     assert completion.response.text == "backup ok"
     assert completion.deployment_id == "backup-key"
     assert [record[3] for record in capacity.records] == [False, True]
+
+
+async def test_repeated_empty_model_response_preserves_all_fallback_context() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        AlwaysEmptyTransport(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(ModelGatewayError) as captured:
+        await gateway.complete(request())
+
+    assert str(captured.value) == "model response text is empty"
+    assert captured.value.logical_models == ("primary", "backup")
+    assert captured.value.deployments == ("primary-key", "backup-key")
+    assert [record[3] for record in capacity.records] == [False, False]
+    assert len(capacity.releases) == 2
 
 
 @pytest.mark.parametrize("status_code", [None, 500])

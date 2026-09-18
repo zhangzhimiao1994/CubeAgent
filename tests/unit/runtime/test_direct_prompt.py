@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import cast
 from uuid import uuid4
 
@@ -108,6 +109,29 @@ def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:
     assert "reviewer 超时时先压缩上下文再分块审查" in serialized
 
 
+def test_direct_prompt_includes_requested_plugin_context() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="用 $plugin:runway 生成视频",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision={"requested_plugins": "runway,github"},
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    prompt = runtime._build_prompt(context)
+
+    assert prompt.messages is not None
+    serialized = "\n".join(cast(str, message.content) for message in prompt.messages)
+    assert "REQUESTED_PLUGIN_CONTEXT" in serialized
+    assert "runway" in serialized
+    assert "github" in serialized
+    assert "not proof" in serialized
+
+
 @pytest.mark.asyncio
 async def test_direct_runtime_completes_when_gateway_omits_usage_for_bounded_text() -> None:
     gateway = UsageLessTextGateway()
@@ -129,6 +153,32 @@ async def test_direct_runtime_completes_when_gateway_omits_usage_for_bounded_tex
     assert [request.logical_model for request in gateway.requests] == ["main"]
     assert any(event.kind is EventKind.ARTIFACT_CREATED for event in events)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_direct_model_started_event_includes_requested_plugin_context() -> None:
+    gateway = UsageLessTextGateway()
+    runtime = DirectRuntime(gateway, logical_model="main")
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.DIRECT,
+                request="用 $plugin:runway 生成视频",
+                token_budget=20_000,
+                routing_decision={"requested_plugins": "runway"},
+            )
+        )
+    ]
+
+    started = next(event for event in events if event.kind is EventKind.MODEL_STARTED)
+    plugin_context = started.payload["requested_plugin_context"]
+    assert isinstance(plugin_context, Mapping)
+    assert plugin_context["requested_plugins"] == ("runway",)
+    assert "not proof" in str(plugin_context["policy"])
 
 
 @pytest.mark.asyncio

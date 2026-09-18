@@ -26,5 +26,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash deploy/native/install-packages.sh --detect tests/install/fixtures/os-release-${{ matrix.distro }}
-      - run: env AGENT_HUB_TEST=1 bash install.sh --mode auto --dry-run --yes
-
+      - run: bash tests/install/smoke.sh --mode auto --dry-run

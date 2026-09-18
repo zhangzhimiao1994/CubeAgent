@@ -1258,6 +1258,26 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
     assert response.payload["nested"] == {"token": "[redacted]", "result": "ok"}
 
 
+def test_admin_run_event_exposes_artifact_review_approval_id() -> None:
+    response = _admin_run_event(
+        {
+            "sequence": 8,
+            "kind": "approval.requested",
+            "message": "artifact review requested",
+            "actor": "multimedia_generator",
+            "action": "artifact_review",
+            "approval_id": "artifact-review-1",
+            "payload": {
+                "approval_kind": "runtime_artifact_review",
+                "stage_id": "character_model_sheet",
+                "artifact_id": "artifact-1",
+            },
+        }
+    )
+
+    assert response.approval_id == "artifact-review-1"
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [
@@ -3094,7 +3114,7 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
                 request="审查脚本",
                 mode=TaskMode.DISPATCH,
                 status=RunStatus.COMPLETED,
-                version=1,
+                version=7,
                 created_at=datetime.now(UTC),
                 routing_decision=routing_decision,
             )
@@ -3143,6 +3163,7 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
     conversation = api.get("/api/v1/admin/conversations/conv-hermes-runtime", headers=headers())
 
     assert detail.status_code == 200
+    assert detail.json()["version"] == 7
     assert "decision_token" not in detail.json()["routing_decision"]
     assert "temporary_agent_proposal" not in detail.json()["routing_decision"]
     assert "api_key" not in detail.json()["routing_decision"]
@@ -3516,6 +3537,67 @@ def test_admin_run_artifact_exposes_multimedia_job_download_metadata() -> None:
         artifact.download_url
         == "/api/v1/admin/multimedia/jobs/media_downloadable/artifacts/0/download"
     )
+
+
+def test_admin_run_artifacts_expand_multiple_stored_multimedia_files() -> None:
+    from agent_hub.api.routers.admin import _admin_run_artifacts_response
+
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifacts = _admin_run_artifacts_response(
+        (
+            {
+                "id": "media-tool-result",
+                "type": "tool_result",
+                "producer": "multimedia_generator",
+                "content": {
+                    "result": {
+                        "presentation": "final_attachment",
+                        "artifacts": [
+                            {
+                                "kind": "image",
+                                "filename": "male-lead.png",
+                                "mime_type": "image/png",
+                                "size_bytes": 8,
+                                "sha256": "a" * 64,
+                                "artifact_id": "33333333-3333-4333-8333-333333333331",
+                                "storage_key": (
+                                    "00000000-0000-4000-8000-000000000001/"
+                                    "22222222-2222-4222-8222-222222222222/"
+                                    "33333333-3333-4333-8333-333333333331/male-lead.png"
+                                ),
+                            },
+                            {
+                                "kind": "image",
+                                "filename": "female-lead.png",
+                                "mime_type": "image/png",
+                                "size_bytes": 9,
+                                "sha256": "b" * 64,
+                                "artifact_id": "33333333-3333-4333-8333-333333333332",
+                                "storage_key": (
+                                    "00000000-0000-4000-8000-000000000001/"
+                                    "22222222-2222-4222-8222-222222222222/"
+                                    "33333333-3333-4333-8333-333333333332/female-lead.png"
+                                ),
+                            },
+                        ],
+                    }
+                },
+            },
+        ),
+        run_id=run_id,
+    )
+
+    assert [artifact.filename for artifact in artifacts] == ["male-lead.png", "female-lead.png"]
+    assert [artifact.download_url for artifact in artifacts] == [
+        (
+            "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/"
+            "artifacts/33333333-3333-4333-8333-333333333331/download"
+        ),
+        (
+            "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/"
+            "artifacts/33333333-3333-4333-8333-333333333332/download"
+        ),
+    ]
 
 
 def test_admin_run_artifact_rejects_unsafe_multimedia_download_metadata() -> None:
