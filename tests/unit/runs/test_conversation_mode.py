@@ -580,6 +580,206 @@ async def test_auto_submission_does_not_reuse_previous_direct_mode_for_script_ge
     assert routing["mode_source"] == "current_user_request"
 
 
+async def test_auto_artifact_delivery_can_upgrade_to_hybrid_when_discussion_is_requested() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="先讨论剧本方向，再生成全量资产图。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-discuss-before-assets",
+        idempotency_key="idem-discuss-before-assets",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["mode_source"] == "current_user_request"
+
+
+async def test_auto_current_discussion_request_overrides_previous_dispatch_mode() -> None:
+    repository = ConversationModeRepository(TaskMode.DISPATCH)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISCUSS),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="这一步需要讨论一下方案。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-discuss-current-request",
+        idempotency_key="idem-discuss-current-request",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISCUSS
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_discussion_request"
+    assert routing["main_agent_selected_mode"] == "discuss"
+    assert routing["mode_source"] == "current_user_request"
+
+
+async def test_auto_current_discussion_request_can_bypass_router_dispatch() -> None:
+    repository = ConversationModeRepository(None)
+    router = ReadyDispatchRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISCUSS),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="需要评审这个方案。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-current-discuss-bypass-router",
+        idempotency_key="idem-current-discuss-bypass-router",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISCUSS
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_discussion_request"
+    assert routing["main_agent_selected_mode"] == "discuss"
+    assert routing["mode_source"] == "current_user_request"
+
+
+async def test_auto_router_ready_dispatch_can_be_upgraded_to_hybrid() -> None:
+    repository = ConversationModeRepository(None)
+    router = ReadyDispatchRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="分析这个方案的优缺点。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-router-ready-hybrid",
+        idempotency_key="idem-router-ready-hybrid",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 1
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["router_selected_mode"] == "dispatch"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["main_agent_adjusted"] is True
+
+
+async def test_auto_discussion_negation_keeps_artifact_delivery_dispatch() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="不要讨论，直接生成 PPT。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-no-discuss-ppt",
+        idempotency_key="idem-no-discuss-ppt",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+async def test_auto_compare_then_deliver_routes_hybrid() -> None:
+    repository = ConversationModeRepository(TaskMode.DISPATCH)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="先对比两个视频剪辑方案，再生成最终成片。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-compare-then-video",
+        idempotency_key="idem-compare-then-video",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+
+
+async def test_auto_compare_image_generation_description_stays_dispatch() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="生成一张对比图，展示两版图片生成效果。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-compare-image-generation",
+        idempotency_key="idem-compare-image-generation",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
 async def test_auto_submission_does_not_reuse_previous_discuss_mode_for_current_office_delivery() -> None:
     repository = ConversationModeRepository(TaskMode.DISCUSS)
     router = WaitingRouter()

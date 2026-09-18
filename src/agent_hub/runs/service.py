@@ -511,6 +511,25 @@ class RunService:
                     enqueue=True,
                 )
                 return _submitted(record)
+            discussion_override_mode = _current_discussion_override_mode(message)
+            if discussion_override_mode is not None:
+                routing_payload = {
+                    "reason": "current_discussion_request",
+                    "main_agent_selected_mode": discussion_override_mode.value,
+                    "mode_source": "current_user_request",
+                    **operator_selection,
+                }
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=discussion_override_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
             continuation_mode = await self._conversation_continuation_mode(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
@@ -2717,6 +2736,9 @@ def _main_agent_adjusted_ready_mode(
     message: str,
     attachment_ids: tuple[str, ...],
 ) -> TaskMode:
+    discussion_override = _current_discussion_override_mode(message)
+    if discussion_override is not None:
+        return discussion_override
     local_mode = _local_main_agent_auto_mode(message, attachment_ids)
     if (
         local_mode is TaskMode.DIRECT
@@ -2860,8 +2882,9 @@ def _looks_like_interactive_support_request(message: str) -> bool:
 
 def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
     """Route explicit file/media generation requests before conversation-mode reuse."""
+    discussion_override = _current_discussion_override_mode(message)
     if _media_pipeline_plan_for_request(message) is not None:
-        return TaskMode.DISPATCH
+        return TaskMode.HYBRID if discussion_override is not None else TaskMode.DISPATCH
 
     rule_result = assess_rules(message)
     if (
@@ -2869,7 +2892,7 @@ def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
         and rule_result.mode is TaskMode.DISPATCH
         and rule_result.reason == "multimedia_generation_rule"
     ):
-        return TaskMode.DISPATCH
+        return TaskMode.HYBRID if discussion_override is not None else TaskMode.DISPATCH
 
     normalized = message.casefold()
     if any(marker in normalized for marker in _ARTIFACT_DELIVERY_NEGATIONS):
@@ -2877,8 +2900,98 @@ def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
     if not any(action in normalized for action in _ARTIFACT_DELIVERY_ACTIONS):
         return None
     if any(term in normalized for term in _ARTIFACT_DELIVERY_TERMS):
-        return TaskMode.DISPATCH
+        return TaskMode.HYBRID if discussion_override is not None else TaskMode.DISPATCH
     return None
+
+
+def _current_discussion_override_mode(message: str) -> TaskMode | None:
+    normalized = message.casefold()
+    if any(marker in normalized for marker in _DISCUSSION_OVERRIDE_NEGATIONS):
+        return None
+    if not any(marker in normalized for marker in _DISCUSSION_OVERRIDE_MARKERS):
+        return None
+    if _has_explicit_execution_action(normalized) or any(
+        marker in normalized for marker in _DISCUSSION_THEN_EXECUTION_MARKERS
+    ):
+        return TaskMode.HYBRID
+    return TaskMode.DISCUSS
+
+
+_DISCUSSION_OVERRIDE_MARKERS = (
+    "需要讨论",
+    "先讨论",
+    "讨论一下",
+    "讨论后",
+    "讨论完",
+    "需要评审",
+    "先评审",
+    "评审后",
+    "需要审查",
+    "先审查",
+    "审查后",
+    "需要复核",
+    "先复核",
+    "复核后",
+    "需要裁决",
+    "先裁决",
+    "裁决后",
+    "需要对比",
+    "先对比",
+    "对比后",
+    "对比一下",
+    "比较一下",
+    "先比较",
+    "比较后",
+    "多方案",
+    "有分歧",
+    "争论",
+    "needs discussion",
+    "discuss first",
+    "review first",
+    "needs review",
+    "debate",
+)
+_DISCUSSION_OVERRIDE_NEGATIONS = (
+    "不要讨论",
+    "不用讨论",
+    "无需讨论",
+    "不需要讨论",
+    "不要评审",
+    "不用评审",
+    "无需评审",
+    "不需要评审",
+    "不要审查",
+    "不用审查",
+    "无需审查",
+    "不需要审查",
+    "直接执行",
+    "直接生成",
+    "直接制作",
+    "do not discuss",
+    "don't discuss",
+    "no discussion",
+    "no review",
+)
+_DISCUSSION_THEN_EXECUTION_MARKERS = (
+    "再执行",
+    "再生成",
+    "再制作",
+    "再剪辑",
+    "然后执行",
+    "然后生成",
+    "然后制作",
+    "然后剪辑",
+    "讨论后执行",
+    "讨论后生成",
+    "评审后执行",
+    "评审后生成",
+    "审查后执行",
+    "审查后生成",
+    "after discussion",
+    "after review",
+    "then execute",
+    "then generate",
+)
 
 
 _ARTIFACT_DELIVERY_ACTIONS = (
