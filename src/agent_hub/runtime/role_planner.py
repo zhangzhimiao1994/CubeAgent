@@ -2114,7 +2114,8 @@ def _is_script_first_asset_image_request(task: str) -> bool:
         "短剧" in normalized
     )
     has_reference = any(term in normalized for term in _SCRIPT_MEDIA_REFERENCE_TERMS) or any(
-        marker in normalized for marker in ("然后", "之后", "确认后", "after", "then", "next")
+        marker in normalized
+        for marker in ("然后", "之后", "确认后", "再", "随后", "接着", "after", "then", "next")
     )
     has_asset_image = any(
         term in normalized

@@ -552,6 +552,19 @@ def test_provided_script_asset_image_request_starts_from_asset_generator() -> No
     assert [role.id for role in plan.roles] == ["asset_generator"]
 
 
+def test_script_first_asset_image_request_accepts_zai_sequence_marker() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="先生成一个都市甜宠短剧剧本，再生成全量资产图，暂时不要生成视频。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["copywriter", "asset_generator"]
+
+
 def test_video_editing_plan_request_does_not_get_compose_video_tool() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

@@ -516,6 +516,70 @@ async def test_auto_submission_routes_character_model_sheet_as_current_media_del
     assert routing["mode_source"] == "current_user_request"
 
 
+async def test_auto_submission_does_not_reuse_previous_direct_mode_for_script_first_media_pipeline() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=(
+            "给我生成一个都市甜宠短剧剧本，确认后生成全量资产图，"
+            "资产确认后生成分镜并制作视频，最后剪辑成片。"
+        ),
+        mode=TaskMode.AUTO,
+        conversation_id="conv-script-first-media-pipeline",
+        idempotency_key="idem-script-first-media-pipeline",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["mode_source"] == "current_user_request"
+    plan = routing.get("media_pipeline_plan")
+    assert isinstance(plan, dict)
+    assert plan["source"] == "script_request"
+
+
+async def test_auto_submission_does_not_reuse_previous_direct_mode_for_script_generation() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="让自动生成一个都市甜宠短剧剧本。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-script-generation",
+        idempotency_key="idem-script-generation",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["mode_source"] == "current_user_request"
+
+
 async def test_auto_submission_does_not_reuse_previous_discuss_mode_for_current_office_delivery() -> None:
     repository = ConversationModeRepository(TaskMode.DISCUSS)
     router = WaitingRouter()

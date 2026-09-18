@@ -2860,6 +2860,9 @@ def _looks_like_interactive_support_request(message: str) -> bool:
 
 def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
     """Route explicit file/media generation requests before conversation-mode reuse."""
+    if _media_pipeline_plan_for_request(message) is not None:
+        return TaskMode.DISPATCH
+
     rule_result = assess_rules(message)
     if (
         rule_result is not None
@@ -2914,6 +2917,9 @@ _ARTIFACT_DELIVERY_TERMS = (
     "cover",
     "character model sheet",
     "model sheet",
+    "script",
+    "screenplay",
+    "story script",
     "video",
     "animation",
     "audio",
@@ -2949,6 +2955,13 @@ _ARTIFACT_DELIVERY_TERMS = (
     "角色定妆图",
     "角色设定表",
     "设定表",
+    "剧本",
+    "脚本",
+    "故事大纲",
+    "资产图",
+    "素材图",
+    "全量资产",
+    "专业资产",
     "概念图",
     "分镜图",
     "视频",
