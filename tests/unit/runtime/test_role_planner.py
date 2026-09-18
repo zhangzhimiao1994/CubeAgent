@@ -432,6 +432,31 @@ def test_script_plan_with_explicit_no_video_now_does_not_start_video_roles() -> 
     assert "video_compositor" not in role_ids
 
 
+def test_asset_locked_video_pipeline_with_review_artifact_retention_is_not_deferred() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "请进行一次端到端实测：生成一个高武都市修仙短剧。"
+                "先生成剧本，剧本通过后，基于剧本拆解全量资产并生成资产图。"
+                "资产确认后生成分镜图，根据分镜和资产参考生成 AI 视频片段，"
+                "最后把视频片段剪辑成一个成片。"
+                "全流程需要保留中间产物审批点；本次测试我会默认审批通过。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == [
+        "copywriter",
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    ]
+
+
 def test_character_sheet_followup_with_negated_video_routes_to_media_generator_only() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(

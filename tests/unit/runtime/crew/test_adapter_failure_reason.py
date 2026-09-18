@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import cast
@@ -1189,6 +1190,12 @@ async def test_multimedia_generator_direct_script_image_assets_generate_full_ass
                 "## 剧本\n"
                 "女主苏念在咖啡店发现会发光的旧钥匙，男主陆沉追来。"
                 "窗外暴雨，钥匙引发蓝色电弧特效，两人奔跑穿过街巷。"
+                + (
+                    "都市高武修仙补充：霓虹雨夜、龙脉裂缝、外卖员林烬、"
+                    "玄烛宗追兵、盛穹集团天台阵法、妹妹病房、铜钱法器、"
+                    "蓝色电弧、金色符文、巷战、车流闪避、楼顶坠落救援。"
+                )
+                * 40
             )
         },
     )
@@ -1233,9 +1240,18 @@ async def test_multimedia_generator_direct_script_image_assets_generate_full_ass
     _actor, name, arguments = capabilities.calls[0]
     assert name == "generate_multimedia"
     assert arguments["kind"] == "image"
-    assert arguments["artifact_count"] == 9
+    assert arguments["artifact_count"] == 8
     artifact_prompts = arguments["artifact_prompts"]
     assert isinstance(artifact_prompts, tuple)
+    assert len(artifact_prompts) == 8
+    canonical_arguments = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert len(canonical_arguments.encode("utf-8")) <= 32_768
     joined = "\n".join(cast(str, prompt) for prompt in artifact_prompts)
     for required in (
         "角色资产",
@@ -1245,8 +1261,10 @@ async def test_multimedia_generator_direct_script_image_assets_generate_full_ass
         "动作资产",
         "特效资产",
         "镜头资产",
-        "情绪/表演资产",
-        "声音节奏与风格锁定资产",
+        "表演节奏与风格锁定资产",
+        "情绪变化",
+        "声音节奏",
+        "BGM 氛围",
     ):
         assert required in joined
     assert "不要只生成角色图" in joined
@@ -1435,6 +1453,105 @@ async def test_multimedia_generator_direct_video_comparison_creates_reference_an
     assert "锁定人物" in cast(str, artifact_prompts[0])
     assert "male-lead-sheet.png" in cast(str, artifact_prompts[0])
     assert "不带参考图" in cast(str, artifact_prompts[1])
+
+
+async def test_shot_video_generator_direct_step_prefers_video_over_asset_and_storyboard_terms() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct shot video generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        DispatchPlan(
+            agents=(
+                AgentSpec(
+                    id="shot_video_generator",
+                    role="Shot Video Generator",
+                    goal="Generate AI video shots using locked assets and storyboard references.",
+                    logical_model="general",
+                    allowed_tools=("generate_multimedia",),
+                ),
+            ),
+            steps=(
+                DispatchStep(
+                    id="shot_video_generator_step",
+                    agent="shot_video_generator",
+                    task="根据剧本、全量锁定资产图和分镜图生成 AI 视频片段。",
+                    tools=("generate_multimedia",),
+                    final_synthesizer=True,
+                    token_budget=100,
+                ),
+            ),
+            allowed_tools=("generate_multimedia",),
+            total_token_budget=100,
+        ),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="根据分镜和资产参考生成 AI 视频片段。")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "video"
+
+
+async def test_asset_generator_direct_step_prefers_image_even_when_full_request_mentions_video() -> None:
+    class FailingTextGateway:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise AssertionError("text gateway must not be called for direct asset generation")
+
+    capabilities = DirectMultimediaCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingTextGateway(),
+        DispatchPlan(
+            agents=(
+                AgentSpec(
+                    id="asset_generator",
+                    role="Asset Generator",
+                    goal="Generate the full locked production asset image pack.",
+                    logical_model="general",
+                    allowed_tools=("generate_multimedia",),
+                ),
+            ),
+            steps=(
+                DispatchStep(
+                    id="asset_generator_step",
+                    agent="asset_generator",
+                    task=(
+                        "用户要求先生成剧本，再生成全量资产图，资产确认后生成分镜图，"
+                        "根据分镜和资产参考生成 AI 视频片段，最后剪辑成片。"
+                    ),
+                    tools=("generate_multimedia",),
+                    final_synthesizer=True,
+                    token_budget=100,
+                ),
+            ),
+            allowed_tools=("generate_multimedia",),
+            total_token_budget=100,
+        ),
+        capability_gateway=capabilities,
+        crew_factory=CapturingFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(request="生成高武都市修仙短剧，最终要 AI 视频片段和成片。")
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    _actor, _name, arguments = capabilities.calls[0]
+    assert arguments["kind"] == "image"
 
 
 async def test_video_compositor_directly_composes_upstream_file_handles_without_text_model() -> None:

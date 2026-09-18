@@ -93,6 +93,7 @@ _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIRECT_MULTIMEDIA_PROMPT_BYTES = 8_192
+_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES = 2_400
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CREWAI_IMPORT_LOCK = threading.Lock()
 _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
@@ -1461,6 +1462,14 @@ def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> s
     if any(
         term in step_text
         for term in (
+            "shot_video_generator",
+            "shot video generator",
+        )
+    ):
+        return "video"
+    if any(
+        term in step_text
+        for term in (
             "asset_generator",
             "asset generator",
             "storyboard_artist",
@@ -1474,17 +1483,6 @@ def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> s
         )
     ):
         return "image"
-    if any(
-        term in step_text
-        for term in (
-            "shot_video_generator",
-            "shot video generator",
-            "镜头视频",
-            "ai 视频",
-            "ai视频",
-        )
-    ):
-        return "video"
     request_text = context.request.casefold()
     request_kind = _infer_direct_multimedia_kind_from_text(request_text)
     if request_kind is not None:
@@ -1867,14 +1865,10 @@ _FULL_PRODUCTION_ASSET_PROMPT_SPECS: tuple[tuple[str, str], ...] = (
         "服务后续分镜和 AI 视频镜头生成。",
     ),
     (
-        "情绪/表演资产",
-        "生成关键表情、眼神、肢体状态和表演强度参考图；"
-        "覆盖剧情转折处的情绪变化。",
-    ),
-    (
-        "声音节奏与风格锁定资产",
-        "生成声音节奏、旁白/对白节拍、音效点位、BGM 氛围和整体画风/色彩/质感锁定参考图；"
-        "用于剪辑节奏和统一视觉风格。",
+        "表演节奏与风格锁定资产",
+        "生成关键表情、眼神、肢体状态、表演强度、声音节奏、旁白/对白节拍、"
+        "音效点位、BGM 氛围和整体画风/色彩/质感锁定参考图；"
+        "覆盖剧情转折处的情绪变化，用于剪辑节奏和统一视觉风格。",
     ),
 )
 
@@ -1907,21 +1901,57 @@ def _direct_full_production_asset_prompts(
     sources: tuple[Artifact, ...],
     feedback: str | None,
 ) -> tuple[str, ...]:
-    base_prompt = _direct_multimedia_generation_prompt(context, step, sources, feedback)
+    shared_context = _direct_full_production_asset_shared_context(
+        context,
+        step,
+        sources,
+        feedback,
+    )
     prompts: list[str] = []
     for title, requirement in _FULL_PRODUCTION_ASSET_PROMPT_SPECS:
         prompt = (
-            f"{base_prompt}\n\n"
             f"本张图片资产类别：{title}。\n"
             f"{requirement}\n"
             "全量专业资产包规则：必须从剧本提取资产，不要只生成角色图；"
             "不要跳过服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏或风格锁定。"
-            "本图只聚焦当前资产类别，供用户审核确认并作为后续分镜/视频的锁定参考。"
+            "本图只聚焦当前资产类别，供用户审核确认并作为后续分镜/视频的锁定参考。\n\n"
+            f"{shared_context}"
         )
         prompts.append(
-            _truncate_prompt_text(prompt, max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+            _truncate_prompt_text(
+                prompt,
+                max_bytes=_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES,
+            )
         )
     return tuple(prompts)
+
+
+def _direct_full_production_asset_shared_context(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    feedback: str | None,
+) -> str:
+    source_previews: list[str] = []
+    for artifact in sources[:4]:
+        preview = _artifact_text_preview(artifact, max_bytes=900)
+        if preview:
+            source_previews.append(f"- {artifact.producer}: {preview}")
+    parts = [
+        "项目请求：" + _truncate_prompt_text(context.request.strip(), max_bytes=420),
+        "执行任务：" + _truncate_prompt_text(step.task.strip(), max_bytes=420),
+    ]
+    if source_previews:
+        parts.append("剧本/上游产物摘录：\n" + "\n".join(source_previews))
+    if feedback is not None:
+        parts.append(
+            "用户审核退回意见："
+            + _truncate_prompt_text(feedback.strip(), max_bytes=420)
+        )
+    return _truncate_prompt_text(
+        "\n\n".join(part for part in parts if part).strip(),
+        max_bytes=1_700,
+    )
 
 
 def _is_video_reference_comparison_prompt(request: str, task: str) -> bool:

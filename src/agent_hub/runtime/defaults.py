@@ -1134,9 +1134,26 @@ def _producer_step_timeout(
     context: TaskContext,
     selected_roles: tuple[RoleAssignment, ...],
 ) -> float:
+    if _is_media_pipeline_execution_context(context, selected_roles):
+        return 300.0
     return min(
         max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
         300.0,
+    )
+
+
+def _is_media_pipeline_execution_context(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+) -> bool:
+    media_role_ids = {
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    }
+    return isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping) or any(
+        role.id in media_role_ids for role in selected_roles
     )
 
 
@@ -1260,7 +1277,7 @@ def _role_allowed_tools(
     if (
         context is not None
         and role.id == "copywriter"
-        and _is_deferred_media_script_plan_context(context)
+        and _is_media_pipeline_script_stage_context(context)
     ):
         requested = tuple(tool for tool in requested if tool != "read_context")
     if not requested or context is None or capability_gateway is None:
@@ -1278,6 +1295,12 @@ def _role_allowed_tools(
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
     return tuple(dict.fromkeys(filtered))
+
+
+def _is_media_pipeline_script_stage_context(context: TaskContext) -> bool:
+    return isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping) or (
+        _is_deferred_media_script_plan_context(context)
+    )
 
 
 def _is_deferred_media_script_plan_context(context: TaskContext) -> bool:

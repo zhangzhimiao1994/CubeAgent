@@ -894,6 +894,7 @@ async def test_final_video_request_plans_script_asset_storyboard_shot_and_compos
         "video_compositor",
     }
     assert steps_by_agent["copywriter"]["requires_user_review"] is True
+    assert steps_by_agent["copywriter"]["tools"] == ()
     assert steps_by_agent["asset_generator"]["depends_on"] == ("copywriter_step",)
     assert steps_by_agent["asset_generator"]["requires_user_review"] is True
     assert steps_by_agent["storyboard_artist"]["depends_on"] == ("asset_generator_step",)
@@ -2431,6 +2432,14 @@ def test_final_video_request_uses_full_asset_locked_pipeline() -> None:
     assert steps["shot_video_generator"].requires_user_review is True
     assert steps["video_compositor"].depends_on == ("shot_video_generator_step",)
     assert "compose_video" in steps["video_compositor"].tools
+    for agent_id in (
+        "copywriter",
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    ):
+        assert steps[agent_id].timeout_seconds == 300.0
 
 
 def test_script_to_image_request_generates_full_asset_pack_without_video_steps() -> None:
