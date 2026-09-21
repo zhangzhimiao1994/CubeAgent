@@ -273,6 +273,23 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+def test_content_studio_video_request_uses_project_tool_before_media_generation() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="做一条 60 秒 AIGC 科普视频，先研究事实、写脚本、分镜、素材、预览和 QC。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    producer = plan.role("content_producer")
+
+    assert producer.purpose is RolePurpose.EXECUTE
+    assert "content_studio" in producer.allowed_tools
+    assert "generate_multimedia" not in producer.allowed_tools
+
+
 def test_video_editing_delivery_dispatch_adds_compose_video_tool_role() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
@@ -567,6 +584,48 @@ def test_provided_script_asset_image_request_starts_from_asset_generator() -> No
                 "以下是剧本：第一场，女主在办公室收到神秘短信；"
                 "第二场，男主带她去天台确认线索。"
                 "请根据这个剧本提取并生成完整资产图，暂时不要生成视频。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["asset_generator"]
+
+
+def test_confirmed_script_full_asset_pack_request_starts_from_asset_generator() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "以下剧本已确认，请按新短剧流程只执行资产拆解与资产图生成，"
+                "暂时不要生成分镜、视频或剪辑。必须生成全量专业资产图并停在用户审核："
+                "角色锁定资产每个主要角色单独一张；服装妆造资产；场景资产；"
+                "道具资产；动作资产；特效资产；镜头资产。"
+                "剧本《霓虹龙脉》：雨夜的江城，外卖员林烬送单到废弃地铁站。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert [role.id for role in plan.roles] == ["asset_generator"]
+
+
+def test_confirmed_script_story_summary_asset_pack_request_starts_from_asset_generator() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "根据下面已确认剧本生成全量专业资产图，只生成资产图并进入人工审核，"
+                "暂时不要生成分镜、视频或剪辑。本剧共有 6 个需要锁定的人物。"
+                "剧本角色：林渊，22岁男，雨夜外卖骑手，黑短发，眉骨旧疤；"
+                "苏清月，21岁女，江城武道协会见习医师，低马尾，白大褂；"
+                "赵天霸，24岁男，龙门武馆少主，大背头。"
+                "故事：雨夜巷口，林渊送外卖时被赵天霸带人围堵，"
+                "祖传青玉断佩发出蓝色电弧；苏清月赶到发现电弧是失传灵脉共鸣。"
+                "关键资产必须覆盖：角色锁定资产、服装妆造资产、场景资产、"
+                "道具资产、动作资产、特效资产、镜头资产。"
             ),
             mode=TaskMode.DISPATCH,
             profile=TaskProfile.GENERAL,

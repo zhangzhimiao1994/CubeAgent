@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -60,6 +61,13 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.production import (
+    CharacterIdentity,
+    CharacterLook,
+    ProductionPlan,
+    build_identity_lock_prompt,
+    build_production_plan,
+)
 from agent_hub.runtime.plugin_context import requested_plugin_context_payload
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,7 +78,7 @@ _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
 _MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES = 2_048
-_MAX_OUTPUT_BYTES = 65_536
+_MAX_OUTPUT_BYTES = 262_144
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
@@ -93,7 +101,7 @@ _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIRECT_MULTIMEDIA_PROMPT_BYTES = 8_192
-_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES = 2_400
+_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES = 2_700
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CREWAI_IMPORT_LOCK = threading.Lock()
 _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
@@ -308,6 +316,14 @@ def _tool_description(internal_name: str, external_name: str) -> str:
             f"function name {external_name} to merge generated image/video artifacts "
             "into a downloadable MP4. Required fields are title and clips."
         )
+    if internal_name == "content_studio":
+        return (
+            "Approved Agent Hub capability: content_studio. Use the model "
+            f"function name {external_name} to create, run, revise, approve, retry, "
+            "and inspect structured Content Studio projects. Use it for factual "
+            "short-form videos where research, evidence, fact check, script, "
+            "storyboard, assets, timeline, preview, and QC must be project state."
+        )
     return f"Approved Agent Hub capability: {internal_name}"
 
 
@@ -442,7 +458,7 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                 "artifact_count": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 8,
+                    "maximum": 24,
                     "description": "Number of independent media artifacts to generate.",
                 },
                 "artifact_prompts": {
@@ -452,7 +468,20 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                         "character, shot, or asset when the requested output count matters."
                     ),
                     "minItems": 1,
-                    "maxItems": 8,
+                    "maxItems": 24,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                },
+                "artifact_labels": {
+                    "type": "array",
+                    "description": (
+                        "Optional per-artifact display labels. Use the same order as "
+                        "artifact_prompts so users can tell which generated file is which."
+                    ),
+                    "minItems": 1,
+                    "maxItems": 24,
                     "items": {
                         "type": "string",
                         "minLength": 1,
@@ -528,6 +557,75 @@ def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
                 },
             },
         }
+    if internal_name == "content_studio":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("operation",),
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": (
+                        "create_content_project",
+                        "get_content_project",
+                        "run_content_project",
+                        "revise_script",
+                        "revise_storyboard",
+                        "regenerate_asset",
+                        "render_preview",
+                        "approve_script",
+                        "approve_final",
+                        "retry_stage",
+                        "replace_claim_status",
+                    ),
+                    "description": "Content Studio project operation.",
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Required for all operations except create_content_project.",
+                },
+                "title": {"type": "string", "description": "Project title for creation."},
+                "topic": {"type": "string", "description": "Content topic for creation."},
+                "source_urls": {
+                    "type": "array",
+                    "description": "Official or supporting source URLs.",
+                    "items": {"type": "string"},
+                },
+                "domain": {"type": "string", "description": "Domain Pack name, default aigc."},
+                "format": {
+                    "type": "string",
+                    "enum": ("explainer", "news", "tutorial"),
+                    "description": "Format Pack name.",
+                },
+                "platform": {"type": "string", "description": "Platform Pack name, default douyin."},
+                "channel": {"type": "string", "description": "Channel Pack name."},
+                "style": {"type": "string", "description": "Style Pack name."},
+                "until": {
+                    "type": "string",
+                    "description": "Target status, such as SCRIPT_READY, ASSETS_READY, or QC_REVIEW.",
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": "Revision or regeneration instruction.",
+                },
+                "asset_id": {"type": "string", "description": "Asset id for regenerate_asset."},
+                "stage": {"type": "string", "description": "Stage for retry_stage."},
+                "claim_id": {"type": "string", "description": "Claim id for replace_claim_status."},
+                "status": {
+                    "type": "string",
+                    "enum": (
+                        "supported",
+                        "partially_supported",
+                        "conflicting",
+                        "outdated",
+                        "unsupported",
+                        "opinion",
+                    ),
+                    "description": "Claim status for replace_claim_status.",
+                },
+                "note": {"type": "string", "description": "Audit note for replace_claim_status."},
+            },
+        }
     return {"type": "object", "additionalProperties": True}
 
 
@@ -597,6 +695,22 @@ def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
         return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
     prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
     return f"{prefix}{suffix}"
+
+
+def _truncate_prompt_text_head_tail(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = f"\n\n[truncated_middle: original_bytes={len(encoded)}]\n\n"
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    remaining = max_bytes - len(marker_bytes)
+    head_bytes = max(1, remaining // 2)
+    tail_bytes = max(1, remaining - head_bytes)
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
+    return f"{head}{marker}{tail}"
 
 
 def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
@@ -669,6 +783,9 @@ def _artifact_review_packet_payload(
 
 
 def _artifact_review_items_payload(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
+    multimedia_items = _multimedia_artifact_review_items_payload(artifact)
+    if multimedia_items:
+        return multimedia_items
     items: list[Mapping[str, JsonValue]] = []
     seen: set[str] = set()
     for file_metadata in _file_metadata_values(artifact.content):
@@ -683,6 +800,7 @@ def _artifact_review_items_payload(artifact: Artifact) -> tuple[Mapping[str, Jso
         item: dict[str, JsonValue] = {
             "id": f"{artifact.id}:{len(items) + 1}",
             "artifact_id": str(artifact.id),
+            "storage_key": storage_key,
             "mime_type": mime_type,
         }
         for field_name in ("filename", "sha256", "kind", "title"):
@@ -691,6 +809,82 @@ def _artifact_review_items_payload(artifact: Artifact) -> tuple[Mapping[str, Jso
                 item[field_name] = value.strip()
         items.append(item)
     return tuple(items)
+
+
+def _multimedia_artifact_review_items_payload(
+    artifact: Artifact,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    result = artifact.content.get("result")
+    if not isinstance(result, Mapping):
+        return ()
+    raw_items = result.get("artifacts")
+    if not isinstance(raw_items, list | tuple):
+        return ()
+    items: list[Mapping[str, JsonValue]] = []
+    for index, raw_item in enumerate(raw_items, start=1):
+        if not isinstance(raw_item, Mapping):
+            continue
+        storage_key = raw_item.get("storage_key")
+        mime_type = raw_item.get("mime_type")
+        generation_error = raw_item.get("generation_error")
+        visual_review = raw_item.get("visual_review")
+        has_file = type(storage_key) is str and type(mime_type) is str
+        has_failure = type(generation_error) is str and generation_error.strip()
+        if isinstance(visual_review, Mapping) and visual_review.get("passed") is False:
+            has_failure = True
+        if not has_file and not has_failure:
+            continue
+        item: dict[str, JsonValue] = {
+            "id": f"{artifact.id}:{index}",
+            "artifact_id": str(artifact.id),
+            "kind": str(raw_item.get("kind") or artifact.type),
+        }
+        for field_name in ("storage_key", "mime_type", "filename", "sha256", "title", "label"):
+            value = raw_item.get(field_name)
+            if type(value) is str and value.strip():
+                item[field_name] = value.strip()
+        if "title" not in item and isinstance(item.get("label"), str):
+            item["title"] = item["label"]
+        if type(generation_error) is str and generation_error.strip():
+            item["generation_error"] = generation_error.strip()[:1000]
+        if isinstance(visual_review, Mapping):
+            summary = visual_review.get("summary")
+            if type(summary) is str and summary.strip():
+                item["visual_review_summary"] = summary.strip()[:1000]
+        items.append(item)
+    return tuple(items)
+
+
+def _artifact_review_items_payload_from_lineage(
+    artifact: Artifact,
+    available_artifacts: tuple[Artifact, ...],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    lineage = _lineage_expanded_artifacts((artifact,), available_artifacts)
+    items: list[Mapping[str, JsonValue]] = []
+    seen: set[str] = set()
+    for lineage_artifact in lineage:
+        for item in _artifact_review_items_payload(lineage_artifact):
+            key = _artifact_review_item_identity(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    return tuple(items)
+
+
+def _artifact_review_item_identity(item: Mapping[str, JsonValue]) -> str:
+    for field_name in ("storage_key", "sha256"):
+        value = item.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return f"{field_name}:{value.strip()}"
+    filename = item.get("filename")
+    mime_type = item.get("mime_type")
+    if isinstance(filename, str) and filename.strip() and isinstance(mime_type, str):
+        return f"file:{filename.strip()}\0{mime_type.strip()}"
+    return (
+        f"artifact:{str(item.get('artifact_id') or '').strip()}"
+        f":{str(item.get('id') or '').strip()}"
+    )
 
 
 def _usable_file_artifacts_payload(artifacts: tuple[Artifact, ...]) -> tuple[Mapping[str, JsonValue], ...]:
@@ -712,7 +906,7 @@ def _usable_file_artifacts_payload(artifacts: tuple[Artifact, ...]) -> tuple[Map
                 "storage_key": storage_key,
                 "mime_type": mime_type,
             }
-            for metadata_field in ("filename", "artifact_id", "download_url"):
+            for metadata_field in ("filename", "artifact_id", "download_url", "title", "label"):
                 value = file_metadata.get(metadata_field)
                 if type(value) is str and value:
                     item[metadata_field] = value
@@ -796,7 +990,7 @@ def _file_metadata_values(value: JsonValue) -> tuple[Mapping[str, JsonValue], ..
             for nested in candidate.values():
                 visit(nested)
             return
-        if isinstance(candidate, tuple):
+        if isinstance(candidate, (list, tuple)):
             for nested in candidate:
                 visit(nested)
 
@@ -812,6 +1006,20 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     if not stripped:
         return None
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
+
+
+def _artifact_text_head_tail_preview(
+    artifact: Artifact,
+    *,
+    max_bytes: int = 1_000,
+) -> str | None:
+    text = _first_artifact_text_value(artifact.content)
+    if text is None:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    return _truncate_prompt_text_head_tail(stripped, max_bytes=max_bytes)
 
 
 def _first_artifact_text_value(content: Mapping[str, JsonValue]) -> str | None:
@@ -983,6 +1191,110 @@ def _direct_multimedia_result_artifact_count(result: Mapping[str, JsonValue]) ->
     if isinstance(result.get("file"), Mapping) or isinstance(result.get("metadata"), Mapping):
         return 1
     return 0
+
+
+def _merge_preserved_multimedia_result_artifacts(
+    result: Mapping[str, JsonValue],
+    preserved_artifacts: object,
+    *,
+    complete_labels: tuple[str, ...],
+) -> Mapping[str, JsonValue]:
+    raw_generated = result.get("artifacts")
+    if not isinstance(raw_generated, list | tuple) or not isinstance(
+        preserved_artifacts, list | tuple
+    ):
+        return result
+    generated = tuple(
+        cast(Mapping[str, JsonValue], item)
+        for item in raw_generated
+        if isinstance(item, Mapping)
+    )
+    preserved = tuple(
+        cast(Mapping[str, JsonValue], item)
+        for item in preserved_artifacts
+        if isinstance(item, Mapping)
+    )
+    if not generated or not preserved:
+        return result
+
+    generated_by_label: dict[str, Mapping[str, JsonValue]] = {}
+    preserved_by_label: dict[str, Mapping[str, JsonValue]] = {}
+    for item in generated:
+        label = _artifact_item_label(item)
+        if label is not None:
+            generated_by_label[_normalize_artifact_label(label)] = item
+    for item in preserved:
+        label = _artifact_item_label(item)
+        if label is not None:
+            preserved_by_label[_normalize_artifact_label(label)] = item
+
+    merged: list[Mapping[str, JsonValue]] = []
+    used_identities: set[tuple[str, str]] = set()
+    used_label_keys: set[str] = set()
+
+    def append_item(item: Mapping[str, JsonValue]) -> None:
+        identity = _multimedia_result_item_identity(item)
+        label = _artifact_item_label(item)
+        label_key = _normalize_artifact_label(label) if label is not None else None
+        if identity is not None and identity in used_identities:
+            return
+        if label_key is not None and label_key in used_label_keys:
+            return
+        if identity is not None:
+            used_identities.add(identity)
+        if label_key is not None:
+            used_label_keys.add(label_key)
+        merged.append(item)
+
+    for label in complete_labels:
+        key = _normalize_artifact_label(label)
+        item = generated_by_label.get(key) or preserved_by_label.get(key)
+        if item is not None:
+            append_item(item)
+    for item in preserved:
+        append_item(item)
+    for item in generated:
+        append_item(item)
+
+    if len(merged) <= len(generated):
+        return result
+    merged_result = dict(result)
+    merged_result["artifacts"] = tuple(merged)
+    merged_result["summary"] = (
+        f"已生成完整多媒体资产包：共 {len(merged)} 个文件，"
+        f"本次重试生成 {len(generated)} 个，保留 {len(preserved)} 个已通过文件。"
+    )
+    return cast(Mapping[str, JsonValue], merged_result)
+
+
+def _multimedia_result_item_identity(
+    item: Mapping[str, JsonValue],
+) -> tuple[str, str] | None:
+    for field_name in (
+        "artifact_id",
+        "storage_key",
+        "sha256",
+        "download_url",
+        "uri",
+    ):
+        value = item.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return (field_name, value.strip())
+    file_value = item.get("file")
+    if isinstance(file_value, Mapping):
+        for field_name in (
+            "artifact_id",
+            "storage_key",
+            "sha256",
+            "download_url",
+        ):
+            value = file_value.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return (f"file.{field_name}", value.strip())
+    label = _artifact_item_label(item)
+    if label is not None:
+        return ("label", _normalize_artifact_label(label))
+    return None
 
 
 def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
@@ -1343,12 +1655,23 @@ _CHARACTER_MODEL_SHEET_PROMPT_CONSTRAINT = (
     "一张图只包含一个角色；不要把多个角色放在同一张设定表。"
     "如果用户要求男女主或多个角色，必须为每个角色分别输出独立图片文件，"
     "男女主至少输出两张：男主一张、女主一张。"
+    "画布规则是硬约束：全图只能是纯白、浅灰或透明感纯色/极淡网格画布；"
+    "所有人物、三视图、表情和服装模块都必须像抠图式孤立人物贴在同一干净画布上。"
+    "禁止任何真实环境背景或职业场所背景，包括墙面、门框、窗户、海报、扶手、器械柜、办公桌、"
+    "街景、室内光影、医院走廊、医疗办公室、展示柜、地面透视和环境景深。"
+    "职业是医生/医师/外卖骑手也不得自动生成医院、办公室、街道或店铺背景。"
     "保持同一人物身份一致：主定妆照、三视图、表情和服装细节必须像同一个人。"
     "保持同一画风，不得混用写实照片、二次元头像和线稿三视图；"
     "用户指定二次元时全二次元，指定写实时全写实。"
-    "采用中等复杂度：画面以主定妆照为核心，必须包含正面主定妆照、简化三视图、"
-    "3-5 个表情/头部变化、服装整体展示、色彩基调和 3-6 个关键服装/身份道具细节；"
+    "采用中等复杂度但可生成的专业设定板：画面以主定妆大图为核心，"
+    "限制为 6-8 个清晰模块，包含主定妆半身大图、正/侧/背全身三视图、"
+    "3 个表情头部、2 套剧情服装/状态变体、随身物/职业道具、材质色卡；"
     "服装、发型、年龄感、职业气质必须来自角色设定。"
+    "允许角色根据场景和剧情更换服装或湿身/战斗/工作状态，但必须保持同一张脸、同一发型逻辑、"
+    "同一年龄感、体态和身份气质；换衣服不是换人。"
+    "随身物/职业道具必须来自剧本或角色设定，不得加入剧本或角色设定之外的随机道具。"
+    "图内文字只使用少量极短且容易生成正确的栏目标题，例如主图、三视图、表情、服装、道具、色卡；"
+    "宁可用编号/图标/空白栏，也不要生成长句、小字、伪字、错别字、乱码或不可读说明。"
     "不要过度堆叠小物件、文字说明或复杂资产格，也不要只输出头像、单张主图、"
     "重复近景头像或与角色设定无关的食物/商品/摆拍道具。"
     "禁止写实主图+二次元表情+线稿三视图的混合拼贴。"
@@ -1399,6 +1722,165 @@ def _direct_capability_names_for_step(step: DispatchStep) -> frozenset[str]:
         for name in ("generate_multimedia", "compose_video")
         if name in step.tools
     )
+
+
+def _direct_capability_timeout_reason(
+    capability_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> str:
+    if capability_name == "generate_multimedia":
+        kind = arguments.get("kind")
+        logical_model = arguments.get("logical_model")
+        count = arguments.get("artifact_count")
+        count_text = f" {count}" if isinstance(count, int) and count > 1 else ""
+        kind_text = f" {kind}" if isinstance(kind, str) and kind else ""
+        model_text = f" with {logical_model}" if isinstance(logical_model, str) and logical_model else ""
+        return f"capability failed: generate_multimedia timed out while generating{count_text}{kind_text} assets{model_text}"
+    return f"capability failed: {capability_name} timed out"
+
+
+def _direct_capability_failure_payload(
+    failure_reason: str,
+    capability_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = dict(runtime_failure_diagnostic_from_reason(failure_reason))
+    payload["capability_name"] = capability_name
+    if capability_name == "generate_multimedia":
+        for key in ("kind", "logical_model", "artifact_count"):
+            value = arguments.get(key)
+            if isinstance(value, (str, int)):
+                payload[key] = value
+        labels = arguments.get("artifact_labels")
+        if isinstance(labels, tuple):
+            payload["artifact_label_count"] = len(labels)
+            payload["artifact_labels"] = tuple(
+                label for label in labels[:24] if isinstance(label, str)
+            )
+            payload["artifact_labels_truncated"] = len(labels) > 24
+    return payload
+
+
+def _direct_capability_progress_payload(
+    capability_name: str,
+    arguments: Mapping[str, JsonValue],
+    started_payload: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    if capability_name != "generate_multimedia":
+        return None
+    kind = arguments.get("kind")
+    count = arguments.get("artifact_count")
+    logical_model = arguments.get("logical_model")
+    if not isinstance(kind, str) or not isinstance(count, int) or count <= 1:
+        return None
+    labels_value = arguments.get("artifact_labels")
+    labels: tuple[str, ...] = ()
+    if isinstance(labels_value, tuple):
+        labels = tuple(label for label in labels_value[:24] if isinstance(label, str))
+    parallelism = _direct_multimedia_progress_parallelism(kind, count)
+    wave_count = max(1, math.ceil(count / parallelism))
+    timeout_budget_seconds = _direct_multimedia_progress_timeout_seconds(
+        kind,
+        count,
+        wave_count,
+        labels=labels,
+    )
+    payload: dict[str, JsonValue] = {
+        "phase": "multimedia_generation",
+        "capability_name": capability_name,
+        "kind": kind,
+        "artifact_count": count,
+        "parallelism": parallelism,
+        "wave_count": wave_count,
+        "timeout_budget_seconds": timeout_budget_seconds,
+        "completed_count": 0,
+        "status": "running",
+        "message": f"正在生成 {count} 个{kind}资产，预计分 {wave_count} 批并行轮询。",
+    }
+    if isinstance(logical_model, str):
+        payload["logical_model"] = logical_model
+    if labels:
+        payload["artifact_label_count"] = len(labels_value) if isinstance(labels_value, tuple) else len(labels)
+        payload["artifact_labels"] = labels
+        payload["artifact_labels_truncated"] = (
+            isinstance(labels_value, tuple) and len(labels_value) > 24
+        )
+    direct_dispatch = started_payload.get("direct_dispatch")
+    if isinstance(direct_dispatch, bool):
+        payload["direct_dispatch"] = direct_dispatch
+    return payload
+
+
+def _direct_capability_progress_heartbeat_seconds(
+    capability_name: str,
+    base_payload: Mapping[str, JsonValue],
+) -> int:
+    if capability_name != "generate_multimedia":
+        return 0
+    kind = str(base_payload.get("kind") or "").strip().casefold()
+    if kind == "image":
+        return 60
+    if kind in {"video", "audio"}:
+        return 90
+    return 60
+
+
+def _direct_capability_progress_heartbeat_message(
+    base_payload: Mapping[str, JsonValue],
+    *,
+    elapsed_seconds: int,
+    timeout_seconds: float,
+) -> str:
+    count = base_payload.get("artifact_count")
+    kind = str(base_payload.get("kind") or "media").strip() or "media"
+    wave_count = base_payload.get("wave_count")
+    parallelism = base_payload.get("parallelism")
+    timeout_budget = base_payload.get("timeout_budget_seconds")
+    timeout = (
+        int(max(1.0, timeout_budget))
+        if isinstance(timeout_budget, int | float) and not isinstance(timeout_budget, bool)
+        else int(max(1.0, timeout_seconds))
+    )
+    parts = [f"仍在轮询 {count} 个{kind}资产" if count else f"仍在轮询{kind}资产"]
+    if parallelism and wave_count:
+        parts.append(f"并行度 {parallelism}，预计 {wave_count} 批")
+    parts.append(f"已等待 {elapsed_seconds}s / 超时预算 {timeout}s")
+    return "；".join(parts) + "。"
+
+
+def _direct_multimedia_progress_parallelism(kind: str, count: int) -> int:
+    if count <= 1:
+        return 1
+    if kind == "image":
+        return min(9, count)
+    if kind in {"video", "audio"}:
+        return 1
+    return 1
+
+
+def _direct_multimedia_progress_timeout_seconds(
+    kind: str,
+    count: int,
+    wave_count: int,
+    *,
+    labels: tuple[str, ...] = (),
+) -> int:
+    if kind == "image":
+        per_job = 600
+        if any(
+            "角色锁定资产" in label
+            or "Character Model Sheet".casefold() in label.casefold()
+            or "表演节奏" in label
+            or "风格锁定" in label
+            for label in labels
+        ):
+            per_job = 1_200
+        return per_job * max(1, wave_count)
+    if kind == "video":
+        return 1_200 * max(1, count)
+    if kind == "audio":
+        return 420 * max(1, count)
+    return 600 * max(1, wave_count)
 
 
 def _is_direct_multimedia_step(step: DispatchStep) -> bool:
@@ -1455,6 +1937,60 @@ def _lineage_expanded_artifacts(
     for source in sources:
         add_with_lineage(source)
     return tuple(ordered)
+
+
+def _prune_invalidated_artifact_lineage(
+    artifact_registry: dict[str, Artifact],
+    invalidated_artifact_ids: set[str],
+) -> None:
+    """Remove derived artifacts whose sources point at invalidated runtime outputs."""
+
+    changed = True
+    while changed:
+        changed = False
+        for artifact_id, artifact in tuple(artifact_registry.items()):
+            if artifact_id in invalidated_artifact_ids or any(
+                source_id in invalidated_artifact_ids for source_id in artifact.source_ids
+            ):
+                artifact_registry.pop(artifact_id, None)
+                if artifact_id not in invalidated_artifact_ids:
+                    invalidated_artifact_ids.add(artifact_id)
+                changed = True
+
+
+def _artifact_registry_source_closure(
+    artifact_registry: Mapping[str, Artifact],
+    supplemental_artifacts: tuple[Artifact, ...],
+) -> dict[str, Artifact]:
+    """Return checkpoint artifacts plus source ancestors available in context."""
+
+    by_id = {str(artifact.id): artifact for artifact in supplemental_artifacts}
+    by_id.update(artifact_registry)
+    closed = dict(artifact_registry)
+    pending = list(closed.values())
+    while pending:
+        artifact = pending.pop()
+        for source_id in artifact.source_ids:
+            if source_id in closed:
+                continue
+            source = by_id.get(source_id)
+            if source is None:
+                continue
+            closed[source_id] = source
+            pending.append(source)
+    return closed
+
+
+def _is_dispatch_internal_context_artifact(
+    artifact: Artifact,
+    plan: DispatchPlan,
+) -> bool:
+    """Return true for restored runtime evidence that must not become fresh input."""
+
+    plan_actors = {agent.id for agent in plan.agents}
+    if artifact.type in {"model_response", "tool_result", "review_feedback"}:
+        return True
+    return artifact.producer in plan_actors and artifact.type in {"text", "image", "video", "audio"}
 
 
 def _infer_direct_multimedia_kind(context: TaskContext, step: DispatchStep) -> str | None:
@@ -1559,6 +2095,16 @@ def _direct_multimedia_generation_prompt(
         style_lock = _character_model_sheet_style_lock(context.request, step.task)
         if style_lock is not None:
             parts.append(style_lock)
+    if _looks_like_video_generation_request(context.request, step.task):
+        parts.append(
+            "Director / 制片导演要求：视频片段必须服务当前分镜的节奏、动作目的和情绪推进，"
+            "不要只生成一张会动的剧照。Scene Character State 必须继承已审核资产中的 Character ID "
+            "和 Look ID；连续时间继承上一场造型，只有剧本明确换装、第二天、回家、受伤、战斗、"
+            "雨夜/湿身或活动时才切换 Look。"
+            "局部失败策略：只重试失败视频片段或受影响镜头，保留已通过镜头。"
+            "Video QC：输出后必须抽帧检测身份/服装/黑帧/静音/字幕、道具连续性、特效位置、"
+            "动作是否符合分镜、人物是否漂移、字幕是否遮挡安全区。"
+        )
     prompt = "\n\n".join(part for part in parts if part)
     prompt = unicodedata.normalize("NFC", prompt)
     prompt = "".join(
@@ -1567,6 +2113,11 @@ def _direct_multimedia_generation_prompt(
     )
     prompt = _CONTROL_CHARS.sub(" ", prompt)
     return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+
+
+def _looks_like_video_generation_request(request: str, task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", f"{request} {task}").casefold()
+    return any(term in normalized for term in ("视频", "短片", "成片", "片段", "video", "clip"))
 
 
 def _is_character_model_sheet_prompt(request: str, task: str) -> bool:
@@ -1812,7 +2363,17 @@ def _direct_storyboard_generation_prompt(
         (
             "分镜图产物约束：本张产物是短剧/视频分镜图，按剧本拆成关键镜头画面格；"
             "标注镜头顺序、场景、景别、角色动作、情绪和画面重点。"
+            "分镜画面必须干净，只表达该镜头必要的构图、动作、情绪、机位和节奏；"
+            "不要把资产包里的角色设定、道具特写、特效设定、服装板、场景细节全部塞进同一格。"
             "不要生成角色定妆照、角色参考设定表、单人写真、合照或海报。"
+        ),
+        (
+            "Scene Character State / 场记连续性：每个镜头必须标明涉及的 Character ID、Look ID、"
+            "场景时间和造型继承关系；连续时间默认继承上一场造型，只有换装、第二天、回家、"
+            "受伤、雨夜/湿身、战斗或活动才切换 Look。"
+            "失败处理：分镜审核不合格时只重试失败镜头或受影响镜头，不重做已通过镜头。"
+            "视频 QC 钩子：后续视频片段必须抽帧检测身份/服装/黑帧/静音/字幕、道具连续性、"
+            "动作和特效是否与本分镜一致。"
         ),
     ]
     if source_previews:
@@ -1831,45 +2392,140 @@ def _direct_storyboard_generation_prompt(
 
 _FULL_PRODUCTION_ASSET_PROMPT_SPECS: tuple[tuple[str, str], ...] = (
     (
-        "角色资产",
-        "为每个重要角色生成独立角色资产图，包含定妆、体态、发型、表情和身份气质；"
-        "角色必须来自剧本，不要只生成头像。",
+        "角色锁定资产",
+        "生成主要角色的角色资产/角色锁定资产板。每个重要角色必须独立成区，"
+        "采用中等复杂度但可生成的专业设定板：主定妆半身大图、正/侧/背全身三视图、"
+        "3 个表情头部、2 套剧情服装/状态变体、随身物/职业道具、材质色卡和不可漂移特征。"
+        "总模块控制在 6-8 个，不要塞满密集小格。"
+        "角色可以根据剧情场景更换服装或状态，但所有服装变体必须保持同一脸型、发型逻辑、年龄感、体态和身份气质。"
+        "随身物/职业道具必须来自剧本或角色设定，不得加入剧本或角色设定之外的随机道具；"
+        "文字只使用少量清晰中文标签和栏目标题，避免密集小字、伪字、乱码或不可读说明。"
+        "人物定妆必须使用纯白/浅灰/透明感纯色背景，整张图像是干净设定板画布；"
+        "人物、三视图、表情和服装模块都必须像抠图式孤立人物，禁止出现室内、街景、道具桌面、"
+        "门框、窗户、墙画、海报、扶手、器械柜、医疗办公室、医院走廊、环境光影、地面透视或任何具体场景背景，"
+        "避免后续把背景误当成人物锁定锚点。"
+        "这是 Character Model Sheet / 角色参考设定表，不是动作剧照、海报、合照或单人写真。",
     ),
     (
         "服装妆造资产",
-        "生成主服装、场景服装、配饰、妆发、材质和色彩基调资产图；"
-        "每套服装要对应角色身份和剧情场景。",
+        "生成服装妆造设定板，覆盖主服装、场景服装、配饰、妆发、材质和色彩基调；"
+        "必须按角色分区展示，不得只生成一个角色的服装；每个分区写清 Character ID / Look ID。"
+        "每套服装要对应角色身份和剧情场景，并保持角色锁定资产中的脸型、发型、体态不变。"
+        "服装必须来自剧本角色锚点，不要擅自改成黑西装、战术服、奇幻铠甲或无关职业制服。"
+        "现代都市角色不要被画成古风长袍、铠甲、特警、雇佣兵或科幻战术装，除非剧本明确要求。"
+        "禁止项不得画进画面当反例；即使旁边写“禁止使用”也不合格，禁用造型必须完全不出现。"
+        "不得生成 Character ID 001/A01/B03 等占位编号角色，不得生成金发西装男、陌生学生、运动少女或剧本外人物。"
+        "优先使用无头服装平铺、衣架展示、服装正反面和局部细节；不要使用真人模特照片，不要让模特脸影响角色身份。"
+        "必须按剧情/场景拆出服装变化，例如工作服、雨夜状态、战斗/受伤状态、外出状态；"
+        "每套衣服都要说明适用场景，不能把全剧都固定成一套衣服，也不能换衣服后换成另一个人。"
+        "重点展示服装正反面、服装拆解、材质色卡、配饰、妆发细节和色彩，使用纯白/浅灰/透明感纯色背景；"
+        "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
+        "不得出现办公室、街景、桌面、窗户、墙画或其他具体环境背景。"
+        "不要生成普通人像写真或电影剧照。",
     ),
     (
         "场景资产",
-        "生成主要地点和关键空间资产图，包含室内/室外、时代城市感、天气、光线和氛围。",
+        "生成场景设定板，覆盖主要地点和关键空间，包含空间视角、平面/纵深层次、"
+        "室内/室外、时代城市感、天气、光线方向、氛围、可复用背景层、入口/遮挡/动线和色彩基调。"
+        "只覆盖剧本出现的地点；如果剧本是雨夜巷口和角色家中，就必须围绕这些地点拆解，"
+        "不得替换成写字楼大厅、会展广场、办公楼入口、地铁通道或剧本外公共空间。"
+        "标签必须是中文地点/光线/动线说明，不得出现 smoke、v30、test、demo 或任何测试水印式文字。"
+        "可以用 3-5 个干净场景小图格、光线箭头和背景层拆解，不要把场景资产画成主角动作海报。",
     ),
     (
         "道具资产",
-        "生成剧情关键物、随身物、识别性物件和特殊物件资产图；"
-        "道具必须能服务剧情推进。",
+        "生成道具设定板，覆盖剧情关键物、随身物、识别性物件、特殊法器/科技物件和细节特写；"
+        "道具必须可独立识别并服务剧情推进，使用独立物件 lineup、局部特写、材质色卡、比例参考和状态变化，"
+        "使用纯白/浅灰/透明感纯色背景；"
+        "只生成剧本明确要求的道具或角色身份必需的道具，不要补充随机钥匙、信件、手杖、饰物等无关物；"
+        "不要补充能量核心、机械装置、科幻圆盘、未知武器或任何没有出现在剧本/用户要求中的道具；"
+        "证件照片只能使用空白头像占位或剪影占位，不能生成随机真人头像；每个标签必须贴在正确道具下方，标签不得错位。"
+        "如果用户或剧本列出黄色外卖箱、青玉断佩、银针、证件等指定物件，必须逐项覆盖并清楚分区。"
+        "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
+        "不得出现书桌、工作室、街景或角色摆拍背景，不要只让角色拿着道具摆拍。",
     ),
     (
         "动作资产",
-        "生成关键动作姿态参考图，例如奔跑、转身、递物、拥抱、打斗、施法或躲避等；"
-        "动作必须来自剧本。",
+        "生成动作姿态参考板，例如奔跑、转身、递物、打斗、施法、躲避、救援等；"
+        "高武都市修仙/雨夜外卖类剧本必须优先覆盖：林渊护黄色外卖箱后撤、雨中追击/躲避、"
+        "青玉断佩触发电弧、苏清月银针压脉/牵真气纹、反派近身压迫。"
+        "动作必须来自剧本，重点是姿态序列、动作分解、姿态线、关键帧、重心变化和运动箭头，"
+        "角色外观必须沿用角色锁定资产，不得擅自换成战术服、黑西装、陌生发型或无关人物。"
+        "优先使用无脸灰色剪影/线稿动作人偶，只用黄色外卖箱、青玉断佩、银针和动作箭头标识剧情动作；"
+        "如果剧本没有明确雨伞，道具和动作中不得出现雨伞；用雨线和湿地面表达雨，不要用伞表达雨。"
+        "不得出现古风发冠、古风长袍、仙侠人物、黑甲护卫或陌生动漫主角。"
+        "如果难以稳定角色脸，宁可继续使用无脸动作人偶；不要生成可辨识陌生人脸。"
+        "使用纯白/浅灰/透明感纯色背景或极简动作网格；不要混入场景板、道具板或大量头像；"
+        "每格只表达一个可复用动作。",
     ),
     (
         "特效资产",
-        "生成法术、能量、爆炸、烟雾、光效、屏幕特效、转场特效等视觉效果资产图；"
-        "特效形态和颜色要可复用。",
+        "生成干净的特效设定板，只覆盖本剧需要的 3 类特效：蓝色电弧、银针真气纹、雨水剑气；"
+        "每类用 2 个小格展示基础形态和增强形态，总计约 6 格。"
+        "标明颜色、强弱层级、触发动作、扩散方向、边缘质感和可复用变化。"
+        "不要生成通用魔法爆炸集合，不要把雨水剑气画成实体长剑或武器道具。"
+        "背景必须干净，可用透明感棋盘/深浅纯色底突出特效形态；"
+        "不要出现角色头像、半身人像、街景、战斗场景、单张战斗海报、宣传图或无法复用的剧照。",
     ),
     (
         "镜头资产",
-        "生成景别、机位、镜头运动、构图和节奏参考图；"
-        "服务后续分镜和 AI 视频镜头生成。",
+        "生成镜头语言设定板，覆盖景别、机位、镜头运动、构图、焦段感和剪辑节奏参考；"
+        "服务后续分镜和 AI 视频镜头生成，可用小图格、框线、箭头、机位图标、焦段示意和构图线表达。"
+        "使用纯白/浅灰/蓝图感纯色背景，不要使用真实街景、室内或角色剧照做背景。"
+        "画面主体必须是 storyboard / cinematography board：镜头框、机位俯视图、推拉摇移轨迹、"
+        "景别机位构图卡、远景/中景/近景/特写示意、景深和剪辑节奏图。"
+        "不要生成角色头像阵列、脸部九宫格、角色定妆表、普通剧照、人物写真或宣传海报；"
+        "如果需要人物，只能用小比例剪影或火柴人占位，不得出现可辨识大脸；"
+        "不得出现真人眼睛、真实脸部特写、照片式皮肤细节或任何会造成身份漂移的脸部素材。",
     ),
     (
         "表演节奏与风格锁定资产",
-        "生成关键表情、眼神、肢体状态、表演强度、声音节奏、旁白/对白节拍、"
-        "音效点位、BGM 氛围和整体画风/色彩/质感锁定参考图；"
-        "覆盖剧情转折处的情绪变化，用于剪辑节奏和统一视觉风格。",
+        "生成剪辑和导演用的表演节奏板，不要求复杂人物大图；"
+        "必须使用中文或图标，禁止英文错字、伪字和不可读小字。"
+        "必须明确标出 60 秒短剧节奏段：0-3秒Hook、3-10秒人物/冲突、10-35秒动作推进、35-52秒反转兑现、52-60秒钩子。"
+        "时间段文字必须逐字正确，不得省略“秒”字，不得写成 35-522、52-600、Hookk 或其他数字/英文错字。"
+        "使用 4-6 个清晰模块表达情绪曲线、表情强度、肢体状态、旁白/对白节拍、音效点位、BGM 氛围和色彩/光影风格。"
+        "可以用时间轴、节奏点、图标、小比例表情示意和色块表达，避免生成大幅单人写真。"
+        "如出现人物示意，必须沿用本剧角色年龄感、服装基调和画风，不要换成黑西装男性、陌生动漫角色或通用情绪模板。"
+        "使用干净纯色/网格/时间轴式背景，不要生成室内场景或剧照。",
     ),
+)
+_FULL_PRODUCTION_CHARACTER_ASSET_LIMIT = 12
+_FULL_PRODUCTION_ASSET_PROMPT_LIMIT = (
+    _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT + len(_FULL_PRODUCTION_ASSET_PROMPT_SPECS) - 1
+)
+_SCRIPT_CHARACTER_SECTION_TERMS = (
+    "角色表",
+    "人物表",
+    "主要角色",
+    "角色清单",
+    "人物小传",
+    "人物设定",
+    "人物设置",
+    "角色设定",
+    "出场角色",
+)
+_NON_CHARACTER_HEADING_TERMS = (
+    "风险",
+    "成本",
+    "密度",
+    "规则",
+    "审核",
+    "闸门",
+    "交付",
+    "项目信息",
+    "世界观",
+    "场景",
+    "分镜",
+    "资产",
+    "道具",
+    "特效",
+    "镜头",
+    "服装",
+    "投放",
+    "封面",
+    "剧名",
+    "预告",
 )
 
 
@@ -1901,29 +2557,696 @@ def _direct_full_production_asset_prompts(
     sources: tuple[Artifact, ...],
     feedback: str | None,
 ) -> tuple[str, ...]:
+    production_plan = _full_production_plan_for_asset_context(context, step, sources)
+    specs = _direct_full_production_asset_prompt_specs(
+        context,
+        step,
+        sources,
+    )
+    per_prompt_budget = _direct_full_production_asset_prompt_budget(len(specs))
     shared_context = _direct_full_production_asset_shared_context(
         context,
         step,
         sources,
         feedback,
+        max_bytes=min(900, max(560, per_prompt_budget // 3)),
     )
     prompts: list[str] = []
-    for title, requirement in _FULL_PRODUCTION_ASSET_PROMPT_SPECS:
+    for title, requirement in specs:
+        production_control = _full_production_asset_control_section(
+            title,
+            context=context,
+            step=step,
+            sources=sources,
+            plan=production_plan,
+        )
         prompt = (
             f"本张图片资产类别：{title}。\n"
             f"{requirement}\n"
+            f"{production_control}\n"
             "全量专业资产包规则：必须从剧本提取资产，不要只生成角色图；"
             "不要跳过服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏或风格锁定。"
-            "本图只聚焦当前资产类别，供用户审核确认并作为后续分镜/视频的锁定参考。\n\n"
+            "每张资产图必须干净、低噪声，只表达当前资产类别直接需要锁定的必要细节；"
+            "不要把剧本里所有角色、地点、道具、动作、特效和背景都当作细节堆进同一张图。"
+            "除场景资产外，资产图应使用纯白/浅灰/透明感纯色背景或极简网格底；"
+            "不得出现办公室、桌面、窗户、室内、街景、墙画、环境光影等具体背景。"
+            "可用少量清晰标签列出取舍依据，但画面主体必须是当前类别的可复用参考元素。"
+            "本图只聚焦当前资产类别，供用户审核确认并作为后续分镜/视频的锁定参考。"
+            "资产图必须是清晰的设定板/参考板/模型表，不是电影剧照、成片截图、宣传海报或随机美图。"
+            "同一角色在所有资产类别里必须保持同一脸型、年龄、发型、体态、服装基调和画风；"
+            "若无法确认某项资产，请在画面文字标签中标注待确认，不要擅自换人。\n\n"
             f"{shared_context}"
         )
         prompts.append(
             _truncate_prompt_text(
                 prompt,
-                max_bytes=_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES,
+                max_bytes=per_prompt_budget,
             )
         )
     return tuple(prompts)
+
+
+def _full_production_plan_for_asset_context(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> ProductionPlan:
+    source_text = "\n".join(_source_structural_texts(sources[:4]))
+    return build_production_plan(
+        "\n".join(part for part in (context.request, step.task, source_text) if part.strip())
+    )
+
+
+def _full_production_asset_control_section(
+    title: str,
+    *,
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+    plan: ProductionPlan,
+) -> str:
+    target = _character_target_from_asset_label(title)
+    if target:
+        identity = _production_identity_for_target(target, plan, context, step, sources)
+        looks = _production_looks_for_identity(identity, plan)
+        look = looks[0]
+        return "\n".join(
+            (
+                "Production Direction / 导演/制片控制:",
+                plan.direction.director_statement,
+                "Scene Character State:",
+                _scene_state_summary(identity.character_id, plan),
+                "Available Looks / 多造型管理:",
+                _look_catalog_summary(looks),
+                _compact_identity_lock_prompt(identity, look),
+            )
+        )
+    return "\n".join(
+        (
+            "Production Direction / 导演/制片控制:",
+            plan.direction.director_statement,
+            "Scene Character State:",
+            "支撑资产必须服务已定义 Character ID / Look ID；不要让道具、动作、特效或镜头资产反向改写人物身份。",
+            "Continuity / 场记要求：连续时间继承上一场造型；只有剧本明确换装、第二天、回家、受伤、战斗、雨夜/湿身或活动时才切换 Look。",
+            "Retry / 制片要求：只重试失败的角色、Look、分镜或视频片段，保留已通过资产。",
+        )
+    )
+
+
+def _character_target_from_asset_label(label: str) -> str | None:
+    marker = "角色锁定资产："
+    if label.startswith(marker):
+        target = label[len(marker) :].strip()
+        return target or None
+    return None
+
+
+def _production_identity_for_target(
+    target: str,
+    plan: ProductionPlan,
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> CharacterIdentity:
+    normalized_target = unicodedata.normalize("NFKC", target)
+    for identity in plan.character_identities:
+        if identity.display_name and (
+            identity.display_name in normalized_target
+            or normalized_target in identity.display_name
+        ):
+            return identity
+    anchor = _full_production_asset_character_anchor(target, context, step, sources)
+    return CharacterIdentity(
+        character_id=_fallback_character_id(normalized_target, len(plan.character_identities) + 1),
+        display_name=normalized_target,
+        role_type=None,
+        identity_prompt=anchor or normalized_target,
+        identity_traits=(anchor or normalized_target, "身份与脸部长期稳定"),
+        forbidden_drift=("换脸", "改变年龄感", "改变五官比例", "改变体态", "与其他角色撞脸"),
+        master_reference_artifact_ids=(),
+        embedding_refs=(),
+    )
+
+
+def _production_look_for_identity(
+    identity: CharacterIdentity,
+    plan: ProductionPlan,
+) -> CharacterLook:
+    looks = _production_looks_for_identity(identity, plan)
+    if looks:
+        return looks[0]
+    return CharacterLook(
+        look_id="LOOK_001",
+        character_id=identity.character_id,
+        name="基础造型",
+        scene_applicability=(),
+        costume_traits=("符合角色身份和剧本场景的基础服装",),
+        accessories=(),
+        hair_makeup_variations=("沿用身份参考发型逻辑",),
+        forbidden_identity_changes=("不得改脸", "不得改变年龄感", "不得继承服装参考模特身份"),
+    )
+
+
+def _production_looks_for_identity(
+    identity: CharacterIdentity,
+    plan: ProductionPlan,
+) -> tuple[CharacterLook, ...]:
+    looks = tuple(look for look in plan.looks if look.character_id == identity.character_id)
+    if looks:
+        return looks
+    return (
+        CharacterLook(
+            look_id="LOOK_001",
+            character_id=identity.character_id,
+            name="基础造型",
+            scene_applicability=(),
+            costume_traits=("符合角色身份和剧本场景的基础服装",),
+            accessories=(),
+            hair_makeup_variations=("沿用身份参考发型逻辑",),
+            forbidden_identity_changes=("不得改脸", "不得改变年龄感", "不得继承服装参考模特身份"),
+        ),
+    )
+
+
+def _look_catalog_summary(looks: tuple[CharacterLook, ...]) -> str:
+    lines: list[str] = []
+    for look in looks[:6]:
+        scenes = "、".join(look.scene_applicability) or "未限定"
+        traits = "、".join(item for item in look.costume_traits if item.strip()) or "按剧本"
+        accessories = "、".join(item for item in look.accessories if item.strip()) or "无新增"
+        lines.append(f"- {look.look_id} {look.name}：服装={traits}；配饰={accessories}；适用场景={scenes}")
+    return "\n".join(lines) or "- LOOK_001 基础造型：按剧本身份建立，不改变人物身份"
+
+
+def _compact_identity_lock_prompt(identity: CharacterIdentity, look: CharacterLook) -> str:
+    return "\n".join(
+        (
+            f"CHARACTER_ID: {identity.character_id}；CHARACTER_NAME: {identity.display_name}",
+            f"IDENTITY LOCK: {identity.identity_prompt}",
+            (
+                "身份优先级：Character ID 只负责脸型、五官、眼距、鼻型、嘴型、下颌线、肤色、"
+                "年龄感、发际线、基础发型和体态；Look ID 只负责服装、配饰、鞋履、包、帽子和场景状态。"
+            ),
+            (
+                f"当前基础 Look: {look.look_id} {look.name}；服装={_join_prompt_traits(look.costume_traits)}；"
+                f"配饰={_join_prompt_traits(look.accessories)}；妆发={_join_prompt_traits(look.hair_makeup_variations)}。"
+            ),
+            (
+                "禁止换脸、变年龄、变体态、与其他角色撞脸；每次换装都从原始 Identity Reference 出发，"
+                "不得以上一场图连续编辑造成漂移。"
+            ),
+        )
+    )
+
+
+def _join_prompt_traits(values: tuple[str, ...]) -> str:
+    return "、".join(item.strip() for item in values if item.strip()) or "未指定"
+
+
+def _scene_state_summary(character_id: str, plan: ProductionPlan) -> str:
+    states = [state for state in plan.scene_states if state.character_id == character_id]
+    if not states:
+        return f"{character_id} -> LOOK_001（默认基础造型；后续场景按连续性规则继承或切换）"
+    return "；".join(
+        f"{state.scene_id} -> {state.character_id} + {state.look_id}（{state.continuity_reason}）"
+        for state in states[:6]
+    )
+
+
+def _fallback_character_id(target: str, index: int) -> str:
+    letters = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", target).upper()
+        if "A" <= character <= "Z" or "0" <= character <= "9"
+    )
+    if not letters:
+        letters = "".join(f"{ord(character):X}"[-1] for character in target if character.strip())
+    letters = re.sub(r"[^A-Z0-9]+", "", letters)[:8] or "CHAR"
+    return f"CHAR_{letters}_{index:03d}"
+
+
+def _direct_full_production_asset_prompt_budget(asset_count: int) -> int:
+    if asset_count <= 0:
+        return _DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES
+    return max(2_000, min(_DIRECT_MULTIMEDIA_ARTIFACT_PROMPT_BYTES, 24_000 // asset_count))
+
+
+def _direct_full_production_asset_labels(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        title for title, _requirement in _direct_full_production_asset_prompt_specs(context, step, sources)
+    )
+
+
+def _direct_full_production_asset_prompt_specs(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> tuple[tuple[str, str], ...]:
+    character_targets = _full_production_asset_character_targets(context, step, sources)
+    if not character_targets:
+        return _FULL_PRODUCTION_ASSET_PROMPT_SPECS
+    specs: list[tuple[str, str]] = []
+    for target in character_targets[:_FULL_PRODUCTION_CHARACTER_ASSET_LIMIT]:
+        anchor = _full_production_asset_character_anchor(target, context, step, sources)
+        anchor_requirement = (
+            f"角色硬锚点（最高优先级，所有模块都必须对应）：{anchor}。"
+            if anchor
+            else f"角色硬锚点（最高优先级）：只生成 {target}，不得把名字泛化成仙侠/礼服/陌生职业模板。"
+        )
+        specs.append(
+            (
+                f"角色锁定资产：{target}",
+                (
+                    f"生成唯一目标角色：{target} 的 Character Model Sheet / 角色参考设定表。"
+                    f"{anchor_requirement}"
+                    "Available Looks / 多造型管理：本图必须展示基础 Look 和剧本触发的换装/雨夜/居家/战斗状态 Look；"
+                    "Character ID 只负责脸型、五官、年龄感、肤色、基础发型和体态，Look ID 只负责服装、鞋履、配饰和场景状态。"
+                    "角色锁定资产只管理人物身份和明确服装 Look，不展示动作场景、雨景、战斗场景、背景图或剧情剧照；"
+                    "雨夜/战斗/追击只能作为服装状态的孤立抠图，不得出现雨伞、雨景、街景、护甲、战术服或武器化装备。"
+                    "图内文字尽量不用英文，只允许少量大号中文栏目名，禁止伪字、错字、乱码和不可读小字。"
+                    "一张图只包含这个角色，不要混入其他角色、双人剧照、场景海报或无关资产。"
+                    "人物定妆必须是纯白/浅灰/透明感纯色背景；整张图像必须像专业设定板画布，"
+                    "所有人物模块都是抠图式孤立人物，不得在任何模块里出现墙、门、窗、海报、扶手、器械柜、"
+                    "医疗办公室、医院走廊、街景、道具桌面、场景光影、地面透视或任何会影响人物锁定的具体环境背景。"
+                    "职业锚点只能体现在服装、证件、随身物和姿态中，不允许用职业场所背景来表达。"
+                    "生成不同 Look 时必须从原始 Identity Reference 出发，不得以上一个场景图继续编辑导致累计漂移。"
+                    "采用中等复杂度但可生成的专业设定板结构，限制为 6-8 个清晰模块："
+                    "主定妆正脸半身大图、正/左45度/右45度/侧脸/背面或正侧背全身视图、3 个表情头部、2-4 套剧情 Look 变体、"
+                    "随身物/职业道具、材质色卡和不可漂移特征。不要超过 10 个小格。"
+                    "每个模块都必须回到角色硬锚点：表情变化必须是同一张脸的不同情绪；"
+                    "服装展示必须展示锚点服装、职业身份和剧情服装变化；三视图必须保持同一发型、年龄感和体态；"
+                    "允许根据场景变化服装或状态，但脸型、发型逻辑、年龄感、体态和身份气质不得漂移；"
+                    "道具栏只放锚点职业/剧情必需物。"
+                    "随身物/职业道具必须来自该角色小传、职业、剧情任务或用户明确列出的道具，"
+                    "不得加入剧本或角色设定之外的随机道具；图内文字尽量不用英文，不要写长句、小字、伪字、错别字、乱码或不可读说明；"
+                    "如必须标注，只允许 6 个以内大号中文栏目名：主图、三视图、表情、Look、道具、色卡。"
+                    "像专业角色定妆参考图，不要过度简化为单张头像，也不要复杂到塞满无关小格。"
+                ),
+            )
+        )
+    support_specs = list(_FULL_PRODUCTION_ASSET_PROMPT_SPECS[1:])
+    specs.extend(support_specs)
+    return tuple(specs[:_FULL_PRODUCTION_ASSET_PROMPT_LIMIT])
+
+
+def _full_production_asset_character_anchor(
+    target: str,
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> str:
+    text = "\n".join(
+        part
+        for part in (
+            unicodedata.normalize("NFKC", context.request),
+            unicodedata.normalize("NFKC", step.task),
+            "\n".join(_source_structural_texts(sources[:4])),
+        )
+        if part.strip()
+    )
+    names = [target]
+    generic_role_prefixes = ("男主", "女主", "男二", "女二", "反派", "配角", "主角")
+    for prefix in generic_role_prefixes:
+        if target.startswith(prefix) and len(target) > len(prefix):
+            names.append(target[len(prefix) :])
+            break
+    snippets: list[str] = []
+    for name in dict.fromkeys(name for name in names if name):
+        pattern = re.compile(
+            rf"(?P<snippet>{re.escape(name)}[^。；;\n]{{0,180}}(?:。|；|;|\n|$))"
+        )
+        for match in pattern.finditer(text):
+            snippet = " ".join(match.group("snippet").split()).strip(" 。；;")
+            if snippet and snippet not in snippets:
+                snippets.append(snippet)
+            if len(snippets) >= 2:
+                break
+        if snippets:
+            break
+    if not snippets:
+        return ""
+    return _truncate_prompt_text("；".join(snippets), max_bytes=420)
+
+
+def _full_production_asset_character_targets(
+    context: TaskContext,
+    step: DispatchStep,
+    sources: tuple[Artifact, ...],
+) -> tuple[str, ...]:
+    raw_targets: list[str] = []
+    source_text = "\n".join(_source_structural_texts(sources[:4]))
+    source_normalized = unicodedata.normalize("NFKC", source_text)
+    request_task_normalized = unicodedata.normalize("NFKC", f"{context.request}\n{step.task}")
+    source_targets = [
+        *_script_role_table_character_targets(source_normalized),
+        *_script_heading_character_targets(source_normalized),
+        *_script_numbered_character_targets(source_normalized),
+        *_script_bold_character_section_targets(source_normalized),
+    ]
+    raw_targets.extend(source_targets)
+    raw_targets.extend(_inline_age_gender_character_targets(request_task_normalized))
+    has_source_character_section = _has_script_character_section(source_normalized)
+    if not source_targets and not has_source_character_section:
+        for role_label in ("女主", "男主", "女二", "男二", "反派"):
+            raw_targets.extend(_specific_character_targets_for_role(request_task_normalized, role_label))
+        raw_targets.extend(_character_model_sheet_targets(context.request, step.task, sources))
+    cleaned: list[str] = []
+    for target in raw_targets:
+        value = _normalized_specific_character_target(target)
+        if not value or len(value) > 32:
+            continue
+        if value not in cleaned:
+            cleaned.append(value)
+        if len(cleaned) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    if not cleaned:
+        plan = build_production_plan(
+            "\n".join(
+                part
+                for part in (request_task_normalized, source_normalized)
+                if part.strip()
+            )
+        )
+        for identity in plan.character_identities:
+            display_name = identity.display_name.strip()
+            if not display_name:
+                continue
+            role_type = (identity.role_type or "").strip()
+            value = (
+                f"{role_type}{display_name}"
+                if role_type and not display_name.startswith(role_type)
+                else display_name
+            )
+            value = _normalized_specific_character_target(value)
+            if value and value not in cleaned:
+                cleaned.append(value)
+            if len(cleaned) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+                break
+    return tuple(cleaned)
+
+
+def _source_structural_texts(sources: tuple[Artifact, ...]) -> tuple[str, ...]:
+    texts: list[str] = []
+    for artifact in sources:
+        text = _first_artifact_text_value(artifact.content)
+        if type(text) is not str:
+            continue
+        stripped = text.strip()
+        if stripped:
+            texts.append(_truncate_prompt_text(stripped, max_bytes=65_536))
+    return tuple(texts)
+
+
+def _has_script_character_section(text: str) -> bool:
+    if not text.strip():
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        _level, header = _markdown_heading_parts(stripped)
+        if _is_script_character_section_header(header):
+            return True
+    return False
+
+
+def _markdown_heading_parts(stripped: str) -> tuple[int | None, str]:
+    match = re.match(r"^(?P<marks>#{1,6})\s*(?P<header>.+?)\s*$", stripped)
+    if match is None:
+        return None, stripped.lstrip("#").strip()
+    return len(match.group("marks")), match.group("header").strip()
+
+
+def _is_script_character_section_header(header: str) -> bool:
+    return bool(header) and any(term in header for term in _SCRIPT_CHARACTER_SECTION_TERMS)
+
+
+def _script_heading_character_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    in_character_section = False
+    section_level: int | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        level, header = _markdown_heading_parts(stripped)
+        if level is None:
+            continue
+        if _is_script_character_section_header(header):
+            in_character_section = True
+            section_level = level
+            continue
+        if not in_character_section:
+            continue
+        if section_level is not None and level <= section_level:
+            break
+        raw_name = _character_name_from_heading(header)
+        if raw_name is None:
+            continue
+        if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
+            continue
+        if any(role_word in header[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+            continue
+        target = _normalized_specific_character_target(raw_name)
+        if target and target not in targets:
+            targets.append(target)
+        if len(targets) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    return tuple(targets)
+
+
+def _character_name_from_heading(header: str) -> str | None:
+    candidate = re.sub(r"^[\d\s\.、:：-]+", "", header).strip()
+    if not candidate or any(term in candidate for term in _NON_CHARACTER_HEADING_TERMS):
+        return None
+    candidate = re.split(r"[（(【\[\s｜|,，:：]", candidate, maxsplit=1)[0]
+    candidate = re.sub(r"[*_`#>\s]", "", candidate)
+    if not re.fullmatch(r"[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9·]{1,15}", candidate):
+        return None
+    return candidate
+
+
+def _script_role_table_character_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    role_name_column: int | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            role_name_column = None
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not cells:
+            continue
+        if "---" in stripped:
+            continue
+        if role_name_column is None:
+            for index, cell in enumerate(cells):
+                if cell in {"角色", "人物", "名称"}:
+                    role_name_column = index
+                    break
+            continue
+        if role_name_column >= len(cells):
+            continue
+        name_cell = cells[role_name_column]
+        bold_names = re.findall(r"\*\*(?P<name>[^*|\n]{1,20})\*\*", name_cell)
+        raw_name = bold_names[0] if bold_names else name_cell
+        raw_name = re.split(r"[（(【\[]", raw_name, maxsplit=1)[0]
+        raw_name = re.sub(r"[*_`#>\s]", "", raw_name)
+        if raw_name in {"群演", "路人", "顾客", "行人"}:
+            continue
+        if any(role_word in stripped[:160] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+            continue
+        target = _normalized_specific_character_target(raw_name)
+        if target and target not in targets:
+            targets.append(target)
+        if len(targets) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    return tuple(targets)
+
+
+def _script_bold_character_section_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    in_character_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        header = stripped.lstrip("#").strip()
+        if header:
+            if _is_script_character_section_header(header):
+                in_character_section = True
+                continue
+            if in_character_section and stripped.startswith("#"):
+                break
+        if not in_character_section:
+            continue
+        match = re.match(
+            r"^(?:[-*]\s*)?\*\*(?:\d+[\.\)、)]\s*)?"
+            r"(?P<name>[^*|\n]{1,20})(?:\*\*)?\s*(?:[｜|，,。:：]|$)",
+            stripped,
+        )
+        if match is None:
+            continue
+        raw_name = re.split(r"[（(【\[]", match.group("name"), maxsplit=1)[0]
+        raw_name = re.sub(r"^\d+[\.\)、)]\s*", "", raw_name)
+        raw_name = re.sub(r"[*_`#>\s]", "", raw_name)
+        if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
+            continue
+        if any(role_word in stripped[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+            continue
+        target = _normalized_specific_character_target(raw_name)
+        if target and target not in targets:
+            targets.append(target)
+        if len(targets) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    return tuple(targets)
+
+
+def _script_numbered_character_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    in_character_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        header = stripped.lstrip("#").strip()
+        if header:
+            if _is_script_character_section_header(header):
+                in_character_section = True
+                continue
+            if in_character_section and stripped.startswith("#"):
+                break
+        if not in_character_section:
+            continue
+        match = re.match(
+            r"^(?:[-*]\s*)?\d+[\.\)、)]\s*(?:\*\*)?"
+            r"(?P<name>[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9·]{1,15})"
+            r"(?:\*\*)?\s*(?:[｜|，,。:：]|$)",
+            stripped,
+        )
+        if match is None:
+            continue
+        raw_name = match.group("name")
+        if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
+            continue
+        if any(role_word in stripped[:80] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+            continue
+        target = _normalized_specific_character_target(raw_name)
+        if target and target not in targets:
+            targets.append(target)
+        if len(targets) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    return tuple(targets)
+
+
+def _specific_character_targets_for_role(text: str, role_label: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    pattern = re.compile(
+        rf"(?<![男女]){re.escape(role_label)}[：:\s]*(?P<tail>[\u4e00-\u9fff]{{1,16}})"
+    )
+    for match in pattern.finditer(text):
+        tail = match.group("tail")
+        tail = re.split(
+            r"是|，|,|、|。|；|;|：|:|（|\(|在|穿|追查|追|和|与|用|持|拿|发现|确认|被|把",
+            tail,
+            maxsplit=1,
+        )[0]
+        name = tail[:3] if len(tail) == 3 else tail[:2]
+        target = _normalized_specific_character_target(f"{role_label}{name}")
+        if target and target not in targets:
+            targets.append(target)
+    return tuple(targets)
+
+
+def _inline_age_gender_character_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    pattern = re.compile(
+        r"(?P<name>[\u4e00-\u9fff][\u4e00-\u9fff·]{1,5})"
+        r"[，,、\s]*"
+        r"(?P<age>\d{1,2})\s*岁\s*(?:男|女)"
+    )
+    for match in pattern.finditer(text):
+        name = match.group("name")
+        if any(term in name for term in _NON_CHARACTER_HEADING_TERMS):
+            continue
+        target = _normalized_specific_character_target(name)
+        if target and target not in targets:
+            targets.append(target)
+        if len(targets) >= _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT:
+            break
+    return tuple(targets)
+
+
+def _normalized_specific_character_target(target: str) -> str | None:
+    value = _strip_character_target_instruction_noise(
+        unicodedata.normalize("NFKC", target)
+    )
+    value = value.replace("：", "").replace(":", "")
+    generic_roles = {"男主", "女主", "男二", "女二", "反派", "配角", "主角"}
+    if value in generic_roles:
+        return None
+    for role in generic_roles:
+        if value.startswith(role) and len(value) > len(role):
+            suffix = _strip_character_target_instruction_noise(value[len(role) :])
+            if _looks_like_non_character_name_suffix(suffix):
+                return None
+            return f"{role}{suffix}"
+    return value if value not in generic_roles else None
+
+
+def _strip_character_target_instruction_noise(value: str) -> str:
+    cleaned = value.strip(" \t\r\n：:-—,，.。；;、()（）[]【】")
+    next_role = re.search(
+        r"(?:和|与|及|以及|、)?(?=男主|女主|男二|女二|反派|配角|主角)",
+        cleaned[1:],
+    )
+    if next_role is not None:
+        cleaned = cleaned[: next_role.start() + 1]
+    cleaned = cleaned.strip(" \t\r\n：:-—,，.。；;、()（）[]【】")
+    trailing_patterns = (
+        r"(?:一|二|两|三|四|五|六|七|八|九|十|\d+)?(?:张|个|位|名|套|份)$",
+        r"(?:独立|单独|分别|各自|各个|每人|每个)$",
+        r"(?:角色|人物)?(?:参考设定表|参考图|定妆图|设定表|资产图|资产|锁定资产|设定|参考)$",
+        r"(?:Character\s*Model\s*Sheet|model\s*sheet)$",
+        r"(?:和|与|及|以及|、)$",
+    )
+    changed = True
+    while changed and cleaned:
+        changed = False
+        for pattern in trailing_patterns:
+            stripped = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip(
+                " \t\r\n：:-—,，.。；;、()（）[]【】"
+            )
+            if stripped != cleaned:
+                cleaned = stripped
+                changed = True
+    return cleaned
+
+
+def _looks_like_non_character_name_suffix(suffix: str) -> bool:
+    if not suffix:
+        return True
+    return any(
+        suffix.startswith(candidate)
+        for candidate in (
+            "角色",
+            "人物",
+            "设定",
+            "参考",
+            "资产",
+            "锁定",
+            "模型",
+            "定妆",
+            "单独",
+            "混",
+            "混在",
+            "或",
+            "或配",
+            "配角",
+            "不要",
+            "不允",
+            "不能",
+            "必须",
+            "应该",
+            "可以",
+        )
+    )
 
 
 def _direct_full_production_asset_shared_context(
@@ -1931,15 +3254,17 @@ def _direct_full_production_asset_shared_context(
     step: DispatchStep,
     sources: tuple[Artifact, ...],
     feedback: str | None,
+    *,
+    max_bytes: int = 1_250,
 ) -> str:
     source_previews: list[str] = []
     for artifact in sources[:4]:
-        preview = _artifact_text_preview(artifact, max_bytes=900)
+        preview = _artifact_text_head_tail_preview(artifact, max_bytes=max(220, max_bytes // 2))
         if preview:
             source_previews.append(f"- {artifact.producer}: {preview}")
     parts = [
-        "项目请求：" + _truncate_prompt_text(context.request.strip(), max_bytes=420),
-        "执行任务：" + _truncate_prompt_text(step.task.strip(), max_bytes=420),
+        "项目请求：" + _truncate_prompt_text(context.request.strip(), max_bytes=180),
+        "执行任务：" + _truncate_prompt_text(step.task.strip(), max_bytes=180),
     ]
     if source_previews:
         parts.append("剧本/上游产物摘录：\n" + "\n".join(source_previews))
@@ -1950,7 +3275,7 @@ def _direct_full_production_asset_shared_context(
         )
     return _truncate_prompt_text(
         "\n\n".join(part for part in parts if part).strip(),
-        max_bytes=1_700,
+        max_bytes=max_bytes,
     )
 
 
@@ -2031,7 +3356,11 @@ def _direct_multimedia_artifact_prompts(
 ) -> tuple[str, ...]:
     if _is_video_reference_comparison_prompt(context.request, step.task):
         return _direct_video_reference_comparison_prompts(context, step, sources, feedback)
-    if _is_full_production_asset_image_prompt(context.request, step.task):
+    step_agent = unicodedata.normalize("NFKC", step.agent).casefold()
+    if (
+        step_agent in {"asset_generator", "asset generator"}
+        and _is_full_production_asset_image_prompt(context.request, step.task)
+    ):
         return _direct_full_production_asset_prompts(context, step, sources, feedback)
     prompts: list[str] = []
     if _is_character_model_sheet_prompt(
@@ -2061,6 +3390,309 @@ def _direct_multimedia_artifact_prompts(
     return tuple(prompts)
 
 
+def _direct_multimedia_artifact_labels(
+    context: TaskContext,
+    step: DispatchStep,
+    prompts: tuple[str, ...],
+    sources: tuple[Artifact, ...] = (),
+) -> tuple[str, ...]:
+    if not prompts:
+        return ()
+    step_agent = unicodedata.normalize("NFKC", step.agent).casefold()
+    if (
+        step_agent in {"asset_generator", "asset generator"}
+        and _is_full_production_asset_image_prompt(context.request, step.task)
+    ):
+        return _direct_full_production_asset_labels(context, step, sources)
+    if _is_storyboard_image_prompt(context.request, step.task):
+        return tuple(f"分镜图 {index}" for index in range(1, len(prompts) + 1))
+    if _is_video_reference_comparison_prompt(context.request, step.task):
+        return ("带参考图锁定视频", "不带参考图视频")[: len(prompts)]
+    if _is_character_model_sheet_prompt(context.request, step.task):
+        targets = _character_model_sheet_targets(context.request, step.task, sources)
+        if len(targets) >= len(prompts):
+            return tuple(f"角色锁定资产：{target}" for target in targets[: len(prompts)])
+        return tuple(f"角色锁定资产 {index}" for index in range(1, len(prompts) + 1))
+    return tuple(f"生成产物 {index}" for index in range(1, len(prompts) + 1))
+
+
+def _direct_multimedia_retry_selection(
+    *,
+    previous_artifacts: tuple[Artifact, ...],
+    expected_labels: tuple[str, ...],
+    feedback_text: str | None,
+    explicit_retry_labels: tuple[str, ...] = (),
+) -> _DirectMultimediaRetrySelection | None:
+    if not previous_artifacts or not expected_labels or not feedback_text:
+        return None
+    normalized_expected = {_normalize_artifact_label(label): label for label in expected_labels}
+    explicit_label_keys = _matched_expected_label_keys(
+        expected_labels,
+        explicit_retry_labels,
+    )
+    if not explicit_label_keys:
+        explicit_label_keys = {
+            _normalize_artifact_label(label)
+            for label in explicit_retry_labels
+            if isinstance(label, str) and label.strip()
+        }
+    explicit_mode = bool(explicit_label_keys)
+    mentioned_label_keys = (
+        set()
+        if explicit_mode
+        else _feedback_retry_label_keys(expected_labels, feedback_text)
+    )
+    for artifact in reversed(previous_artifacts):
+        items = _multimedia_result_items_by_label(artifact)
+        if not items or not set(items).intersection(normalized_expected):
+            continue
+        retry_labels: list[str] = []
+        preserved: list[Mapping[str, JsonValue]] = []
+        for expected_label in expected_labels:
+            expected_label_key = _normalize_artifact_label(expected_label)
+            item = items.get(_normalize_artifact_label(expected_label))
+            if explicit_mode:
+                if item is None or _artifact_item_matches_explicit_retry(
+                    item,
+                    expected_label=expected_label,
+                    explicit_label_keys=explicit_label_keys,
+                ):
+                    retry_labels.append(expected_label)
+                    continue
+                preserved.append(_preserved_multimedia_result_item(item, fallback_label=expected_label))
+                continue
+            if item is None or _artifact_item_review_failed(item) or expected_label_key in mentioned_label_keys:
+                retry_labels.append(expected_label)
+                continue
+            preserved.append(_preserved_multimedia_result_item(item, fallback_label=expected_label))
+        if retry_labels:
+            return _DirectMultimediaRetrySelection(
+                retry_labels=tuple(retry_labels),
+                preserved_artifacts=tuple(preserved),
+            )
+    mentioned_labels = tuple(label for label in expected_labels if _normalize_artifact_label(label) in mentioned_label_keys)
+    if mentioned_labels:
+        return _DirectMultimediaRetrySelection(
+            retry_labels=mentioned_labels,
+            preserved_artifacts=(),
+        )
+    return None
+
+
+def _matched_expected_label_keys(
+    expected_labels: tuple[str, ...],
+    candidate_labels: tuple[str, ...],
+) -> set[str]:
+    candidate_keys = {
+        _normalize_artifact_label(label)
+        for label in candidate_labels
+        if isinstance(label, str) and label.strip()
+    }
+    if not candidate_keys:
+        return set()
+    matched: set[str] = set()
+    for expected_label in expected_labels:
+        expected_key = _normalize_artifact_label(expected_label)
+        if expected_key in candidate_keys or any(
+            expected_key in candidate_key or candidate_key in expected_key
+            for candidate_key in candidate_keys
+        ):
+            matched.add(expected_key)
+    return matched
+
+
+def _feedback_retry_label_keys(
+    expected_labels: tuple[str, ...],
+    feedback_text: str,
+) -> set[str]:
+    normalized_feedback = _normalize_artifact_label(feedback_text)
+    mentioned: set[str] = set()
+    preserve_markers = ("保留", "已通过", "通过项", "合格", "无需重试", "不用重试", "不要重试", "不重试")
+    for label in expected_labels:
+        label_key = _normalize_artifact_label(label)
+        start = normalized_feedback.find(label_key)
+        while start >= 0:
+            before = normalized_feedback[max(0, start - 24) : start]
+            local_before = re.split(r"[:：;；。,.，]", before)[-1]
+            if not any(marker in local_before for marker in preserve_markers):
+                mentioned.add(label_key)
+                break
+            start = normalized_feedback.find(label_key, start + len(label_key))
+    return mentioned
+
+
+def _multimedia_result_items_by_label(artifact: Artifact) -> dict[str, Mapping[str, JsonValue]]:
+    result = artifact.content.get("result")
+    if not isinstance(result, Mapping):
+        return {}
+    raw_items = result.get("artifacts")
+    if not isinstance(raw_items, list | tuple):
+        return {}
+    items: dict[str, Mapping[str, JsonValue]] = {}
+    for index, raw_item in enumerate(raw_items, start=1):
+        if not isinstance(raw_item, Mapping):
+            continue
+        item = dict(raw_item)
+        item.setdefault("review_item_id", f"{artifact.id}:{index}")
+        label = _artifact_item_label(item)
+        if label is None:
+            continue
+        typed_item = cast(Mapping[str, JsonValue], item)
+        for key in _artifact_item_retry_keys(typed_item, fallback_label=label):
+            items[_normalize_artifact_label(key)] = typed_item
+    return items
+
+
+def _artifact_item_label(item: Mapping[object, object]) -> str | None:
+    for field_name in ("label", "title", "filename"):
+        value = item.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _artifact_item_review_failed(item: Mapping[str, JsonValue]) -> bool:
+    review = item.get("visual_review")
+    if not isinstance(review, Mapping):
+        return True
+    passed = review.get("passed")
+    if passed is False:
+        return True
+    if isinstance(passed, str) and passed.strip().casefold() == "false":
+        return True
+    return False
+
+
+def _artifact_item_matches_explicit_retry(
+    item: Mapping[str, JsonValue],
+    *,
+    expected_label: str,
+    explicit_label_keys: set[str],
+) -> bool:
+    if not explicit_label_keys:
+        return False
+    return any(
+        _normalize_artifact_label(key) in explicit_label_keys
+        for key in _artifact_item_retry_keys(item, fallback_label=expected_label)
+    )
+
+
+def _artifact_item_retry_keys(
+    item: Mapping[str, JsonValue],
+    *,
+    fallback_label: str,
+) -> tuple[str, ...]:
+    keys: list[str] = [fallback_label]
+    for field_name in (
+        "label",
+        "title",
+        "filename",
+        "id",
+        "artifact_id",
+        "review_item_id",
+        "storage_key",
+        "sha256",
+    ):
+        value = item.get(field_name)
+        if isinstance(value, str) and value.strip() and value.strip() not in keys:
+            keys.append(value.strip())
+    return tuple(keys)
+
+
+def _preserved_multimedia_result_item(
+    item: Mapping[str, JsonValue],
+    *,
+    fallback_label: str,
+) -> Mapping[str, JsonValue]:
+    cleaned: dict[str, JsonValue] = {}
+    for key in (
+        "kind",
+        "label",
+        "title",
+        "artifact_id",
+        "storage_key",
+        "sha256",
+        "filename",
+        "mime_type",
+        "size_bytes",
+        "deployment_id",
+        "logical_model",
+    ):
+        value = item.get(key)
+        if _is_json_value(value):
+            cleaned[key] = value
+    file_value = item.get("file")
+    if isinstance(file_value, Mapping):
+        file_payload: dict[str, JsonValue] = {}
+        for key in (
+            "sha256",
+            "filename",
+            "mime_type",
+            "expires_at",
+            "size_bytes",
+            "artifact_id",
+            "storage_key",
+        ):
+            value = file_value.get(key)
+            if _is_json_value(value):
+                file_payload[key] = value
+        if file_payload:
+            cleaned["file"] = file_payload
+            for key in ("artifact_id", "storage_key"):
+                if key not in cleaned and key in file_payload:
+                    cleaned[key] = file_payload[key]
+    review = item.get("visual_review")
+    if isinstance(review, Mapping):
+        review_payload: dict[str, JsonValue] = {}
+        passed = review.get("passed")
+        if isinstance(passed, bool):
+            review_payload["passed"] = passed
+        summary = review.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            review_payload["summary"] = _truncate_prompt_text(summary.strip(), max_bytes=360)
+        issues = review.get("issues")
+        if isinstance(issues, list | tuple):
+            bounded_issues = tuple(
+                _truncate_prompt_text(str(issue).strip(), max_bytes=160)
+                for issue in issues[:3]
+                if str(issue).strip()
+            )
+            if bounded_issues:
+                review_payload["issues"] = bounded_issues
+        confidence = review.get("confidence")
+        if isinstance(confidence, int | float) and not isinstance(confidence, bool):
+            review_payload["confidence"] = confidence
+        if review_payload:
+            cleaned["visual_review"] = review_payload
+    production_metadata = item.get("production_metadata")
+    if isinstance(production_metadata, Mapping):
+        metadata_payload: dict[str, JsonValue] = {}
+        for key in ("character_id", "look_id", "production_category"):
+            value = production_metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                metadata_payload[key] = value.strip()
+        if metadata_payload:
+            cleaned["production_metadata"] = metadata_payload
+    cleaned.setdefault("label", fallback_label)
+    cleaned.setdefault("title", fallback_label)
+    cleaned["preserved_from_previous_attempt"] = True
+    return cleaned
+
+
+def _normalize_artifact_label(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).casefold())
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, str | int | float | bool):
+        return True
+    if isinstance(value, tuple | list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
 def _character_model_sheet_review_criteria(
     request: str,
     task: str,
@@ -2074,11 +3706,12 @@ def _character_model_sheet_review_criteria(
         "reject_if": (
             "图片数量少于明确要求的角色数量",
             "一张图片包含多个角色或把多个角色放在同一张设定表",
+            "人物定妆图存在室内、街景、道具桌面、窗户、墙画、环境光影或其他具体背景",
             "主定妆照、三视图、表情或服装细节不像同一人物",
             "同一设定表混用写实照片、二次元头像或线稿三视图",
             "过度简化为头像/单张主图，或过度堆叠复杂资产格和小物件",
         ),
-        "layout": "每个角色一张独立图片；一张图片只允许一个角色；采用中等复杂度。",
+        "layout": "每个角色一张独立图片；一张图片只允许一个角色；采用中等复杂度；人物资产使用纯白/浅灰/透明感纯色背景。",
         "identity": "同一人物身份必须一致。",
         "style": "同一画风；不得混合写实、二次元和线稿。",
     }
@@ -2126,12 +3759,19 @@ def _fail(message: str) -> Never:
 def _sanitize_artifact_text(text: str) -> str:
     normalized_lines = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = unicodedata.normalize("NFC", normalized_lines)
-    return "".join(
+    safe_characters = "".join(
         character
         for character in normalized
         if unicodedata.category(character) != "Cf"
         and (unicodedata.category(character) != "Cc" or character in "\n\t")
     )
+    without_closed_think = re.sub(
+        r"(?is)<think\b[^>]*>.*?</think\s*>",
+        "",
+        safe_characters,
+    )
+    without_open_think = re.sub(r"(?is)<think\b[^>]*>.*\Z", "", without_closed_think)
+    return without_open_think.strip()
 
 
 def _safe_artifact_text(text: str) -> str:
@@ -2214,6 +3854,21 @@ def _artifact_review_feedback_text(feedback: _UserArtifactReviewFeedback) -> str
             detail_parts.append(f"问题={item_feedback}")
         lines.append(f"- {label}（{'；'.join(detail_parts)}）")
     return "\n".join(lines)
+
+
+def _artifact_review_feedback_labels(
+    feedback: _UserArtifactReviewFeedback,
+) -> tuple[str, ...]:
+    labels: list[str] = []
+    for item in feedback.review_items:
+        for field_name in ("title", "label", "filename", "id"):
+            value = item.get(field_name)
+            if isinstance(value, str) and value.strip():
+                label = value.strip()
+                if label not in labels:
+                    labels.append(label)
+                break
+    return tuple(labels)
 
 
 def _step_ids_invalidated_by_review_feedback(
@@ -2643,6 +4298,12 @@ class _UserArtifactReviewFeedback:
 
 
 @dataclass(frozen=True, slots=True)
+class _DirectMultimediaRetrySelection:
+    retry_labels: tuple[str, ...]
+    preserved_artifacts: tuple[Mapping[str, JsonValue], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RunToken:
     generation: int
 
@@ -2812,6 +4473,8 @@ class CrewDispatchRuntime:
         usage_ledger = _UsageLedger()
         review_ledger = _ReviewLedger()
         user_feedback_by_step: dict[str, str] = {}
+        user_feedback_retry_artifacts_by_step: dict[str, tuple[Artifact, ...]] = {}
+        user_feedback_retry_labels_by_step: dict[str, tuple[str, ...]] = {}
         invalidated_artifact_ids: set[str] = set()
         artifact_registry: dict[str, Artifact] = {}
         self._current_artifact_registry = artifact_registry
@@ -2904,6 +4567,12 @@ class CrewDispatchRuntime:
                         user_feedback_by_step[user_feedback.stage_id] = (
                             _artifact_review_feedback_text(user_feedback)
                         )
+                        user_feedback_retry_labels_by_step[user_feedback.stage_id] = (
+                            _artifact_review_feedback_labels(user_feedback)
+                        )
+                        user_feedback_retry_artifacts_by_step[user_feedback.stage_id] = (
+                            tuple(restored_artifacts.values())
+                        )
                         for step_id in invalidated:
                             artifact = completed.pop(step_id, None)
                             retry_counts.pop(step_id, None)
@@ -2934,6 +4603,10 @@ class CrewDispatchRuntime:
                                     tool_artifact_id = str(tool_artifact.id)
                                     invalidated_artifact_ids.add(tool_artifact_id)
                                     artifact_registry.pop(tool_artifact_id, None)
+                        _prune_invalidated_artifact_lineage(
+                            artifact_registry,
+                            invalidated_artifact_ids,
+                        )
                         await emit(
                             kind=EventKind.STEP_RETRYING,
                             step_id=user_feedback.stage_id,
@@ -2980,6 +4653,7 @@ class CrewDispatchRuntime:
                 for artifact in context.artifacts
                 if str(artifact.id) not in artifact_registry
                 and str(artifact.id) not in invalidated_artifact_ids
+                and not _is_dispatch_internal_context_artifact(artifact, plan)
             )
             checkpoint_lock = asyncio.Lock()
 
@@ -3377,6 +5051,8 @@ class CrewDispatchRuntime:
                             state,
                             review_ledger,
                             user_feedback_by_step.get(step.id),
+                            user_feedback_retry_artifacts_by_step.get(step.id, ()),
+                            user_feedback_retry_labels_by_step.get(step.id, ()),
                         )
 
                 tasks = {asyncio.create_task(execute(step)): step for step in ready}
@@ -3407,6 +5083,7 @@ class CrewDispatchRuntime:
                                     continue
                                 completed[result.step.id] = result.artifact
                                 retry_counts[result.step.id] = result.retries
+                                awaiting_user_review = result.step.requires_user_review
                                 checkpoint = self._make_checkpoint(
                                     context,
                                     plan,
@@ -3420,11 +5097,17 @@ class CrewDispatchRuntime:
                                     + (3 if result.step.requires_user_review else 2),
                                     terminal=(
                                         usage_ledger.terminal_phase is not None
-                                        or len(completed) == len(steps)
+                                        or (
+                                            len(completed) == len(steps)
+                                            and not awaiting_user_review
+                                        )
                                     ),
                                     phase=(
                                         usage_ledger.terminal_phase
                                         or (
+                                            "waiting_approval"
+                                            if awaiting_user_review
+                                            else
                                             "completed"
                                             if len(completed) == len(steps)
                                             else "running"
@@ -3436,7 +5119,7 @@ class CrewDispatchRuntime:
                                     kind=EventKind.CHECKPOINT_SAVED,
                                     checkpoint=checkpoint,
                                 )
-                                if result.step.requires_user_review:
+                                if awaiting_user_review:
                                     await emit(
                                         kind=EventKind.APPROVAL_REQUESTED,
                                         actor=result.step.agent,
@@ -3456,8 +5139,9 @@ class CrewDispatchRuntime:
                                             "next_action": "approve_or_revise_artifact",
                                             "review_items": [
                                                 dict(item)
-                                                for item in _artifact_review_items_payload(
-                                                    result.artifact
+                                                for item in _artifact_review_items_payload_from_lineage(
+                                                    result.artifact,
+                                                    tuple(artifact_registry.values()),
                                                 )
                                             ],
                                         },
@@ -3648,6 +5332,8 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         review_ledger: _ReviewLedger,
         user_feedback: str | None = None,
+        user_feedback_artifacts: tuple[Artifact, ...] = (),
+        user_feedback_retry_labels: tuple[str, ...] = (),
     ) -> _StepResult:
         async def event(**values: object) -> None:
             await emit(**values)
@@ -3702,6 +5388,8 @@ class CrewDispatchRuntime:
                     retries,
                     run_state,
                     step_deadline,
+                    user_feedback_artifacts,
+                    user_feedback_retry_labels,
                 )
                 artifact = self._artifact(
                     step,
@@ -4061,6 +5749,8 @@ class CrewDispatchRuntime:
         retries: int,
         run_state: _RunState,
         step_deadline: float,
+        user_feedback_artifacts: tuple[Artifact, ...] = (),
+        user_feedback_retry_labels: tuple[str, ...] = (),
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         direct_multimedia = await self._complete_direct_multimedia_agent(
             context,
@@ -4077,6 +5767,8 @@ class CrewDispatchRuntime:
             run_state,
             step_deadline,
             feedback,
+            user_feedback_artifacts,
+            user_feedback_retry_labels,
         )
         if direct_multimedia is not None:
             return direct_multimedia
@@ -4290,6 +5982,8 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
         feedback: str | None = None,
+        user_feedback_artifacts: tuple[Artifact, ...] = (),
+        user_feedback_retry_labels: tuple[str, ...] = (),
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]] | None:
         if self._capabilities is None:
             return None
@@ -4299,9 +5993,11 @@ class CrewDispatchRuntime:
         started_payload: Mapping[str, JsonValue]
         direct_completion_text: str
         final_fallback_text: str
+        complete_artifact_labels: tuple[str, ...] = ()
         available_artifacts = self._ordered_artifacts(
             (
                 *context.artifacts,
+                *user_feedback_artifacts,
                 *tuple(model_ledger.artifacts.values()),
                 *tuple(tool_ledger.artifacts.values()),
             )
@@ -4341,6 +6037,15 @@ class CrewDispatchRuntime:
                 _fail(f"capability failed: no configured {kind} generation model")
             logical_model = selected_model
             multimedia_sources = _lineage_expanded_artifacts(sources, available_artifacts)
+            retry_previous_artifacts = self._ordered_artifacts(
+                (
+                    *multimedia_sources,
+                    *_lineage_expanded_artifacts(
+                        user_feedback_artifacts,
+                        available_artifacts,
+                    ),
+                )
+            )
             generation_prompt = _direct_multimedia_generation_prompt(
                 context, step, multimedia_sources, feedback
             )
@@ -4358,13 +6063,62 @@ class CrewDispatchRuntime:
                 feedback,
             )
             if artifact_prompts:
+                artifact_labels = _direct_multimedia_artifact_labels(
+                    context,
+                    step,
+                    artifact_prompts,
+                    multimedia_sources,
+                )
+                complete_artifact_labels = artifact_labels
+                retry_selection = (
+                    _direct_multimedia_retry_selection(
+                        previous_artifacts=retry_previous_artifacts,
+                        expected_labels=artifact_labels,
+                        feedback_text=feedback,
+                        explicit_retry_labels=user_feedback_retry_labels,
+                    )
+                    if artifact_labels
+                    else None
+                )
+                if retry_selection is not None:
+                    prompt_by_label = dict(zip(artifact_labels, artifact_prompts, strict=False))
+                    artifact_prompts = tuple(
+                        prompt_by_label[label]
+                        for label in retry_selection.retry_labels
+                        if label in prompt_by_label
+                    )
+                    artifact_labels = tuple(
+                        label
+                        for label in retry_selection.retry_labels
+                        if label in prompt_by_label
+                    )
+                    if retry_selection.preserved_artifacts:
+                        arguments["preserved_artifacts"] = retry_selection.preserved_artifacts
                 arguments["artifact_count"] = len(artifact_prompts)
                 arguments["artifact_prompts"] = artifact_prompts
+                if artifact_labels:
+                    arguments["artifact_labels"] = artifact_labels
             started_payload = {
                 "kind": kind,
                 "logical_model": logical_model,
+                "artifact_count": int(arguments.get("artifact_count", 1)),
                 "direct_dispatch": True,
             }
+            labels_for_payload = arguments.get("artifact_labels")
+            if isinstance(labels_for_payload, tuple):
+                started_payload = {
+                    **started_payload,
+                    "artifact_label_count": len(labels_for_payload),
+                    "artifact_labels": labels_for_payload[:24],
+                    "artifact_labels_truncated": len(labels_for_payload) > 24,
+                }
+            preserved_for_payload = arguments.get("preserved_artifacts")
+            if isinstance(preserved_for_payload, tuple):
+                started_payload = {
+                    **started_payload,
+                    "preserved_artifact_count": len(preserved_for_payload),
+                    "retry_artifact_count": int(arguments.get("artifact_count", 1)),
+                }
             direct_completion_text = "Multimedia generation dispatched directly."
             final_fallback_text = f"Generated {kind} artifact with {logical_model}."
         else:
@@ -4516,29 +6270,98 @@ class CrewDispatchRuntime:
                 tool_name=capability_name,
                 payload=started_payload,
             )
+            progress_payload = _direct_capability_progress_payload(
+                capability_name,
+                arguments,
+                started_payload,
+            )
+            if progress_payload is not None:
+                await emit(
+                    kind="custom.progress",
+                    payload={
+                        **progress_payload,
+                        "actor": step.agent,
+                        "tool_call_id": call_id,
+                        "tool_name": capability_name,
+                    },
+                )
             running_tool = dict(prepared_tool)
             running_tool["status"] = "running"
             await tool_boundary(tool_key, running_tool, None)
             try:
-                async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                    result = await self._capabilities.execute(
-                        tenant_id=context.tenant_id,
-                        run_id=context.run_id,
-                        actor=step.agent,
-                        name=capability_name,
-                        arguments=arguments,
-                        idempotency_key=tool_key,
+                timeout_seconds = self._remaining_timeout(run_state, step_deadline)
+                async with asyncio.timeout(timeout_seconds):
+                    execute_task = asyncio.create_task(
+                        self._capabilities.execute(
+                            tenant_id=context.tenant_id,
+                            run_id=context.run_id,
+                            actor=step.agent,
+                            name=capability_name,
+                            arguments=arguments,
+                            idempotency_key=tool_key,
+                        )
                     )
+                    heartbeat_task: asyncio.Task[None] | None = None
+                    if progress_payload is not None:
+                        heartbeat_task = asyncio.create_task(
+                            self._emit_direct_capability_progress_heartbeats(
+                                emit=emit,
+                                capability_name=capability_name,
+                                actor=step.agent,
+                                call_id=call_id,
+                                base_payload=progress_payload,
+                                timeout_seconds=timeout_seconds,
+                                execute_task=execute_task,
+                            )
+                        )
+                    try:
+                        result = await execute_task
+                    finally:
+                        if heartbeat_task is not None:
+                            heartbeat_task.cancel()
+                            await asyncio.gather(
+                                heartbeat_task,
+                                return_exceptions=True,
+                            )
                 encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
                 if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
                     _fail("capability result exceeds limit")
                 _validate_direct_multimedia_result_count(capability_name, arguments, result)
+                result = _merge_preserved_multimedia_result_artifacts(
+                    result,
+                    arguments.get("preserved_artifacts"),
+                    complete_labels=complete_artifact_labels,
+                )
+                encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+                if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                    _fail("capability result exceeds limit")
             except asyncio.CancelledError:
                 if not replay_safe:
                     uncertain = dict(running_tool)
                     uncertain["status"] = "uncertain"
                     await asyncio.shield(tool_boundary(tool_key, uncertain, None))
                 raise
+            except TimeoutError:
+                failure_reason = _direct_capability_timeout_reason(
+                    capability_name,
+                    arguments,
+                )
+                await emit(
+                    kind=EventKind.TOOL_FAILED,
+                    actor=step.agent,
+                    tool_call_id=call_id,
+                    tool_name=capability_name,
+                    reason=failure_reason,
+                    payload=_direct_capability_failure_payload(
+                        failure_reason,
+                        capability_name,
+                        arguments,
+                    ),
+                )
+                uncertain = dict(running_tool)
+                uncertain["status"] = "uncertain"
+                await tool_boundary(tool_key, uncertain, None)
+                raise CapabilityOutcomeUncertain(failure_reason) from None
             except Exception as error:  # noqa: BLE001
                 failure_reason = safe_runtime_failure_reason(
                     error,
@@ -4554,7 +6377,11 @@ class CrewDispatchRuntime:
                     tool_call_id=call_id,
                     tool_name=capability_name,
                     reason=failure_reason,
-                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                    payload=_direct_capability_failure_payload(
+                        failure_reason,
+                        capability_name,
+                        arguments,
+                    ),
                 )
                 uncertain = dict(running_tool)
                 uncertain["status"] = "uncertain"
@@ -4591,6 +6418,53 @@ class CrewDispatchRuntime:
             text=final_summary,
         )
         return final_completion, (model_artifact, tool_artifact)
+
+    async def _emit_direct_capability_progress_heartbeats(
+        self,
+        *,
+        emit: EventEmitter,
+        capability_name: str,
+        actor: str,
+        call_id: str,
+        base_payload: Mapping[str, JsonValue],
+        timeout_seconds: float,
+        execute_task: asyncio.Task[Mapping[str, JsonValue]],
+    ) -> None:
+        interval_seconds = _direct_capability_progress_heartbeat_seconds(
+            capability_name,
+            base_payload,
+        )
+        if interval_seconds <= 0:
+            return
+        started_at = asyncio.get_running_loop().time()
+        heartbeat_index = 0
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if execute_task.done():
+                return
+            heartbeat_index += 1
+            elapsed_seconds = max(
+                0,
+                int(asyncio.get_running_loop().time() - started_at),
+            )
+            payload = dict(base_payload)
+            payload.update(
+                {
+                    "actor": actor,
+                    "tool_call_id": call_id,
+                    "tool_name": capability_name,
+                    "status": "polling",
+                    "heartbeat_index": heartbeat_index,
+                    "elapsed_seconds": elapsed_seconds,
+                    "timeout_seconds": int(max(1.0, timeout_seconds)),
+                    "message": _direct_capability_progress_heartbeat_message(
+                        base_payload,
+                        elapsed_seconds=elapsed_seconds,
+                        timeout_seconds=timeout_seconds,
+                    ),
+                }
+            )
+            await emit(kind="custom.progress", payload=payload)
 
     async def _complete_gateway_messages(
         self,
@@ -5833,8 +7707,12 @@ class CrewDispatchRuntime:
         phase: str,
         artifact_registry: Mapping[str, Artifact] | None = None,
     ) -> RuntimeCheckpoint:
-        checkpoint_artifacts = (
+        base_checkpoint_artifacts = (
             self._current_artifact_registry if artifact_registry is None else artifact_registry
+        )
+        checkpoint_artifacts = _artifact_registry_source_closure(
+            base_checkpoint_artifacts,
+            context.artifacts,
         )
         completed_ids = tuple(sorted(completed))
         frontier = tuple(
@@ -5880,6 +7758,7 @@ class CrewDispatchRuntime:
                     artifact_id: checkpoint_artifacts[artifact_id].content_sha256
                     for artifact_id in sorted(checkpoint_artifacts)
                 },
+                "artifact_registry_roots": tuple(sorted(base_checkpoint_artifacts)),
                 "usage": {
                     "tokens": usage_ledger.tokens,
                     "cost_usd": str(usage_ledger.cost_usd),
@@ -5914,7 +7793,7 @@ class CrewDispatchRuntime:
         ):
             _fail("runtime checkpoint is incompatible")
         state = checkpoint.state
-        if set(state) != {
+        expected_state_fields = {
             "plan_digest",
             "completed",
             "retries",
@@ -5930,7 +7809,11 @@ class CrewDispatchRuntime:
             "usage",
             "step_usage",
             "audit_overflow",
-        }:
+        }
+        optional_state_fields = {"artifact_registry_roots"}
+        if not set(state) <= expected_state_fields | optional_state_fields or not (
+            expected_state_fields <= set(state)
+        ):
             _fail("runtime checkpoint is incompatible")
         completed = state["completed"]
         retries = state["retries"]
@@ -5940,6 +7823,7 @@ class CrewDispatchRuntime:
         models = state["models"]
         review_refs = state["review_refs"]
         artifact_registry = state["artifact_registry"]
+        artifact_registry_roots = state.get("artifact_registry_roots", tuple(artifact_registry))
         usage = state["usage"]
         step_usage = state["step_usage"]
         audit_overflow = state["audit_overflow"]
@@ -5952,6 +7836,7 @@ class CrewDispatchRuntime:
             or not isinstance(models, Mapping)
             or not isinstance(review_refs, Mapping)
             or not isinstance(artifact_registry, Mapping)
+            or not isinstance(artifact_registry_roots, tuple)
             or not isinstance(usage, Mapping)
             or not isinstance(step_usage, Mapping)
             or not isinstance(audit_overflow, Mapping)
@@ -5960,6 +7845,7 @@ class CrewDispatchRuntime:
             or state["phase"]
             not in {
                 "running",
+                "waiting_approval",
                 "completed",
                 "cancelled",
                 "failed",
@@ -5987,6 +7873,14 @@ class CrewDispatchRuntime:
             except ValueError:
                 _fail("runtime checkpoint is incompatible")
             registry_ids.add(artifact_id)
+        if (
+            len(artifact_registry_roots) != len(set(artifact_registry_roots))
+            or not all(
+                type(artifact_id) is str and artifact_id in registry_ids
+                for artifact_id in artifact_registry_roots
+            )
+        ):
+            _fail("runtime checkpoint is incompatible")
         if (
             set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
@@ -6688,22 +8582,34 @@ class CrewDispatchRuntime:
                     context.tenant_id, context.run_id, references
                 )
         except ArtifactRepositoryError:
-            compatible = tuple(supplemental.get(str(reference.id)) for reference in references)
-            if any(
-                artifact is None or artifact.content_sha256 != reference.sha256
-                for artifact, reference in zip(compatible, references, strict=True)
-            ):
-                review_ids = {
-                    item["id"]
-                    for item in cast(
-                        Mapping[str, Mapping[str, str]],
-                        checkpoint.state["review_refs"],
-                    ).values()
-                }
-                if any(str(reference.id) in review_ids for reference in references):
-                    _fail("runtime checkpoint review artifact is unavailable")
-                _fail("runtime checkpoint artifacts are unavailable")
-            stored = cast(tuple[Artifact, ...], compatible)
+            review_ids = {
+                item["id"]
+                for item in cast(
+                    Mapping[str, Mapping[str, str]],
+                    checkpoint.state["review_refs"],
+                ).values()
+            }
+            resolved: list[Artifact] = []
+            for reference in references:
+                supplemental_artifact = supplemental.get(str(reference.id))
+                if (
+                    supplemental_artifact is not None
+                    and supplemental_artifact.content_sha256 == reference.sha256
+                    and supplemental_artifact.recompute_content_sha256() == reference.sha256
+                ):
+                    resolved.append(supplemental_artifact)
+                    continue
+                try:
+                    async with asyncio.timeout(self._remaining_timeout(run_state)):
+                        item = await self._artifact_repository.get_many(
+                            context.tenant_id, context.run_id, (reference,)
+                        )
+                except ArtifactRepositoryError:
+                    if str(reference.id) in review_ids:
+                        _fail("runtime checkpoint review artifact is unavailable")
+                    _fail("runtime checkpoint artifacts are unavailable")
+                resolved.append(item[0])
+            stored = tuple(resolved)
         if (
             type(stored) is not tuple
             or len(stored) != len(references)
@@ -6723,7 +8629,17 @@ class CrewDispatchRuntime:
             if existing is not None and existing.content_sha256 != stored_artifact.content_sha256:
                 _fail("runtime checkpoint artifacts are unavailable")
             by_id[artifact_id] = stored_artifact
-        registry = {str(artifact.id): artifact for artifact in stored}
+        registry_root_ids = cast(
+            tuple[str, ...],
+            checkpoint.state.get("artifact_registry_roots", tuple(raw_registry)),
+        )
+        registry = {
+            artifact_id: by_id[artifact_id]
+            for artifact_id in registry_root_ids
+            if artifact_id in by_id
+        }
+        if len(registry) != len(registry_root_ids):
+            _fail("runtime checkpoint artifacts are unavailable")
         agents = {agent.id: agent for agent in plan.agents}
         steps = {step.id: step for step in plan.steps}
         completed: dict[str, Artifact] = {}

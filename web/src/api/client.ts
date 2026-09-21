@@ -601,6 +601,26 @@ const RunArtifactSchema = z.object({
   sha256: z.string().nullable().optional(),
   download_url: z.string().nullable().optional(),
   expires_at: z.string().nullable().optional(),
+  visual_review: z
+    .object({
+      passed: z.boolean(),
+      summary: z.string(),
+      issues: z.array(z.string()).optional(),
+      confidence: z.number().optional(),
+      logical_model: z.string().optional(),
+      deployment_id: z.string().optional(),
+    })
+    .nullable()
+    .optional(),
+  production_metadata: z
+    .object({
+      character_id: z.string().optional(),
+      look_id: z.string().optional(),
+      production_category: z.string().optional(),
+    })
+    .nullable()
+    .optional(),
+  generation_error: z.string().nullable().optional(),
 });
 
 const RunEventSchema = z.object({
@@ -788,6 +808,32 @@ const MultimediaGenerationSchema = z.object({
 });
 
 export type MultimediaGeneration = z.infer<typeof MultimediaGenerationSchema>;
+
+const ContentStudioProjectSchema = z
+  .object({
+    project_id: z.string(),
+    revision: z.number().int().nonnegative().default(0),
+    title: z.string(),
+    topic: z.string(),
+    status: z.string(),
+    script_approved: z.boolean().default(false),
+    rights_approved: z.boolean().default(false),
+    final_approved: z.boolean().default(false),
+    execution_mode: z.enum(["demo", "production"]).default("demo"),
+    research_bundle: z.unknown().nullable().optional(),
+    evidence_graph: z.unknown().nullable().optional(),
+    fact_check_report: z.unknown().nullable().optional(),
+    content_plan: z.unknown().nullable().optional(),
+    script: z.unknown().nullable().optional(),
+    storyboard: z.unknown().nullable().optional(),
+    asset_manifest: z.unknown().nullable().optional(),
+    voice_track: z.unknown().nullable().optional(),
+    timeline: z.unknown().nullable().optional(),
+    qc_report: z.unknown().nullable().optional(),
+  })
+  .passthrough();
+
+export type ContentStudioProject = z.infer<typeof ContentStudioProjectSchema>;
 
 const ScheduleSchema = z.object({
   id: z.string(),
@@ -1632,6 +1678,106 @@ export const api = {
       "/api/v1/admin/multimedia/generate",
       { method: "POST", body: JSON.stringify(payload) },
       MultimediaGenerationSchema,
+    );
+  },
+  createContentStudioProject(payload: {
+    title: string;
+    topic: string;
+    source_urls?: string[];
+    domain?: string;
+    format?: string;
+    platform?: string;
+    channel?: string;
+    style?: string;
+  }): Promise<ContentStudioProject> {
+    return request(
+      "/api/v1/content-studio/projects",
+      { method: "POST", body: JSON.stringify(payload) },
+      ContentStudioProjectSchema,
+    );
+  },
+  getContentStudioProject(id: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}`,
+      { method: "GET" },
+      ContentStudioProjectSchema,
+    );
+  },
+  runContentStudioProject(id: string, until: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/run`,
+      { method: "POST", body: JSON.stringify({ until }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  reviseContentStudioScript(id: string, instruction: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/revise-script`,
+      { method: "POST", body: JSON.stringify({ instruction }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  approveContentStudioScript(id: string, revision: number): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/approve-script`,
+      { method: "POST", body: JSON.stringify({ revision }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  approveContentStudioRights(
+    id: string,
+    payload: { asset_ids: string[]; note: string; revision: number },
+  ): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/approve-rights`,
+      { method: "POST", body: JSON.stringify(payload) },
+      ContentStudioProjectSchema,
+    );
+  },
+  reviseContentStudioStoryboard(id: string, instruction: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/revise-storyboard`,
+      { method: "POST", body: JSON.stringify({ instruction }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  regenerateContentStudioAsset(id: string, assetId: string, instruction: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/regenerate-asset`,
+      { method: "POST", body: JSON.stringify({ asset_id: assetId, instruction }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  renderContentStudioPreview(id: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/render-preview`,
+      { method: "POST" },
+      ContentStudioProjectSchema,
+    );
+  },
+  approveContentStudioFinal(id: string, revision: number): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/approve-final`,
+      { method: "POST", body: JSON.stringify({ revision }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  retryContentStudioStage(id: string, stage: string): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/retry-stage`,
+      { method: "POST", body: JSON.stringify({ stage }) },
+      ContentStudioProjectSchema,
+    );
+  },
+  updateContentStudioClaim(
+    id: string,
+    claimId: string,
+    payload: { status: string; note: string; evidence_ids: string[] },
+  ): Promise<ContentStudioProject> {
+    return request(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/claims/${encodeURIComponent(claimId)}`,
+      { method: "POST", body: JSON.stringify(payload) },
+      ContentStudioProjectSchema,
     );
   },
   schedules(): Promise<Schedule[]> {

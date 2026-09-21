@@ -1,0 +1,20 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "platform",
+  "name": "douyin",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "aspect_ratio": "9:16",
+    "width": 1080,
+    "height": 1920,
+    "min_seconds": 45,
+    "max_seconds": 90,
+    "target_seconds": 60,
+    "codec": "H.264/AAC",
+    "subtitle_required": true,
+    "hook_seconds": 3,
+    "visual_change_seconds": [3, 5]
+  }
+}

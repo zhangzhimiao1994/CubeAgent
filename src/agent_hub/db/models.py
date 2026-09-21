@@ -213,11 +213,6 @@ class RunArtifactRow(Base):
     __tablename__ = "agent_hub_run_artifacts"
     __table_args__ = (
         UniqueConstraint("run_id", "id", name="uq_agent_hub_run_artifacts_run_id"),
-        UniqueConstraint(
-            "run_id",
-            "content_sha256",
-            name="uq_agent_hub_run_artifacts_run_hash",
-        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)

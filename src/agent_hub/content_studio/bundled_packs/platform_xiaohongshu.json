@@ -1,0 +1,20 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "platform",
+  "name": "xiaohongshu",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "aspect_ratio": "3:4",
+    "width": 1080,
+    "height": 1440,
+    "min_seconds": 20,
+    "max_seconds": 90,
+    "target_seconds": 45,
+    "codec": "H.264/AAC",
+    "subtitle_required": true,
+    "hook_seconds": 2,
+    "visual_change_seconds": [4, 6]
+  }
+}

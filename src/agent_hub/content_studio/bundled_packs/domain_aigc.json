@@ -1,0 +1,41 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "domain",
+  "name": "aigc",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "source_priority": [
+      "official_docs",
+      "official_blog",
+      "release_notes",
+      "github_release",
+      "paper",
+      "official_demo",
+      "secondary_media"
+    ],
+    "fact_rules": [
+      "temporal_scope_required",
+      "official_source_preferred"
+    ],
+    "allowed_hosts": [
+      "openai.com",
+      "github.com",
+      "arxiv.org",
+      "huggingface.co"
+    ],
+    "official_hosts": [
+      "openai.com",
+      "github.com",
+      "huggingface.co"
+    ],
+    "source_types": {
+      "openai.com": "official_docs",
+      "github.com": "github_release",
+      "arxiv.org": "paper",
+      "huggingface.co": "official_demo"
+    },
+    "default_license": "source_terms"
+  }
+}

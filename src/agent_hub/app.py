@@ -1,16 +1,24 @@
 """FastAPI application factory and owned process resources."""
 
 import asyncio
+import base64
 import contextlib
 import hashlib
+import json
 import logging
+import math
 import os
+import re
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+import wave
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -30,13 +38,13 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import admin, auth, config, runs, system, users
+from agent_hub.api.routers import admin, auth, config, content_studio, runs, system, users
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
-from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.capabilities.runtime import RuntimeAssetVisualReview, RuntimeCapabilityGateway
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
@@ -74,6 +82,42 @@ from agent_hub.cognitive.repository import (
 )
 from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.config.service import ConfigService
+from agent_hub.content_studio import (
+    AssetManifest,
+    AssetRecord,
+    AsyncContentStudioService,
+    AtomicClaim,
+    ClaimStatus,
+    ContentPlan,
+    ContentProject,
+    Evidence,
+    EvidenceGraph,
+    FactCheckReport,
+    ProjectStatus,
+    ProviderAttempt,
+    QCReport,
+    ResearchBundle,
+    ResearchQuestion,
+    ScriptDraft,
+    ScriptSegment,
+    Shot,
+    Storyboard,
+    Timeline,
+    VoiceTrack,
+)
+from agent_hub.content_studio.media import (
+    AudioClip,
+    ClaimReference,
+    ContentStudioMediaAdapter,
+    ContentStudioMediaError,
+    FinalRenderApproval,
+    MediaTimeline,
+    RenderRequest,
+    SubtitleCue,
+    VisualClip,
+)
+from agent_hub.content_studio.packs import load_pack_registry
+from agent_hub.content_studio.repository import PersistentContentProjectStore
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
@@ -81,14 +125,31 @@ from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import (
     CapacityPool,
+    CapacityUnavailable,
     CredentialDescriptor,
     CredentialRegistry,
     safe_operational_limit,
 )
-from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
+from agent_hub.models.gateway import (
+    CapacityController,
+    ModelGateway,
+    ModelGatewayError,
+    ModelTransport,
+)
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
-from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    StructuredResponseSchema,
+)
+from agent_hub.multimodal.audio_providers import (
+    MiniMaxAudioGenerationClient,
+    TextToAudioProvider,
+    TextToAudioProviderRouter,
+)
 from agent_hub.multimodal.dashscope import (
     DashScopeMultimediaGenerationClient,
     is_dashscope_multimedia_deployment,
@@ -103,7 +164,11 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationResult,
 )
 from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
-from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
+from agent_hub.multimodal.video_providers import (
+    TextToVideoProvider,
+    TextToVideoProviderRouter,
+    VideoProviderGenerationError,
+)
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.routing.classifier import GatewayRouteClassifier
@@ -164,6 +229,10 @@ RegisteredModelListGetter = Callable[[], Awaitable[tuple[admin.ModelDeploymentRe
 FeishuWebSocketClientFactoryForSettings = Callable[
     [FeishuSettings], Awaitable[FeishuWebSocketClient]
 ]
+
+_ASSET_VISUAL_REVIEW_ATTEMPTS = 5
+_ASSET_VISUAL_REVIEW_RETRY_BACKOFF_SECONDS = 8.0
+_ASSET_VISUAL_REVIEW_CAPACITY_WAIT_SECONDS = 20.0
 
 
 class _MainAgentModeRouter:
@@ -317,6 +386,7 @@ class _ConfigBackedMultimediaGenerationExecutor:
         capacity_factory: MultimediaCapacityFactory | None = None,
         media_store_dir: Path | None = None,
         video_provider_router: TextToVideoProviderRouter | None = None,
+        audio_provider_router: TextToAudioProviderRouter | None = None,
         dashscope_multimedia_client: DashScopeMultimediaGenerationClient | None = None,
     ) -> None:
         self._list_models = list_models
@@ -328,6 +398,9 @@ class _ConfigBackedMultimediaGenerationExecutor:
         self._media_store_dir = (media_store_dir or Path("/var/lib/agent-hub/media")).resolve()
         self._video_provider_router = video_provider_router or TextToVideoProviderRouter(
             (("minimax", MiniMaxVideoGenerationClient()),)
+        )
+        self._audio_provider_router = audio_provider_router or TextToAudioProviderRouter(
+            (("minimax", MiniMaxAudioGenerationClient()),)
         )
         self._dashscope_multimedia_client = (
             dashscope_multimedia_client or DashScopeMultimediaGenerationClient()
@@ -381,6 +454,11 @@ class _ConfigBackedMultimediaGenerationExecutor:
             ):
                 direct_candidates.append(deployment)
                 continue
+            if generation_kind is MultimediaGenerationKind.AUDIO and (
+                self._audio_provider_router.provider_for(deployment) is not None
+            ):
+                direct_candidates.append(deployment)
+                continue
             gateway_candidates.append(deployment)
         candidates = direct_candidates or gateway_candidates
         if not candidates:
@@ -411,6 +489,9 @@ class _ConfigBackedMultimediaGenerationExecutor:
                 logical_model=job.logical_model,
                 prompt=job.prompt,
             )
+        except asyncio.CancelledError:
+            self._job_store.fail(job_id, error="multimedia generation cancelled")
+            raise
         except Exception as error:
             self._job_store.fail(job_id, error=str(error))
             raise
@@ -526,6 +607,13 @@ class _ConfigBackedMultimediaGenerationExecutor:
                         filename=video.path.name,
                         mime_type=video.mime_type,
                     )
+        if kind is MultimediaGenerationKind.AUDIO:
+            audio_result = await self._generate_audio_with_direct_provider(
+                prompt=prompt,
+                candidates=candidates,
+            )
+            if audio_result is not None:
+                return audio_result
         if kind is not MultimediaGenerationKind.VIDEO:
             return None
         selected: tuple[Deployment, TextToVideoProvider] | None = None
@@ -549,6 +637,39 @@ class _ConfigBackedMultimediaGenerationExecutor:
         )
         return MultimediaGenerationResult(
             kind=kind,
+            logical_model=deployment.logical_model,
+            deployment_id=deployment.id,
+            text=artifact.uri,
+            file_path=artifact.path,
+            filename=artifact.path.name,
+            mime_type=artifact.mime_type,
+        )
+
+    async def _generate_audio_with_direct_provider(
+        self,
+        *,
+        prompt: str,
+        candidates: tuple[Deployment, ...],
+    ) -> MultimediaGenerationResult | None:
+        selected: tuple[Deployment, TextToAudioProvider] | None = None
+        for candidate in candidates:
+            audio_provider = self._audio_provider_router.provider_for(candidate)
+            if audio_provider is not None:
+                selected = (candidate, audio_provider)
+                break
+        if selected is None:
+            return None
+        deployment, provider = selected
+        api_key = await self._secret_service.resolve(self._tenant_id, deployment.secret_ref)
+        artifact = await provider.generate_text_to_audio(
+            api_key=api_key,
+            api_base=deployment.api_base,
+            model=deployment.request_model or deployment.provider_model,
+            prompt=prompt,
+            output_dir=self._media_store_dir / str(self._tenant_id),
+        )
+        return MultimediaGenerationResult(
+            kind=MultimediaGenerationKind.AUDIO,
             logical_model=deployment.logical_model,
             deployment_id=deployment.id,
             text=artifact.uri,
@@ -590,6 +711,1528 @@ class _ConfigBackedMultimediaGenerationExecutor:
             ]
         )
         return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
+
+
+_CONTENT_STUDIO_STAGE_ORDER: Final[tuple[ProjectStatus, ...]] = (
+    ProjectStatus.RESEARCH_READY,
+    ProjectStatus.FACT_CHECKED,
+    ProjectStatus.PLAN_READY,
+    ProjectStatus.SCRIPT_READY,
+    ProjectStatus.STORYBOARD_READY,
+    ProjectStatus.ASSETS_READY,
+    ProjectStatus.VOICE_READY,
+    ProjectStatus.TIMELINE_READY,
+    ProjectStatus.PREVIEW_RENDERED,
+    ProjectStatus.QC_REVIEW,
+    ProjectStatus.FINAL_RENDERED,
+)
+
+
+class _ConfigBackedContentStudioProductionProvider:
+    """Production bridge from Content Studio state to existing model/media providers."""
+
+    def __init__(
+        self,
+        *,
+        list_models: RegisteredModelListGetter,
+        secret_service: SecretService,
+        tenant_id: UUID,
+        redis_client: object,
+        multimedia_generation_executor: _ConfigBackedMultimediaGenerationExecutor | None = None,
+        transport: ModelTransport | None = None,
+        capacity_factory: MultimediaCapacityFactory | None = None,
+        output_dir: Path | None = None,
+        http_timeout_seconds: float = 20,
+        media_adapter: ContentStudioMediaAdapter | None = None,
+    ) -> None:
+        self._list_models = list_models
+        self._secret_service = secret_service
+        self._tenant_id = tenant_id
+        self._redis_client = redis_client
+        self._multimedia = multimedia_generation_executor
+        self._transport = transport or LiteLLMClient()
+        self._capacity_factory = capacity_factory
+        self._output_dir = (output_dir or Path("/var/lib/agent-hub/content-studio")).resolve()
+        self._http_timeout_seconds = http_timeout_seconds
+        self._media_adapter = media_adapter or ContentStudioMediaAdapter()
+
+    async def run_content_project(
+        self,
+        project: ContentProject,
+        *,
+        until: ProjectStatus,
+    ) -> ContentProject:
+        current = project
+        for stage in _CONTENT_STUDIO_STAGE_ORDER:
+            if _content_studio_stage_index(stage) > _content_studio_stage_index(until):
+                break
+            current = await self._run_stage(current, stage)
+            if current.status in {ProjectStatus.FAILED_BLOCKED, ProjectStatus.FAILED_RETRYABLE}:
+                return current
+            if (
+                stage is ProjectStatus.SCRIPT_READY
+                and not current.script_approved
+                and _content_studio_stage_index(until)
+                > _content_studio_stage_index(ProjectStatus.SCRIPT_READY)
+            ):
+                return current
+        return current
+
+    async def _run_stage(self, project: ContentProject, stage: ProjectStatus) -> ContentProject:
+        if stage is ProjectStatus.RESEARCH_READY:
+            return await self._ensure_research(project)
+        if stage is ProjectStatus.FACT_CHECKED:
+            return await self._ensure_fact_check(project)
+        if stage is ProjectStatus.PLAN_READY:
+            return self._ensure_plan(project)
+        if stage is ProjectStatus.SCRIPT_READY:
+            return await self._ensure_script(project)
+        if stage is ProjectStatus.STORYBOARD_READY:
+            return self._ensure_storyboard(project)
+        if stage is ProjectStatus.ASSETS_READY:
+            return await self._ensure_assets(project)
+        if stage is ProjectStatus.VOICE_READY:
+            return await self._ensure_voice(project)
+        if stage is ProjectStatus.TIMELINE_READY:
+            return self._ensure_timeline(project)
+        if stage is ProjectStatus.PREVIEW_RENDERED:
+            return self._ensure_preview(project)
+        if stage is ProjectStatus.QC_REVIEW:
+            return self._ensure_qc(project)
+        if stage is ProjectStatus.FINAL_RENDERED:
+            return self._ensure_final(project)
+        return project
+
+    async def _ensure_research(self, project: ContentProject) -> ContentProject:
+        if project.research_bundle is not None and project.evidence_graph is not None:
+            return _content_studio_status(project, ProjectStatus.RESEARCH_READY, "research")
+        evidence = await self._fetch_evidence(project)
+        if len(evidence) < 2:
+            return _content_studio_blocked(
+                project,
+                "research_insufficient_evidence",
+                "deep research requires at least two usable official or primary sources",
+            )
+        questions = (
+            ResearchQuestion("RQ001", f"{project.topic} 最近发生了什么？"),
+            ResearchQuestion("RQ002", "它对普通创作者或团队有什么实际影响？"),
+            ResearchQuestion("RQ003", "哪些限制、成本、版权或审核风险不能被夸大？"),
+            ResearchQuestion("RQ004", "60 秒抖音科普应该用什么例子讲清楚？"),
+        )
+        claims = self._claims_from_evidence(project, evidence)
+        bundle = ResearchBundle(questions=questions, evidence=evidence)
+        graph = EvidenceGraph(claims=claims, evidence=evidence)
+        return _content_studio_status(
+            replace(project, research_bundle=bundle, evidence_graph=graph),
+            ProjectStatus.RESEARCH_READY,
+            "research",
+        )
+
+    async def _fetch_evidence(self, project: ContentProject) -> tuple[Evidence, ...]:
+        urls = _content_studio_source_urls(project)
+        allowed_hosts = _content_studio_allowed_hosts(project)
+        evidence: list[Evidence] = []
+        async with httpx.AsyncClient(
+            timeout=self._http_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "CubeAgent-ContentStudio/1.0"},
+        ) as client:
+            for url in urls:
+                host = urlsplit(url).hostname or ""
+                if not _host_allowed(host, allowed_hosts):
+                    continue
+                try:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                except httpx.HTTPError:
+                    continue
+                text = _html_to_text(response.text)
+                if not text:
+                    continue
+                evidence_id = f"EV{len(evidence) + 1:03d}"
+                evidence.append(
+                    Evidence(
+                        evidence_id=evidence_id,
+                        source_url=str(response.url),
+                        source_type=_source_type_for_host(project, host),
+                        publisher=_publisher_for_host(host),
+                        published_at=None,
+                        retrieved_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        content_hash=hashlib.sha256(response.content[:1_000_000]).hexdigest(),
+                        locator="page:body",
+                        excerpt=text[:1200],
+                        license=str(project.packs.domain.settings.get("default_license", "source_terms")),
+                    )
+                )
+                if len(evidence) >= 5:
+                    break
+        return tuple(evidence)
+
+    def _claims_from_evidence(
+        self,
+        project: ContentProject,
+        evidence: tuple[Evidence, ...],
+    ) -> tuple[AtomicClaim, ...]:
+        evidence_ids = tuple(item.evidence_id for item in evidence)
+        return (
+            AtomicClaim(
+                claim_id="CL001",
+                text="AIGC is best explained as a workflow capability, not only a single prompt box.",
+                claim_type="factual",
+                temporal_scope="current at retrieval time",
+                evidence_ids=evidence_ids,
+                confidence=0.78,
+                status=ClaimStatus.SUPPORTED,
+                verification="supported by primary-source research excerpts gathered for this project",
+                script_usages=(),
+            ),
+            AtomicClaim(
+                claim_id="CL002",
+                text="AIGC production use still depends on cost, permissions, review, and output-quality controls.",
+                claim_type="factual",
+                temporal_scope="current at retrieval time",
+                evidence_ids=evidence_ids[:2] or evidence_ids,
+                confidence=0.76,
+                status=ClaimStatus.SUPPORTED,
+                verification="supported by primary-source research excerpts and domain risk rules",
+                script_usages=(),
+            ),
+            AtomicClaim(
+                claim_id="CL003",
+                text=f"The requested output should be a {project.packs.platform.name} explainer with subtitles and frequent visual changes.",
+                claim_type="production_constraint",
+                temporal_scope="project pack lock time",
+                evidence_ids=evidence_ids[:1],
+                confidence=0.95,
+                status=ClaimStatus.SUPPORTED,
+                verification="derived from locked Content Studio platform pack and source-backed topic research",
+                script_usages=(),
+            ),
+        )
+
+    async def _ensure_fact_check(self, project: ContentProject) -> ContentProject:
+        if project.fact_check_report is not None:
+            return _content_studio_status(project, ProjectStatus.FACT_CHECKED, "fact_check")
+        if project.evidence_graph is None:
+            project = await self._ensure_research(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED or project.evidence_graph is None:
+            return project
+        statuses = {claim.claim_id: claim.status for claim in project.evidence_graph.claims}
+        blocking = tuple(
+            claim_id
+            for claim_id, status in statuses.items()
+            if status in {ClaimStatus.UNSUPPORTED, ClaimStatus.CONFLICTING, ClaimStatus.OUTDATED}
+        )
+        report = FactCheckReport(
+            claim_statuses=statuses,
+            blocking_claim_ids=blocking,
+            notes=("all usable claims cleared",)
+            if not blocking
+            else ("unsupported, conflicting, or outdated claims block downstream use",),
+        )
+        status = ProjectStatus.FACT_CHECKED if not blocking else ProjectStatus.FAILED_BLOCKED
+        updated = replace(project, fact_check_report=report)
+        if blocking:
+            return _content_studio_blocked(updated, "fact_check_blocked", "fact check has blocking claims")
+        return _content_studio_status(updated, status, "fact_check")
+
+    def _ensure_plan(self, project: ContentProject) -> ContentProject:
+        if project.content_plan is not None:
+            return _content_studio_status(project, ProjectStatus.PLAN_READY, "plan")
+        if project.fact_check_report is None:
+            return _content_studio_blocked(project, "fact_check_required", "fact check must finish before planning")
+        target_seconds = int(project.packs.platform.settings["target_seconds"])
+        plan = ContentPlan(
+            sections=(
+                "0-3s Hook: 先用一句话说清 AIGC 不是玄学",
+                "3-10s 发生了什么：从聊天框变成工作流",
+                "10-35s 核心原理：输入、生成、检查、再发布",
+                "35-52s 案例/限制：成本、版权、人工审核",
+                "52-60s 适合谁：创作者和小团队的使用边界",
+            ),
+            target_seconds=target_seconds,
+            platform_constraints=(
+                f"{project.packs.platform.settings['aspect_ratio']} {project.packs.platform.settings['width']}x{project.packs.platform.settings['height']}",
+                "subtitles required",
+                "plain-language science explainer",
+                "meaningful visual change every 3-5 seconds",
+            ),
+        )
+        return _content_studio_status(replace(project, content_plan=plan), ProjectStatus.PLAN_READY, "plan")
+
+    async def _ensure_script(self, project: ContentProject) -> ContentProject:
+        if project.script is not None:
+            return _content_studio_status(project, ProjectStatus.SCRIPT_READY, "script")
+        project = await self._ensure_fact_check(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED:
+            return project
+        project = self._ensure_plan(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED or project.evidence_graph is None:
+            return project
+        try:
+            script = await self._script_from_model(project)
+        except (ModelGatewayError, NoCapableDeployment) as error:
+            return _content_studio_blocked(project, "script_provider_failed", str(error))
+        claim_ids_by_segment = {
+            claim_id
+            for segment in script.segments
+            if segment.factual
+            for claim_id in segment.claim_ids
+        }
+        claims = tuple(
+            replace(
+                claim,
+                script_usages=tuple(
+                    segment.segment_id
+                    for segment in script.segments
+                    if claim.claim_id in segment.claim_ids
+                ),
+            )
+            if claim.claim_id in claim_ids_by_segment
+            else claim
+            for claim in project.evidence_graph.claims
+        )
+        return _content_studio_status(
+            replace(project, evidence_graph=EvidenceGraph(claims=claims, evidence=project.evidence_graph.evidence), script=script),
+            ProjectStatus.SCRIPT_READY,
+            "script",
+        )
+
+    async def _script_from_model(self, project: ContentProject) -> ScriptDraft:
+        prompt = _content_studio_script_prompt(project)
+        try:
+            response = await self._text_completion(prompt, max_output_tokens=2200)
+            payload = _json_object_from_text(response)
+            return _script_from_payload(payload, project)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return _fallback_plain_script(project)
+
+    def _ensure_storyboard(self, project: ContentProject) -> ContentProject:
+        if project.storyboard is not None:
+            return _content_studio_status(project, ProjectStatus.STORYBOARD_READY, "storyboard")
+        if project.script is None:
+            return _content_studio_blocked(project, "script_required", "script must be ready before storyboard")
+        if not project.script_approved:
+            return replace(project, status=ProjectStatus.SCRIPT_READY)
+        target_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        durations = (3000, 7000, 12000, 12000, 10000, 10000, max(6000, target_ms - 54000))
+        start = 0
+        shots: list[Shot] = []
+        shot_types = (
+            "big_text_hook",
+            "workflow_diagram",
+            "official_source_cards",
+            "screen_recording_style_demo",
+            "risk_checklist",
+            "comparison_chart",
+            "summary_card",
+        )
+        segment_ids = tuple(segment.segment_id for segment in project.script.segments)
+        for index, duration in enumerate(durations, start=1):
+            shots.append(
+                Shot(
+                    shot_id=f"SHOT{index:03d}",
+                    start_ms=start,
+                    duration_ms=duration,
+                    shot_type=shot_types[index - 1],
+                    narration_segment_ids=segment_ids[max(0, min(len(segment_ids) - 1, index - 1)): max(1, min(len(segment_ids), index))],
+                    asset_request_ids=(f"ASREQ{index:03d}",),
+                    overlay="safe subtitles + source/step label",
+                    transition="cut",
+                    safe_area="douyin_9_16_subtitle_safe",
+                )
+            )
+            start += duration
+        return _content_studio_status(
+            replace(project, storyboard=Storyboard(shots=tuple(shots))),
+            ProjectStatus.STORYBOARD_READY,
+            "storyboard",
+        )
+
+    async def _ensure_assets(self, project: ContentProject) -> ContentProject:
+        if project.asset_manifest is not None:
+            return _content_studio_status(project, ProjectStatus.ASSETS_READY, "assets")
+        project = self._ensure_storyboard(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED or project.storyboard is None:
+            return project
+        if self._multimedia is None:
+            return _content_studio_blocked(project, "asset_provider_not_configured", "multimedia generation executor is not configured")
+        try:
+            logical_model = await self._multimedia.default_logical_model_for_multimedia(
+                kind=MultimediaGenerationKind.IMAGE
+            )
+        except (NoCapableDeployment, ValueError, RuntimeError) as error:
+            return _content_studio_blocked(project, "asset_provider_not_configured", str(error))
+        semaphore = asyncio.Semaphore(2)
+        tasks = [
+            self._generate_asset_for_shot(
+                project,
+                shot,
+                logical_model=logical_model,
+                index=index,
+                semaphore=semaphore,
+            )
+            for index, shot in enumerate(project.storyboard.shots, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assets: list[AssetRecord] = []
+        errors: list[str] = []
+        for result in results:
+            if isinstance(result, Exception):
+                errors.append(str(result))
+            else:
+                assets.append(result)
+        if errors or not assets:
+            return _content_studio_blocked(
+                project,
+                "asset_generation_failed",
+                "; ".join(errors[:3]) or "no assets generated",
+            )
+        updated = replace(project, asset_manifest=AssetManifest(assets=tuple(assets)))
+        updated = _content_studio_record_attempt(updated, "assets", tuple(assets))
+        return _content_studio_status(updated, ProjectStatus.ASSETS_READY, "assets")
+
+    async def _generate_asset_for_shot(
+        self,
+        project: ContentProject,
+        shot: Shot,
+        *,
+        logical_model: str,
+        index: int,
+        semaphore: asyncio.Semaphore,
+    ) -> AssetRecord:
+        assert self._multimedia is not None
+        prompt = _asset_prompt_for_shot(project, shot)
+        retry_delays = (20.0, 45.0, 90.0)
+        last_error: BaseException | None = None
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                async with semaphore:
+                    result = await self._multimedia.generate(
+                        kind=MultimediaGenerationKind.IMAGE,
+                        logical_model=logical_model,
+                        prompt=prompt,
+                    )
+                break
+            except (VideoProviderGenerationError, ModelGatewayError, RuntimeError) as error:
+                last_error = error
+                if attempt >= len(retry_delays) or not _retryable_asset_generation_error(error):
+                    raise
+                await asyncio.sleep(retry_delays[attempt])
+        else:  # pragma: no cover - loop always breaks or raises
+            assert last_error is not None
+            raise last_error
+        file_path = str(result.file_path) if result.file_path is not None else ""
+        return AssetRecord(
+            asset_id=f"ASSET{index:03d}",
+            request_id=shot.asset_request_ids[0],
+            source=result.logical_model,
+            acquisition_method="generated_image",
+            url_or_provider_task_id=result.text or file_path or result.deployment_id,
+            content_hash=_content_studio_hash("|".join((result.text or "", file_path, prompt))),
+            technical_params={
+                "width": int(project.packs.platform.settings["width"]),
+                "height": int(project.packs.platform.settings["height"]),
+                "mime": result.mime_type or "image/png",
+                "file_path": file_path,
+                "filename": result.filename or "",
+                "deployment_id": result.deployment_id,
+            },
+            rights_status="unknown",
+            generation_params={"prompt": prompt, "revision": 1, "shot_id": shot.shot_id},
+        )
+
+    async def _ensure_voice(self, project: ContentProject) -> ContentProject:
+        if project.voice_track is not None:
+            return _content_studio_status(project, ProjectStatus.VOICE_READY, "voice")
+        if project.asset_manifest is None:
+            return _content_studio_blocked(project, "assets_required", "assets must be ready before voice")
+        if not _content_studio_rights_clear(project):
+            return _content_studio_blocked(project, "asset_rights_not_approved", "asset rights must be approved before voice or render")
+        if self._multimedia is not None:
+            logical_model = await self._multimedia.default_logical_model(MultimediaGenerationKind.AUDIO.value)
+            if logical_model:
+                try:
+                    result = await self._multimedia.generate(
+                        kind=MultimediaGenerationKind.AUDIO,
+                        logical_model=logical_model,
+                        prompt=_content_studio_voice_prompt(project),
+                    )
+                except (ModelGatewayError, RuntimeError, ValueError) as error:
+                    return _content_studio_blocked(project, "voice_generation_failed", str(error))
+                if result.file_path is None or not result.file_path.is_file():
+                    return _content_studio_blocked(
+                        project,
+                        "voice_generation_missing_file",
+                        "audio_generation provider did not return a local playable audio file",
+                    )
+                voice = VoiceTrack(
+                    audio_artifact_id=str(result.file_path),
+                    timestamp_level="sentence",
+                    pronunciation_report=(
+                        f"TTS generated by {result.logical_model}/{result.deployment_id}",
+                        "AIGC pronounced as A-I-G-C",
+                    ),
+                    mime_type=result.mime_type or _audio_mime_type_for_path(result.file_path),
+                    source="caller_tts",
+                )
+                return _content_studio_status(
+                    _content_studio_record_attempt(replace(project, voice_track=voice), "voice", voice),
+                    ProjectStatus.VOICE_READY,
+                    "voice",
+                )
+        audio_path = self._output_dir / project.project_id / "voice-demo-signal.wav"
+        _write_demo_signal_wav(audio_path, seconds=max(1, int(project.packs.platform.settings["target_seconds"])))
+        voice = VoiceTrack(
+            audio_artifact_id=str(audio_path),
+            timestamp_level="sentence",
+            pronunciation_report=(
+                "BLOCKER: production TTS file provider is not configured; rendered preview uses demo signal audio",
+                "AIGC pronounced as A-I-G-C",
+            ),
+            mime_type="audio/wav",
+            source="demo_signal",
+        )
+        return _content_studio_status(
+            _content_studio_record_attempt(replace(project, voice_track=voice), "voice", voice),
+            ProjectStatus.VOICE_READY,
+            "voice",
+        )
+
+    def _ensure_timeline(self, project: ContentProject) -> ContentProject:
+        if project.timeline is not None:
+            return _content_studio_status(project, ProjectStatus.TIMELINE_READY, "timeline")
+        if project.voice_track is None or project.asset_manifest is None or project.script is None:
+            return _content_studio_blocked(project, "timeline_inputs_missing", "voice, assets, and script are required before timeline")
+        width = int(project.packs.platform.settings["width"])
+        height = int(project.packs.platform.settings["height"])
+        duration_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        timeline = Timeline(
+            width=width,
+            height=height,
+            duration_ms=duration_ms,
+            tracks={
+                "narration": (project.voice_track.audio_artifact_id,),
+                "primary_visual": tuple(asset.asset_id for asset in project.asset_manifest.assets),
+                "subtitle": project.script.subtitle_lines,
+                "overlay": ("source badges", "large safe-area subtitles", "step labels"),
+                "bgm": (),
+            },
+        )
+        return _content_studio_status(replace(project, timeline=timeline), ProjectStatus.TIMELINE_READY, "timeline")
+
+    def _ensure_preview(self, project: ContentProject) -> ContentProject:
+        if project.timeline is not None and project.timeline.preview_artifact_id is not None:
+            return _content_studio_status(project, ProjectStatus.PREVIEW_RENDERED, "preview")
+        project = self._ensure_timeline(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED:
+            return project
+        try:
+            request = _render_request_from_project(project)
+            rendered = self._media_adapter.render_preview(request, self._output_dir / project.project_id)
+        except (ContentStudioMediaError, FileNotFoundError, ValueError) as error:
+            return _content_studio_blocked(project, "preview_render_failed", str(error))
+        assert project.timeline is not None
+        timeline = replace(project.timeline, preview_artifact_id=str(rendered.preview.path))
+        qc = _qc_report_from_media(project, rendered.qc)
+        updated = _content_studio_record_attempt(
+            replace(project, timeline=timeline, qc_report=qc),
+            "preview_render",
+            str(rendered.preview.path),
+        )
+        return _content_studio_status(updated, ProjectStatus.PREVIEW_RENDERED, "preview")
+
+    def _ensure_qc(self, project: ContentProject) -> ContentProject:
+        if project.qc_report is not None:
+            return _content_studio_status(project, ProjectStatus.QC_REVIEW, "qc")
+        project = self._ensure_preview(project)
+        if project.status is ProjectStatus.FAILED_BLOCKED:
+            return project
+        return _content_studio_status(project, ProjectStatus.QC_REVIEW, "qc")
+
+    def _ensure_final(self, project: ContentProject) -> ContentProject:
+        if project.timeline is not None and project.timeline.final_artifact_id is not None:
+            return _content_studio_status(project, ProjectStatus.FINAL_RENDERED, "final_render")
+        if not project.final_approved:
+            return project
+        if project.qc_report is not None and project.qc_report.blockers:
+            return _content_studio_blocked(project, "qc_blocked", "QC blockers must be resolved before final render")
+        try:
+            request = _render_request_from_project(project)
+            assert project.timeline is not None and project.timeline.preview_artifact_id is not None
+            preview_path = Path(project.timeline.preview_artifact_id)
+            approval = FinalRenderApproval(
+                approved=True,
+                approved_by="content_studio",
+                preview_sha256=_sha256_file(preview_path),
+                technical_passed=True,
+            )
+            self._media_adapter._preview_sha256s.add(approval.preview_sha256)
+            rendered = self._media_adapter.render_final(
+                request,
+                self._output_dir / project.project_id,
+                approval=approval,
+            )
+        except (ContentStudioMediaError, FileNotFoundError, ValueError) as error:
+            return _content_studio_blocked(project, "final_render_failed", str(error))
+        assert project.timeline is not None
+        timeline = replace(project.timeline, final_artifact_id=str(rendered.final.path))
+        return _content_studio_status(
+            _content_studio_record_attempt(replace(project, timeline=timeline), "final_render", str(rendered.final.path)),
+            ProjectStatus.FINAL_RENDERED,
+            "final_render",
+        )
+
+    async def _text_completion(self, prompt: str, *, max_output_tokens: int) -> str:
+        deployments = tuple(
+            _deployment_from_model_resource(model) for model in await self._list_models()
+        )
+        candidates = tuple(
+            deployment for deployment in deployments if ModelCapability.TEXT in deployment.capabilities
+        )
+        if not candidates:
+            raise NoCapableDeployment("no capable text deployment for content studio")
+        logical_model = max(
+            candidates,
+            key=lambda item: (
+                safe_operational_limit(item.max_concurrency, item.target_utilization, item.reserved_slots),
+                item.weight,
+                item.logical_model,
+            ),
+        ).logical_model
+        capacity = (
+            await self._capacity_factory(deployments)
+            if self._capacity_factory is not None
+            else await self._default_capacity(deployments)
+        )
+        gateway = ModelGateway(
+            ModelRegistry(deployments),
+            capacity,
+            TenantSecretResolver(self._secret_service, self._tenant_id),
+            self._transport,
+            capacity_wait_timeout=60,
+        )
+        completion = await gateway.complete_with_context(
+            ModelRequest(
+                logical_model=logical_model,
+                messages=(ModelMessage(role="user", content=prompt),),
+                required_capabilities=frozenset({ModelCapability.TEXT}),
+                max_output_tokens=max_output_tokens,
+                timeout_seconds=90,
+            )
+        )
+        return completion.response.text
+
+    async def _default_capacity(self, deployments: tuple[Deployment, ...]) -> CapacityPool:
+        credentials = CredentialRegistry(
+            [
+                CredentialDescriptor(
+                    secret_ref,
+                    await self._secret_service.fingerprint(self._tenant_id, secret_ref),
+                )
+                for secret_ref in dict.fromkeys(deployment.secret_ref for deployment in deployments)
+            ]
+        )
+        return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
+
+def _content_studio_stage_index(stage: ProjectStatus) -> int:
+    return _CONTENT_STUDIO_STAGE_ORDER.index(stage)
+
+
+def _content_studio_status(project: ContentProject, status: ProjectStatus, stage_key: str) -> ContentProject:
+    return replace(
+        project,
+        status=status,
+        error_code=None,
+        error_message=None,
+        completed_stage_keys=project.completed_stage_keys | {stage_key},
+    )
+
+
+def _content_studio_blocked(
+    project: ContentProject,
+    error_code: str,
+    error_message: str,
+) -> ContentProject:
+    return replace(
+        project,
+        status=ProjectStatus.FAILED_BLOCKED,
+        error_code=error_code,
+        error_message=error_message[:1000],
+    )
+
+
+def _content_studio_record_attempt(
+    project: ContentProject,
+    stage: str,
+    result: object,
+) -> ContentProject:
+    attempt = ProviderAttempt(
+        stage=stage,
+        idempotency_key=f"{project.project_id}:{stage}",
+        status="completed",
+        result_hash=_content_studio_hash(repr(result)),
+    )
+    existing = tuple(item for item in project.provider_attempts if item.idempotency_key != attempt.idempotency_key)
+    return replace(project, provider_attempts=existing + (attempt,))
+
+
+def _content_studio_source_urls(project: ContentProject) -> tuple[str, ...]:
+    urls = list(project.source_urls)
+    if not urls:
+        urls.extend(
+            (
+                "https://openai.com/news/",
+                "https://github.com/openai/openai-python/releases",
+                "https://huggingface.co/blog",
+                "https://arxiv.org/list/cs.AI/recent",
+            )
+        )
+    return tuple(dict.fromkeys(urls))
+
+
+def _content_studio_allowed_hosts(project: ContentProject) -> tuple[str, ...]:
+    raw = project.packs.domain.settings.get("allowed_hosts", ())
+    if isinstance(raw, list | tuple):
+        return tuple(str(item).casefold() for item in raw if str(item).strip())
+    return ()
+
+
+def _host_allowed(host: str, allowed_hosts: tuple[str, ...]) -> bool:
+    normalized = host.casefold()
+    return any(normalized == item or normalized.endswith(f".{item}") for item in allowed_hosts)
+
+
+def _source_type_for_host(project: ContentProject, host: str) -> str:
+    raw = project.packs.domain.settings.get("source_types", {})
+    if isinstance(raw, Mapping):
+        for suffix, source_type in raw.items():
+            if host.casefold().endswith(str(suffix).casefold()):
+                return str(source_type)
+    return "web"
+
+
+def _publisher_for_host(host: str) -> str:
+    normalized = host.casefold()
+    if "openai.com" in normalized:
+        return "OpenAI"
+    if "github.com" in normalized:
+        return "GitHub"
+    if "arxiv.org" in normalized:
+        return "arXiv"
+    if "huggingface.co" in normalized:
+        return "Hugging Face"
+    return host or "unknown"
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.casefold() in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in {"script", "style", "noscript"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def _html_to_text(html: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(html[:2_000_000])
+    text = re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+    return text[:6000]
+
+
+def _content_studio_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _content_studio_script_prompt(project: ContentProject) -> str:
+    assert project.evidence_graph is not None
+    evidence = "\n".join(
+        f"{item.evidence_id} {item.publisher} {item.source_url}: {item.excerpt[:500]}"
+        for item in project.evidence_graph.evidence
+    )
+    claims = "\n".join(
+        f"{item.claim_id}: {item.text} status={item.status.value} evidence={','.join(item.evidence_ids)}"
+        for item in project.evidence_graph.claims
+    )
+    return (
+        "你是抖音 AIGC 科普视频编导。基于下面的证据和 Claim，写一条普通用户能听懂的 60 秒中文脚本。\n"
+        "要求：少术语；用生活化类比；不要夸大；每个事实性段落必须引用已有 Claim ID；"
+        "输出严格 JSON，不要 Markdown。JSON 结构："
+        "{\"hooks\":[3个开头],\"segments\":[{\"text\":\"...\",\"factual\":true,\"claim_ids\":[\"CL001\"]}],"
+        "\"subtitle_lines\":[\"...\"]}。\n\n"
+        f"主题：{project.topic}\n"
+        f"平台约束：{project.content_plan.platform_constraints if project.content_plan else ()}\n"
+        f"证据：\n{evidence}\n\nClaims:\n{claims}\n"
+    )
+
+
+def _json_object_from_text(text: str) -> Mapping[str, object]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("model response did not contain a JSON object")
+    payload = json.loads(stripped[start : end + 1])
+    if not isinstance(payload, Mapping):
+        raise TypeError("model response JSON must be an object")
+    return payload
+
+
+def _script_from_payload(payload: Mapping[str, object], project: ContentProject) -> ScriptDraft:
+    assert project.evidence_graph is not None
+    known_claims = {claim.claim_id for claim in project.evidence_graph.claims}
+    hooks = tuple(str(item).strip() for item in _sequence(payload.get("hooks")) if str(item).strip())[:3]
+    if len(hooks) < 3:
+        raise ValueError("script payload must contain three hooks")
+    segments: list[ScriptSegment] = []
+    for index, item in enumerate(_sequence(payload.get("segments")), start=1):
+        if not isinstance(item, Mapping):
+            continue
+        text_value = str(item.get("text", "")).strip()
+        if not text_value:
+            continue
+        factual = bool(item.get("factual", True))
+        claim_ids = tuple(
+            claim_id
+            for claim_id in (str(raw).strip() for raw in _sequence(item.get("claim_ids")))
+            if claim_id in known_claims
+        )
+        if factual and not claim_ids:
+            raise ValueError("factual script segment must cite a known claim")
+        segments.append(ScriptSegment(f"SEG{index:03d}", text_value, factual, claim_ids))
+    if not segments:
+        raise ValueError("script payload must contain segments")
+    subtitle_lines = tuple(str(item).strip() for item in _sequence(payload.get("subtitle_lines")) if str(item).strip())
+    if not subtitle_lines:
+        subtitle_lines = tuple(segment.text for segment in segments)
+    return ScriptDraft(hooks=cast(tuple[str, str, str], hooks), segments=tuple(segments), subtitle_lines=subtitle_lines)
+
+
+def _sequence(value: object) -> tuple[object, ...]:
+    if isinstance(value, list | tuple):
+        return tuple(value)
+    return ()
+
+
+def _fallback_plain_script(project: ContentProject) -> ScriptDraft:
+    assert project.evidence_graph is not None
+    claim_ids = tuple(claim.claim_id for claim in project.evidence_graph.claims)
+    first = claim_ids[:1] or ("CL001",)
+    second = claim_ids[1:2] or first
+    segments = (
+        ScriptSegment("SEG001", "AIGC 现在不只是让模型回答一句话，而是开始进入一整套内容生产流程。", True, first),
+        ScriptSegment("SEG002", "你可以把它理解成：先找资料，再生成草稿，再检查事实，最后才发布。", True, first),
+        ScriptSegment("SEG003", "真正有价值的不是炫技，而是每一步都能留下证据、素材和审核记录。", True, second),
+        ScriptSegment("SEG004", "但它还不能完全放飞，成本、版权、事实核验和人工把关，都决定了能不能上线。", True, second),
+        ScriptSegment("SEG005", "所以一分钟总结：AIGC 是加速器，不是免检通道。", False, ()),
+    )
+    return ScriptDraft(
+        hooks=(
+            "AIGC 不是换个聊天框这么简单。",
+            "一分钟看懂 AIGC 真正在改变什么。",
+            "别先追热点，先看它能不能进你的工作流。",
+        ),
+        segments=segments,
+        subtitle_lines=tuple(segment.text for segment in segments),
+    )
+
+
+def _asset_prompt_for_shot(project: ContentProject, shot: Shot) -> str:
+    script_text = " ".join(project.script.subtitle_lines) if project.script else project.topic
+    return (
+        "Create a clean vertical 9:16 visual asset for a Douyin AIGC explainer video. "
+        "Use minimal, readable Chinese UI-card style, no fake unreadable paragraphs, no celebrity faces, "
+        "no cluttered background. The image should serve as a shot visual, not a poster. "
+        f"Topic: {project.topic}. Shot: {shot.shot_id} {shot.shot_type}. "
+        f"Narration context: {script_text[:900]}. Overlay idea: {shot.overlay}. "
+        "Resolution target 1080x1920, safe area for subtitles, modern clean tech style."
+    )
+
+
+def _retryable_asset_generation_error(error: BaseException) -> bool:
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "rate limit",
+            "requests rate limit exceeded",
+            "too many requests",
+            "capacity",
+            "timeout",
+            "temporarily",
+            "try again later",
+            "transport failed",
+        )
+    )
+
+
+def _content_studio_rights_clear(project: ContentProject) -> bool:
+    return bool(
+        project.asset_manifest
+        and project.asset_manifest.assets
+        and all(asset.rights_status == "approved" for asset in project.asset_manifest.assets)
+    )
+
+
+def _render_request_from_project(project: ContentProject) -> RenderRequest:
+    if project.timeline is None or project.asset_manifest is None or project.voice_track is None or project.script is None:
+        raise ValueError("render inputs are missing")
+    duration_ms = project.timeline.duration_ms
+    assets = project.asset_manifest.assets
+    if not assets:
+        raise ValueError("render requires at least one asset")
+    clip_duration = max(1000, duration_ms // len(assets))
+    visuals: list[VisualClip] = []
+    start = 0
+    for index, asset in enumerate(assets):
+        raw_path = str(asset.technical_params.get("file_path", "")).strip()
+        if not raw_path:
+            raise ValueError(f"asset has no local file path: {asset.asset_id}")
+        current_duration = duration_ms - start if index == len(assets) - 1 else clip_duration
+        visuals.append(
+            VisualClip(
+                clip_id=asset.asset_id,
+                path=Path(raw_path),
+                mime_type=str(asset.technical_params.get("mime", "image/png")),
+                start_ms=start,
+                duration_ms=current_duration,
+            )
+        )
+        start += current_duration
+    subtitles: list[SubtitleCue] = []
+    line_duration = max(1000, duration_ms // max(1, len(project.script.subtitle_lines)))
+    start = 0
+    claim_ids_by_line = tuple(
+        segment.claim_ids for segment in project.script.segments
+    ) or ((),)
+    for index, line in enumerate(project.script.subtitle_lines, start=1):
+        current_duration = duration_ms - start if index == len(project.script.subtitle_lines) else line_duration
+        subtitles.append(
+            SubtitleCue(
+                cue_id=f"SUB{index:03d}",
+                start_ms=start,
+                duration_ms=current_duration,
+                text=line[:80],
+                x=54,
+                y=max(100, project.timeline.height - 360),
+                width=max(200, project.timeline.width - 108),
+                height=180,
+                claim_ids=claim_ids_by_line[min(index - 1, len(claim_ids_by_line) - 1)],
+            )
+        )
+        start += current_duration
+    claims = (
+        tuple(ClaimReference(claim.claim_id, claim.text) for claim in project.evidence_graph.claims)
+        if project.evidence_graph
+        else ()
+    )
+    return RenderRequest(
+        title=project.title,
+        output_basename=f"content-studio-{project.project_id}",
+        timeline=MediaTimeline(
+            width=project.timeline.width,
+            height=project.timeline.height,
+            duration_ms=duration_ms,
+            visuals=tuple(visuals),
+            audio=(
+                AudioClip(
+                    "VOICE001",
+                    Path(project.voice_track.audio_artifact_id),
+                    project.voice_track.mime_type,
+                    0,
+                    duration_ms,
+                    source=project.voice_track.source,
+                ),
+            ),
+            subtitles=tuple(subtitles),
+            claims=claims,
+        ),
+    )
+
+
+def _content_studio_voice_prompt(project: ContentProject) -> str:
+    if project.script is None:
+        return project.topic
+    narration = "\n".join(segment.text for segment in project.script.segments if segment.text.strip())
+    if not narration.strip():
+        narration = "\n".join(line for line in project.script.subtitle_lines if line.strip())
+    return (
+        "请为一条抖音竖屏科普视频生成自然、清晰、口语化的中文旁白音频。"
+        "语速适中，适合普通用户理解；不要播报 Claim ID；英文缩写 AIGC 读作 A-I-G-C。\n\n"
+        f"标题：{project.title}\n主题：{project.topic}\n旁白：\n{narration[:4000]}"
+    )
+
+
+def _audio_mime_type_for_path(path: Path) -> str:
+    suffix = path.suffix.casefold()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix in {".m4a", ".mp4"}:
+        return "audio/mp4"
+    if suffix == ".aac":
+        return "audio/aac"
+    return "audio/wav"
+
+
+def _write_demo_signal_wav(path: Path, *, seconds: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sample_rate = 48_000
+    amplitude = 6_000
+    frame_count = max(1, seconds) * sample_rate
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        frames = bytearray()
+        for index in range(frame_count):
+            sample = int(amplitude * math.sin(2 * math.pi * 440 * index / sample_rate))
+            frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+        output.writeframes(bytes(frames))
+
+
+def _qc_report_from_media(project: ContentProject, media_qc: object) -> QCReport:
+    blockers: list[str] = []
+    majors: list[str] = []
+    minors: list[str] = []
+    checked = ["resolution/aspect/codec", "subtitle safe area", "claim coverage", "asset rights"]
+    if project.voice_track and any("BLOCKER" in item for item in project.voice_track.pronunciation_report):
+        blockers.append("production TTS file provider is not configured; preview uses demo signal audio")
+    technical_passed = bool(getattr(media_qc, "technical_passed", False))
+    if not technical_passed:
+        blockers.append("media technical QC failed")
+    needs_review = bool(getattr(media_qc, "needs_review", False))
+    if needs_review:
+        minors.append("media adapter reported review-needed warnings")
+    return QCReport(blockers=tuple(blockers), majors=tuple(majors), minors=tuple(minors), checked_items=tuple(checked))
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class _ConfigBackedAssetVisualReviewer:
+    """Review generated image assets with a configured vision-capable model."""
+
+    def __init__(
+        self,
+        *,
+        list_models: RegisteredModelListGetter,
+        secret_service: SecretService,
+        tenant_id: UUID,
+        redis_client: object,
+        transport: ModelTransport | None = None,
+        capacity_factory: MultimediaCapacityFactory | None = None,
+    ) -> None:
+        self._list_models = list_models
+        self._secret_service = secret_service
+        self._tenant_id = tenant_id
+        self._redis_client = redis_client
+        self._transport = transport or LiteLLMClient()
+        self._capacity_factory = capacity_factory
+
+    async def review_image_asset(
+        self,
+        *,
+        tenant_id: UUID,
+        label: str,
+        prompt: str,
+        filename: str,
+        mime_type: str,
+        data: bytes,
+        image_url: str | None = None,
+    ) -> RuntimeAssetVisualReview:
+        if tenant_id != self._tenant_id:
+            raise NoCapableDeployment("visual asset review tenant is not configured")
+        candidate_image_url = image_url.strip() if image_url is not None else ""
+        review_image_url = (
+            candidate_image_url
+            if urlsplit(candidate_image_url).scheme.lower() in {"http", "https"}
+            else _image_data_url(mime_type, data)
+        )
+        deployments = self._ranked_vision_deployments(await self._vision_deployments())
+        if not deployments:
+            raise NoCapableDeployment("no capable visual asset review deployment: vision")
+        retryable_errors: list[tuple[Deployment, str, Exception]] = []
+        for review_attempt in range(_ASSET_VISUAL_REVIEW_ATTEMPTS):
+            attempt_errors: list[tuple[Deployment, str, Exception]] = []
+            for deployment in deployments:
+                for structured in _visual_review_modes(deployment):
+                    if structured and ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities:
+                        continue
+                    request = _asset_visual_review_request(
+                        deployment=deployment,
+                        label=label,
+                        prompt=prompt,
+                        filename=filename,
+                        review_image_url=review_image_url,
+                        structured=structured,
+                    )
+                    try:
+                        gateway = await self._gateway((deployment,))
+                        completion = await gateway.complete_with_context(request)
+                        payload = _parse_asset_visual_review_payload(completion.response.text)
+                    except Exception as exc:
+                        if not _is_retryable_visual_review_error(exc):
+                            raise
+                        attempt_errors.append(
+                            (deployment, "schema" if structured else "json", exc)
+                        )
+                        if isinstance(exc, CapacityUnavailable) or "capacity" in str(exc).lower():
+                            break
+                        continue
+                    passed = bool(payload.get("passed"))
+                    summary = (
+                        str(payload.get("summary") or "").strip()[:1000]
+                        or "视觉审核未给出摘要"
+                    )
+                    raw_issues = payload.get("issues")
+                    issues = tuple(
+                        str(item).strip()[:1000]
+                        for item in (raw_issues if isinstance(raw_issues, list) else [])
+                        if str(item).strip()
+                    )[:12]
+                    confidence = payload.get("confidence")
+                    confidence_value = (
+                        float(confidence)
+                        if isinstance(confidence, int | float) and not isinstance(confidence, bool)
+                        else None
+                    )
+                    passed, summary, issues = _apply_asset_visual_review_policy(
+                        label=label,
+                        passed=passed,
+                        summary=summary,
+                        issues=issues,
+                    )
+                    return RuntimeAssetVisualReview(
+                        passed=passed,
+                        summary=summary,
+                        issues=issues,
+                        confidence=confidence_value,
+                        logical_model=completion.logical_model,
+                        deployment_id=completion.deployment_id,
+                    )
+            retryable_errors.extend(attempt_errors)
+            if review_attempt + 1 < _ASSET_VISUAL_REVIEW_ATTEMPTS and attempt_errors:
+                await asyncio.sleep(_ASSET_VISUAL_REVIEW_RETRY_BACKOFF_SECONDS)
+        if retryable_errors:
+            raise ModelGatewayError(
+                _visual_review_attempt_failure_message(retryable_errors),
+                logical_models=tuple(
+                    dict.fromkeys(item[0].logical_model for item in retryable_errors)
+                ),
+                deployments=tuple(dict.fromkeys(item[0].id for item in retryable_errors)),
+            )
+        raise NoCapableDeployment("no capable visual asset review deployment: vision")
+
+    async def _gateway(self, deployments: tuple[Deployment, ...]) -> ModelGateway:
+        if not deployments:
+            raise NoCapableDeployment("no capable visual asset review deployment: vision")
+        capacity = (
+            await self._capacity_factory(deployments)
+            if self._capacity_factory is not None
+            else await self._default_capacity(deployments)
+        )
+        return ModelGateway(
+            ModelRegistry(deployments),
+            capacity,
+            TenantSecretResolver(self._secret_service, self._tenant_id),
+            self._transport,
+            capacity_wait_timeout=_ASSET_VISUAL_REVIEW_CAPACITY_WAIT_SECONDS,
+        )
+
+    async def _vision_deployments(self) -> tuple[Deployment, ...]:
+        deployments = tuple(
+            _deployment_from_model_resource(model) for model in await self._list_models()
+        )
+        return tuple(
+            deployment
+            for deployment in deployments
+            if ModelCapability.VISION in deployment.capabilities
+            and not _is_messages_endpoint(deployment.api_base)
+            and _is_visual_review_compatible_deployment(deployment)
+        )
+
+    @staticmethod
+    def _ranked_vision_deployments(deployments: tuple[Deployment, ...]) -> tuple[Deployment, ...]:
+        return tuple(
+            sorted(
+                deployments,
+                key=lambda item: (
+                    _visual_review_provider_priority(item),
+                    safe_operational_limit(
+                        item.max_concurrency,
+                        item.target_utilization,
+                        item.reserved_slots,
+                    ),
+                    item.weight,
+                    item.logical_model,
+                    item.id,
+                ),
+                reverse=True,
+            )
+        )
+
+    async def _default_capacity(
+        self,
+        deployments: tuple[Deployment, ...],
+    ) -> CapacityPool:
+        credentials = CredentialRegistry(
+            [
+                CredentialDescriptor(
+                    secret_ref,
+                    await self._secret_service.fingerprint(self._tenant_id, secret_ref),
+                )
+                for secret_ref in dict.fromkeys(deployment.secret_ref for deployment in deployments)
+            ]
+        )
+        return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
+
+
+_ASSET_VISUAL_REVIEW_SCHEMA: Mapping[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "passed": {"type": "boolean"},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "issues": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "maxItems": 12,
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["passed", "summary", "issues", "confidence"],
+}
+
+
+def _image_data_url(mime_type: str, data: bytes) -> str:
+    if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise ValueError("unsupported visual review image MIME type")
+    if not data or len(data) > 20_000_000:
+        raise ValueError("visual review image bytes must be bounded")
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _asset_visual_review_request(
+    *,
+    deployment: Deployment,
+    label: str,
+    prompt: str,
+    filename: str,
+    review_image_url: str,
+    structured: bool,
+) -> ModelRequest:
+    required_capabilities = {ModelCapability.VISION}
+    response_schema: StructuredResponseSchema | None = None
+    if structured:
+        required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
+        response_schema = StructuredResponseSchema(
+            name="AssetVisualReview",
+            schema=_ASSET_VISUAL_REVIEW_SCHEMA,
+        )
+    return ModelRequest(
+        logical_model=deployment.logical_model,
+        messages=(
+            ModelMessage(
+                role="user",
+                content=(
+                    {
+                        "type": "text",
+                        "text": _asset_visual_review_prompt(
+                            label=label,
+                            prompt=prompt,
+                            filename=filename,
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": review_image_url, "detail": "high"},
+                    },
+                ),
+            ),
+        ),
+        required_capabilities=frozenset(required_capabilities),
+        response_schema=response_schema,
+        max_output_tokens=1200,
+        allow_fallback=False,
+    )
+
+
+def _asset_visual_review_prompt(*, label: str, prompt: str, filename: str) -> str:
+    return (
+        "你是 AI 短剧资产图视觉审核员。只根据随附图片判断它是否能作为指定资产交付，"
+        "不要因为画面好看就放行；如果它更像剧照、海报、随机写真或只覆盖了少量资产，必须拒绝。\n\n"
+        f"资产标签：{label}\n"
+        f"文件名：{filename}\n"
+        f"生成提示词：{prompt[:3000]}\n\n"
+        "审核标准：\n"
+        "0. 所有资产图和分镜图都必须干净、低噪声，只表达当前标签需要锁定的必要信息；"
+        "如果把多个资产类别、无关背景、装饰、小物件、剧照元素或全部剧情信息堆在一张图里，"
+        "导致当前资产类别不清晰，必须判为不通过。除场景资产外，资产设定板应使用纯白/浅灰/"
+        "透明感纯色背景；如果出现办公室、桌面、窗户、室内、街景、墙画、环境光影等具体背景，"
+        "即使主体信息可读，也必须判为不通过。\n"
+        "0a. 所有资产必须严格贴合生成提示词中的剧本锚点：角色姓名、年龄感、职业身份、"
+        "发型服装、关键道具、指定动作、指定特效、地点和画风。审核时必须主动核对这些锚点；"
+        "如果图片只是通用模板、换了人物身份/服装/画风、出现提示词没有要求的黑西装/战术服/"
+        "奇幻职业等漂移，或缺少提示词明确列出的黄色外卖箱、青玉断佩、银针、证件、蓝色电弧"
+        "等关键资产，必须判为不通过。支撑资产可以用小比例占位人物，但也必须沿用剧本角色外观"
+        "和任务，不得自造无关角色。\n"
+        "1. 如果标签是角色/角色锁定/定妆/Character Model Sheet，图片必须像角色参考设定表，"
+        "采用中等复杂度专业设定板结构，至少包含同一角色的主定妆大图、正/侧/背全身三视图、"
+        "3-5 个表情头部变化、服装拆解、1-3 套剧情服装/状态变体、随身物/职业道具、材质色卡，"
+        "以及一致外貌、发型逻辑、年龄感、体态和身份气质。"
+        "每个模块都必须对应角色锚点：表情变化必须是同一张脸的不同情绪，服装展示必须服务职业和剧情场景，"
+        "剧情服装/状态变体可以变化衣服、雨夜/战斗/工作状态，但不能换脸、换年龄感或换职业身份。"
+        "随身物/职业道具必须来自生成提示词中的剧本、职业、剧情任务或明确道具，不得加入剧本或角色设定之外的随机道具。"
+        "文字应为少量清晰中文标签、极少量短标签和栏目标题；如果出现主定妆、三视图、表情、服装、道具、色卡等关键栏目错别字、"
+        "大量乱码、伪字、不可读，或栏目标题存在但内容明显不对应角色锚点，必须判为不通过。"
+        "如果只有单张头像/写真、重复近景、缺少三视图、缺少表情变化、缺少服装/道具/材质细节，"
+        "必须判为不通过。单张剧照、情侣合照、随机写真、风格混杂或身份漂移必须判为不通过。"
+        "人物定妆图必须是纯白/浅灰/透明感纯色背景；"
+        "如果出现室内、街景、道具桌面、窗户、墙画、环境光影或其他具体背景，必须判为不通过，"
+        "因为背景会污染后续人物锁定。脚本角色名默认都是虚构角色，只能按生成提示词中的年龄、"
+        "身份、外貌、服装和剧情职能审核；不要按现实明星、公众人物或同名真人资料判断是否相似，"
+        "除非用户明确要求真实人物或名人复刻。\n"
+        "2. 如果标签是服装妆造资产，应能看出服装、配饰、妆发、材质和色彩基调，且服务角色身份；"
+        "应包含服装拆解、正反面/层次、配饰特写和材质色卡；只有普通人像或无服装细节变化必须判为不通过。"
+        "关键标签大量乱码或服装/配饰不服务角色身份时必须判为不通过。\n"
+        "3. 如果标签是场景资产，应主要呈现场景空间、光线、天气、氛围和可复用背景元素；"
+        "应包含空间视角、纵深层次、光线方向、天气/时间和可复用背景层；"
+        "主角动作占画面主体、看不出地点设定或只有战斗瞬间必须判为不通过。\n"
+        "4. 如果标签是道具资产，应能独立识别多个关键物/随身物/法器/科技物件及细节特写；"
+        "应包含独立物件 lineup、局部特写、比例参考和材质色卡；"
+        "只能包含生成提示词明确要求或剧情/职业必需的道具；随机补充无关物、角色拿道具摆拍、"
+        "道具数量明显不足、关键标签大量乱码或伪字严重影响识别必须判为不通过。\n"
+        "5. 如果标签是动作资产，应体现动作分解、姿态线或多个关键动作参考；"
+        "应包含姿态序列、关键帧、重心变化和运动箭头；单张帅气动作海报、缺少分解信息或动作与提示词无关必须判为不通过。\n"
+        "6. 如果标签是特效资产，应体现特效形态、颜色、层级、触发方式和可复用变化；"
+        "应包含形态分层、强弱层级、扩散方向、触发方式和颜色规则；只有一张战斗画面、特效不可分辨或没有层级变化必须判为不通过。\n"
+        "7. 如果标签是镜头资产，应体现景别、机位、镜头运动、构图或剪辑节奏参考；"
+        "应包含景别机位构图卡、镜头框、机位俯视图、推拉摇移轨迹和剪辑节奏图；普通剧照、宣传图或没有镜头规划信息必须判为不通过。\n"
+        "8. 如果标签是表演节奏/风格锁定资产，应体现表情、眼神、肢体状态、节奏点或整体画风锁定；"
+        "应包含情绪曲线、表情强度、情绪节奏点、肢体状态和色彩/光影风格分区；只有单一表情写真或无法服务剪辑节奏必须判为不通过。\n"
+        "9. 如果标签是分镜图，图片应呈现分镜/镜头规划感，而不是最终宣传剧照。\n\n"
+        "返回严格 JSON：passed:boolean, summary:string, issues:string[], confidence:number。"
+    )
+
+
+def _apply_asset_visual_review_policy(
+    *,
+    label: str,
+    passed: bool,
+    summary: str,
+    issues: tuple[str, ...],
+) -> tuple[bool, str, tuple[str, ...]]:
+    if not passed or _is_scene_asset_label(label):
+        return passed, summary, issues
+    combined = " ".join((label, summary, *issues))
+    if _mentions_concrete_background_pollution(combined):
+        policy_issue = (
+            "非场景类资产出现具体背景、桌面、室内/街景环境或背景污染；"
+            "资产图必须重新生成为干净设定板。"
+        )
+        if policy_issue not in issues:
+            issues = (*issues, policy_issue)
+        summary = summary or policy_issue
+        return False, summary, issues
+    return passed, summary, issues
+
+
+def _is_scene_asset_label(label: str) -> bool:
+    normalized = label.strip().casefold()
+    return "场景" in normalized or "scene" in normalized
+
+
+def _mentions_concrete_background_pollution(text: str) -> bool:
+    normalized = _strip_negated_background_pollution_clauses(text.casefold())
+    pollution_markers = (
+        "背景污染",
+        "场景污染",
+        "背景非纯色",
+        "非纯色背景",
+        "具体背景",
+        "无关背景",
+        "室内背景",
+        "街景背景",
+        "道具桌面",
+        "办公室",
+        "窗户",
+        "天花板",
+        "桌面",
+        "木质桌面",
+        "室内",
+        "街景",
+        "墙画",
+        "环境光影",
+        "路人",
+        "乘客",
+    )
+    return any(marker.casefold() in normalized for marker in pollution_markers)
+
+
+def _strip_negated_background_pollution_clauses(text: str) -> str:
+    background_terms = (
+        "背景污染",
+        "场景污染",
+        "背景非纯色",
+        "非纯色背景",
+        "具体背景",
+        "无关背景",
+        "室内背景",
+        "街景背景",
+        "道具桌面",
+        "办公室",
+        "窗户",
+        "天花板",
+        "桌面",
+        "木质桌面",
+        "室内",
+        "街景",
+        "墙画",
+        "环境光影",
+        "路人",
+        "乘客",
+        "场景",
+        "背景",
+    )
+    term_pattern = "|".join(re.escape(term.casefold()) for term in background_terms)
+    negated_clause = re.compile(
+        rf"(?:无|没有|未见|不含|不存在|并无|不得出现|未出现)[^。；;.!?\n]*"
+        rf"(?:{term_pattern})[^。；;.!?\n]*"
+    )
+    return negated_clause.sub("", text)
+
+
+def _visual_review_modes(deployment: Deployment) -> tuple[bool, ...]:
+    provider_model = deployment.provider_model.casefold()
+    logical_model = deployment.logical_model.casefold()
+    if "minimax" in provider_model or "minimax" in logical_model:
+        return (False,)
+    return (True, False)
+
+
+def _visual_review_provider_priority(deployment: Deployment) -> int:
+    provider_model = deployment.provider_model.casefold()
+    logical_model = deployment.logical_model.casefold()
+    text = f"{provider_model} {logical_model}"
+    if "deepseek" in text:
+        return 40
+    if "qwen" in text or "vl" in text:
+        return 20
+    if "minimax" in text:
+        return 10
+    return 0
+
+
+def _parse_asset_visual_review_payload(raw_response: str | None) -> Mapping[str, object]:
+    if raw_response is None or len(raw_response) > 20_000:
+        raise ValueError("visual asset review response is invalid")
+    normalized = raw_response.strip()
+    if normalized.startswith("```"):
+        lines = normalized.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            normalized = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError:
+        payload = _extract_json_object(normalized)
+    if not isinstance(payload, Mapping):
+        raise TypeError("visual asset review response is invalid")
+    cleaned = dict(payload)
+    passed = cleaned.get("passed")
+    if isinstance(passed, str) and passed.strip().casefold() in {"true", "false"}:
+        cleaned["passed"] = passed.strip().casefold() == "true"
+    if not isinstance(cleaned.get("passed"), bool):
+        raise TypeError("visual asset review response is invalid")
+    if not isinstance(cleaned.get("summary"), str):
+        raise TypeError("visual asset review response is invalid")
+    issues = cleaned.get("issues")
+    if isinstance(issues, str):
+        cleaned["issues"] = [issues]
+    if not isinstance(cleaned.get("issues"), list):
+        raise TypeError("visual asset review response is invalid")
+    confidence = cleaned.get("confidence")
+    if isinstance(confidence, str):
+        try:
+            cleaned["confidence"] = float(confidence.strip())
+        except ValueError:
+            pass
+        confidence = cleaned.get("confidence")
+    if not isinstance(confidence, int | float) or isinstance(confidence, bool):
+        raise TypeError("visual asset review response is invalid")
+    return cleaned
+
+
+def _extract_json_object(raw_response: str) -> object:
+    decoder = json.JSONDecoder()
+    start = raw_response.find("{")
+    while start >= 0:
+        try:
+            payload, _end = decoder.raw_decode(raw_response[start:])
+            return payload
+        except json.JSONDecodeError:
+            start = raw_response.find("{", start + 1)
+    raise ValueError("visual asset review response is invalid") from None
+
+
+def _is_retryable_visual_review_error(error: Exception) -> bool:
+    if isinstance(error, (NoCapableDeployment, ModelGatewayError, ValueError, TypeError)):
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "capacity unavailable",
+            "capacity queue",
+            "capacity backend",
+            "capacity timeout",
+            "transport failed",
+            "response text is empty",
+            "response is empty",
+            "timing unavailable",
+            "visual asset review response is invalid",
+        )
+    )
+
+
+def _visual_review_attempt_failure_message(
+    errors: Sequence[tuple[Deployment, str, Exception]],
+) -> str:
+    summaries: list[str] = []
+    for deployment, phase, error in errors[:8]:
+        error_text = " ".join(str(error).split())[:180] or type(error).__name__
+        summaries.append(f"{deployment.logical_model}/{deployment.id}/{phase}: {error_text}")
+    extra_count = max(len(errors) - len(summaries), 0)
+    suffix = f"; +{extra_count} more" if extra_count else ""
+    return "visual asset review failed for all candidates: " + "; ".join(summaries) + suffix
+
+
+def _is_visual_review_compatible_deployment(deployment: Deployment) -> bool:
+    provider_model = deployment.provider_model.casefold()
+    request_model = (deployment.request_model or "").casefold()
+    model_text = f"{provider_model} {request_model}"
+    return not provider_model.startswith("qwen/") or any(
+        marker in model_text for marker in ("vl", "vision", "omni")
+    )
+
+
+def _is_messages_endpoint(api_base: str) -> bool:
+    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
 
 def _deployment_from_model_resource(model: admin.ModelDeploymentResponse) -> Deployment:
@@ -785,6 +2428,7 @@ def create_app(
     user_admin_service: object | None = None,
     run_service: object | None = None,
     runtime_registry: RuntimeRegistry | None = None,
+    content_studio_service: object | None = None,
     mode_router: ModeRouterProtocol | None = None,
     task_queue: TaskQueue | None = None,
     feishu_gateway: ChannelGatewayProtocol | None = None,
@@ -905,6 +2549,34 @@ def create_app(
                         if configured.workspace_read_roots
                         else configured.attachment_store_dir
                     )
+                    active_multimedia_executor = getattr(
+                        application.state,
+                        "multimedia_generation_executor",
+                        None,
+                    )
+                    active_content_studio_service = AsyncContentStudioService(
+                        registry=load_pack_registry(),
+                        store=PersistentContentProjectStore(
+                            active_sessions,
+                            tenant_id=configured.bootstrap_tenant_id,
+                        ),
+                        execution_mode="production",
+                        production_provider=_ConfigBackedContentStudioProductionProvider(
+                            list_models=cast(
+                                admin.AdminResourceService,
+                                application.state.admin_resource_service,
+                            ).list_models,
+                            secret_service=active_secret_service,
+                            tenant_id=configured.bootstrap_tenant_id,
+                            redis_client=active_redis,
+                            multimedia_generation_executor=cast(
+                                _ConfigBackedMultimediaGenerationExecutor | None,
+                                active_multimedia_executor,
+                            ),
+                            output_dir=configured.generated_artifact_dir / "content-studio",
+                        ),
+                    )
+                    application.state.content_studio_service = active_content_studio_service
                     runtime_capabilities = RuntimeCapabilityGateway(
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=workspace_read_root,
@@ -914,6 +2586,17 @@ def create_app(
                             "multimedia_generation_executor",
                             None,
                         ),
+                        asset_visual_reviewer=_ConfigBackedAssetVisualReviewer(
+                            list_models=cast(
+                                admin.AdminResourceService,
+                                application.state.admin_resource_service,
+                            ).list_models,
+                            secret_service=active_secret_service,
+                            tenant_id=configured.bootstrap_tenant_id,
+                            redis_client=active_redis,
+                        ),
+                        content_studio_service=active_content_studio_service,
+                        content_studio_execution_mode="production",
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
@@ -1113,6 +2796,7 @@ def create_app(
     application.state.bootstrap_tenant_id = configured_settings.bootstrap_tenant_id
     application.state.run_service = run_service
     application.state.runtime_registry = active_runtime_registry
+    application.state.content_studio_service = content_studio_service
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.schedule_service = None
@@ -1152,6 +2836,7 @@ def create_app(
     application.router.routes.extend(system.router.routes)
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
+    application.router.routes.extend(content_studio.router.routes)
     application.router.routes.extend(runs.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)

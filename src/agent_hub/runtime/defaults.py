@@ -1135,7 +1135,7 @@ def _producer_step_timeout(
     selected_roles: tuple[RoleAssignment, ...],
 ) -> float:
     if _is_media_pipeline_execution_context(context, selected_roles):
-        return 300.0
+        return min(max(context.timeout_seconds * 0.9, 1_800.0), 3_600.0)
     return min(
         max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
         300.0,

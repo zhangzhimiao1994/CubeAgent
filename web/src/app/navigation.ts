@@ -37,6 +37,12 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "连续对话、历史会话、运行过程和附件入口集中在这里。",
         permission: "run:read",
       },
+      {
+        to: "/content-studio",
+        label: "Content Studio",
+        description: "创建通用内容项目，查看研究、事实链、脚本、分镜、素材、时间线和 QC 状态。",
+        permission: "run:create",
+      },
     ],
   },
   {

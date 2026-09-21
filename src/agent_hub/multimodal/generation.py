@@ -266,6 +266,9 @@ class MultimediaGenerationExecutor:
                 logical_model=job.logical_model,
                 prompt=job.prompt,
             )
+        except asyncio.CancelledError:
+            self._job_store.fail(job_id, error="multimedia generation cancelled")
+            raise
         except Exception as error:
             self._job_store.fail(job_id, error=str(error))
             raise

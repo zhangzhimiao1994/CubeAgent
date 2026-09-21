@@ -577,6 +577,48 @@ async def test_artifact_review_rejection_hydrates_persisted_run_artifacts(
     assert not any(event["kind"] == "runtime.failed" for event in events)
 
 
+async def test_recovery_restores_artifact_review_wait_after_checkpoint_trailing_approval(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    runtime = ArtifactReviewResumeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="只生成 Character Model Sheet 形式的角色参考设定表图片，不要生成视频",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="artifact-review-recovery-from-running-window",
+    )
+    waiting = await service.execute(submitted.id)
+    assert waiting.status is RunStatus.WAITING_APPROVAL
+    async with run_session_factory() as session, session.begin():
+        row = await session.get(RunRow, submitted.id)
+        assert row is not None
+        row.status = RunStatus.RUNNING.value
+        row.routing_decision = {"conversation_id": "conv-recovery-window"}
+
+    recovered = await service.recover(submitted.id)
+    recovered_record = await repository.get(tenant_id, submitted.id)
+    events = await service.events(tenant_id, submitted.id)
+
+    assert recovered.status is RunStatus.WAITING_APPROVAL
+    assert recovered_record.routing_decision is not None
+    assert recovered_record.routing_decision["approval_kind"] == "runtime_artifact_review"
+    assert recovered_record.routing_decision["approval_id"] == "artifact-review-test"
+    assert recovered_record.routing_decision["approval_stage_id"] == "multimedia_generator_step"
+    assert recovered_record.routing_decision["conversation_id"] == "conv-recovery-window"
+    assert not any(event["kind"] == "runtime.failed" for event in events)
+    assert runtime.calls == 1
+
+
 async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_window(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1177,6 +1219,42 @@ async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(
     assert recovered.status is RunStatus.FAILED
     assert runtime.calls == 1
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
+    assert events[-1]["kind"] == "runtime.failed"
+    assert events[-1]["reason"] == "run recovery has unreplayable events after checkpoint"
+    assert events[-1]["payload"]["trailing_event_kinds"] == ("step.completed", "artifact.created")
+
+
+async def test_fail_run_backfills_runtime_failed_event_when_status_already_failed(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        message="generate assets",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="failed-without-event",
+    )
+    await repository.update_status(tenant_id, submitted.id, RunStatus.FAILED)
+
+    record = await repository.fail_run(
+        submitted.id,
+        reason="runtime failed before diagnostic event was persisted",
+        diagnostics={"error_code": "runtime.failed"},
+    )
+    events = await service.events(tenant_id, submitted.id)
+
+    assert record.status is RunStatus.FAILED
+    assert events[-1]["kind"] == "runtime.failed"
+    assert events[-1]["reason"] == "runtime failed before diagnostic event was persisted"
+    assert events[-1]["payload"]["error_code"] == "runtime.failed"
 
 
 async def test_submission_writes_run_and_outbox_atomically_then_publisher_delivers_once(
@@ -1532,7 +1610,7 @@ async def test_usage_events_are_idempotent_by_run_sequence(
     assert summary.usage_cost_usd == Decimal("0.25")
 
 
-async def test_duplicate_artifact_content_for_same_run_is_idempotent(
+async def test_duplicate_artifact_content_for_same_run_keeps_distinct_lineage_artifacts(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = uuid4()
@@ -1584,7 +1662,8 @@ async def test_duplicate_artifact_content_for_same_run_is_idempotent(
         )
 
     artifacts = await repository.artifacts(tenant_id, submitted.id)
-    assert len(artifacts) == 1
+    artifact_ids = {artifact["id"] for artifact in artifacts}
+    assert artifact_ids == {str(first.id), str(duplicate_content.id)}
 
 
 async def test_public_events_sanitize_sensitive_persisted_payload_keys(

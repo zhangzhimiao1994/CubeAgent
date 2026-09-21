@@ -2411,6 +2411,7 @@ def test_final_video_request_uses_full_asset_locked_pipeline() -> None:
                 },
             },
             token_budget=1000,
+            timeout_seconds=1800,
         ),
         capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
     )
@@ -2439,7 +2440,7 @@ def test_final_video_request_uses_full_asset_locked_pipeline() -> None:
         "shot_video_generator",
         "video_compositor",
     ):
-        assert steps[agent_id].timeout_seconds == 300.0
+        assert steps[agent_id].timeout_seconds == 1800.0
 
 
 def test_script_to_image_request_generates_full_asset_pack_without_video_steps() -> None:

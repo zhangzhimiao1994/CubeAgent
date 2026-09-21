@@ -16,6 +16,30 @@ def test_runtime_timeout_policy_uses_configured_production_window_for_dispatch()
     assert _runtime_timeout_seconds(TaskMode.DISPATCH, configured_seconds=300.0) == 300.0
 
 
+def test_runtime_timeout_policy_extends_full_asset_generation_requests() -> None:
+    assert (
+        _runtime_timeout_seconds(
+            TaskMode.DISPATCH,
+            configured_seconds=300.0,
+            request="我提供剧本如下，请直接生成全量专业资产图，暂时不要生成视频。",
+            routing_decision={},
+        )
+        == 3600.0
+    )
+
+
+def test_runtime_timeout_policy_extends_media_pipeline_plan_requests() -> None:
+    assert (
+        _runtime_timeout_seconds(
+            TaskMode.DISPATCH,
+            configured_seconds=300.0,
+            request="继续生成资产图",
+            routing_decision={"media_pipeline_plan": {"status": "planned"}},
+        )
+        == 3600.0
+    )
+
+
 def test_runtime_timeout_policy_clamps_to_runtime_contract_limit() -> None:
     assert _runtime_timeout_seconds(TaskMode.HYBRID, configured_seconds=7200.0) == 3600.0
 

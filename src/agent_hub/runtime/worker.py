@@ -11,8 +11,14 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
-from agent_hub.app import _ConfigBackedMultimediaGenerationExecutor
+from agent_hub.app import (
+    _ConfigBackedAssetVisualReviewer,
+    _ConfigBackedMultimediaGenerationExecutor,
+)
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.content_studio import AsyncContentStudioService
+from agent_hub.content_studio.packs import load_pack_registry
+from agent_hub.content_studio.repository import PersistentContentProjectStore
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
 from agent_hub.cognitive.repository import (
     PersistentCognitiveRecordRepository,
@@ -35,6 +41,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class WorkerRunService(Protocol):
+    async def recover_worker_orphans(self, limit: int) -> int: ...
+
     async def publish_pending(self, limit: int) -> int: ...
 
     async def execute(self, run_id: UUID) -> object: ...
@@ -77,6 +85,14 @@ async def run_worker_loop(
     idle_polls = 0
     while not stop.is_set():
         try:
+            recovered = await service.recover_worker_orphans(batch_limit)
+        except Exception as error:
+            recovered = 0
+            _LOGGER.exception(
+                "run_worker_recover_orphans_failed error_type=%s",
+                type(error).__name__,
+            )
+        try:
             delivered = await service.publish_pending(batch_limit)
         except Exception as error:
             delivered = 0
@@ -97,7 +113,7 @@ async def run_worker_loop(
             finally:
                 queue.task_done(run_id)
 
-        if delivered:
+        if recovered or delivered:
             idle_polls = 0
             continue
         idle_polls += 1
@@ -152,6 +168,21 @@ def build_worker_service(
                 ),
                 generated_artifact_dir=settings.generated_artifact_dir,
                 multimedia_generation_executor=multimedia_generation_executor,
+                asset_visual_reviewer=_ConfigBackedAssetVisualReviewer(
+                    list_models=admin_resource_service.list_models,
+                    secret_service=secret_service,
+                    tenant_id=settings.bootstrap_tenant_id,
+                    redis_client=redis_client,
+                ),
+                content_studio_service=AsyncContentStudioService(
+                    registry=load_pack_registry(),
+                    store=PersistentContentProjectStore(
+                        database.session_factory,
+                        tenant_id=settings.bootstrap_tenant_id,
+                    ),
+                    execution_mode="production",
+                ),
+                content_studio_execution_mode="production",
             ),
         ),
         router=None,

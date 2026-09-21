@@ -2171,6 +2171,10 @@ button.agent-cluster-status:focus-visible {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
+.artifact-file-card-missing {
+  border-color: rgba(255, 111, 145, 0.34);
+}
+
 .artifact-file-preview {
   background: rgba(3, 10, 20, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.14);
@@ -2264,6 +2268,16 @@ button.agent-cluster-status:focus-visible {
 .artifact-file-card button:disabled {
   cursor: wait;
   opacity: 0.68;
+}
+
+.artifact-file-download-disabled {
+  border: 1px solid rgba(255, 111, 145, 0.28);
+  border-radius: 999px;
+  color: var(--danger);
+  font-size: 0.82rem;
+  font-weight: 900;
+  padding: 0.42rem 0.68rem;
+  white-space: nowrap;
 }
 
 .artifact-file-card a:hover,
@@ -3383,6 +3397,102 @@ button.agent-cluster-status:focus-visible {
 .table-actions button {
   min-height: 2.05rem;
   padding: 0.42rem 0.66rem;
+}
+
+.content-studio-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.content-studio-overview dl {
+  display: grid;
+  gap: 0.45rem 1rem;
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.content-studio-overview dd,
+.content-studio-overview dt {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.content-studio-approval-strip,
+.content-studio-asset-list,
+.content-studio-evidence-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.content-studio-demo-note,
+.content-studio-helper {
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.content-studio-asset-list,
+.content-studio-evidence-list {
+  flex-direction: column;
+}
+
+.content-studio-asset-row {
+  align-items: flex-start;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.5rem;
+  display: flex;
+  gap: 0.65rem;
+  margin: 0;
+  padding: 0.7rem;
+}
+
+.content-studio-asset-row input {
+  flex: 0 0 auto;
+  margin-top: 0.18rem;
+}
+
+.content-studio-asset-row span {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.content-studio-asset-row strong,
+.content-studio-asset-row small {
+  overflow-wrap: anywhere;
+}
+
+.content-studio-grid article p {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.content-studio-grid details {
+  margin-top: 0.65rem;
+}
+
+.content-studio-grid summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.json-preview {
+  background: rgba(2, 8, 18, 0.45);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.75rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  margin: 0.65rem 0 0;
+  max-height: 320px;
+  min-height: 5.5rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 0.75rem;
+  white-space: pre-wrap;
 }
 
 .danger-button,

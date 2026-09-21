@@ -292,6 +292,9 @@ class RunArtifactResponse(BaseModel):
     sha256: str | None = None
     download_url: str | None = None
     expires_at: datetime | None = None
+    visual_review: dict[str, object] | None = None
+    production_metadata: dict[str, str] | None = None
+    generation_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -8399,9 +8402,31 @@ def _expanded_multimedia_run_artifacts(
             run_id=run_id,
             fallback_artifact_id=_optional_event_string(item.get("artifact_id")),
         )
+        title = (
+            item.get("title")
+            or item.get("label")
+            or item.get("filename")
+            or artifact.get("producer")
+            or artifact_id
+        )
+        visual_review = _safe_visual_review_payload(item.get("visual_review"))
+        production_metadata = _safe_production_metadata_payload(item.get("production_metadata"))
+        generation_error = _safe_generation_error_payload(item.get("generation_error"))
         if metadata is None:
+            if generation_error is None and visual_review is None:
+                continue
+            expanded.append(
+                RunArtifactResponse(
+                    id=f"{artifact_id or 'artifact'}:{index}",
+                    kind=str(item.get("kind") or artifact.get("type") or "artifact"),
+                    title=str(title or "artifact"),
+                    text=generation_error,
+                    visual_review=visual_review,
+                    production_metadata=production_metadata,
+                    generation_error=generation_error,
+                )
+            )
             continue
-        title = item.get("filename") or artifact.get("producer") or artifact_id
         expanded.append(
             RunArtifactResponse(
                 id=f"{artifact_id or 'artifact'}:{index}",
@@ -8414,9 +8439,58 @@ def _expanded_multimedia_run_artifacts(
                 sha256=metadata["sha256"],
                 download_url=metadata["download_url"],
                 expires_at=metadata.get("expires_at"),
+                visual_review=visual_review,
+                production_metadata=production_metadata,
+                generation_error=generation_error,
             )
         )
-    return expanded if len(expanded) > 1 else []
+    return expanded
+
+
+def _safe_generation_error_payload(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped[:1000]
+
+
+def _safe_visual_review_payload(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    passed = value.get("passed")
+    summary = value.get("summary")
+    if type(passed) is not bool or type(summary) is not str or not summary.strip():
+        return None
+    payload: dict[str, object] = {
+        "passed": passed,
+        "summary": summary.strip()[:1000],
+    }
+    issues = value.get("issues")
+    if isinstance(issues, list | tuple):
+        payload["issues"] = tuple(
+            item.strip()[:300] for item in issues if type(item) is str and item.strip()
+        )[:12]
+    confidence = value.get("confidence")
+    if isinstance(confidence, int | float) and not isinstance(confidence, bool):
+        payload["confidence"] = max(0.0, min(1.0, float(confidence)))
+    for key in ("logical_model", "deployment_id"):
+        raw = value.get(key)
+        if type(raw) is str and raw.strip():
+            payload[key] = raw.strip()[:128]
+    return payload
+
+
+def _safe_production_metadata_payload(value: object) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    payload: dict[str, str] = {}
+    for key in ("character_id", "look_id", "production_category"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            payload[key] = item.strip()[:128]
+    return payload or None
 
 
 def _public_file_metadata_from_multimedia_item(

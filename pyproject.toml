@@ -19,6 +19,8 @@ dependencies = [
     "fastapi>=0.116,<1",
     "httpx>=0.28,<1",
     "openai>=2,<3",
+    # Content Studio Pack manifests validate PEP 440 versions and compatible_core ranges.
+    "packaging>=26,<27",
     "pillow>=12.3,<13",
     "pydantic-settings>=2.10,<3",
     "pyjwt[crypto]>=2.10,<3",

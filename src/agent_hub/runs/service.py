@@ -51,6 +51,7 @@ _MAX_SUBMISSION_MESSAGE_BYTES = 65_536
 _MAX_CONVERSATION_HISTORY_TOKENS = 12_000
 _CONVERSATION_HISTORY_SHARE = 0.25
 _CONVERSATION_HISTORY_ARTIFACT_NAMESPACE = UUID("8ef85f85-3d8f-42e6-8e90-6a7c57f8d4a2")
+_EXTENDED_MULTIMEDIA_RUNTIME_SECONDS = 3_600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1141,6 +1142,9 @@ class RunService:
                 delivered += 1
         return delivered
 
+    async def recover_worker_orphans(self, limit: int = 100) -> int:
+        return await self._repository.requeue_orphaned_queued_runs(limit)
+
     async def _enqueue_outbox_run(self, run_id: UUID, idempotency_key: str) -> None:
         await self._queue.enqueue_run(run_id, idempotency_key=idempotency_key)
 
@@ -1213,7 +1217,10 @@ class RunService:
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
                 timeout_seconds=_runtime_timeout_seconds(
-                    mode, configured_seconds=self._runtime_timeout_seconds
+                    mode,
+                    configured_seconds=self._runtime_timeout_seconds,
+                    request=request,
+                    routing_decision=routing_decision,
                 ),
                 token_budget=token_budget,
             )
@@ -1260,7 +1267,9 @@ class RunService:
                                 "approval_action": event.action,
                                 "approval_stage_id": event.payload.get("stage_id"),
                                 "approval_artifact_id": event.payload.get("artifact_id"),
-                                "approval_review_items": event.payload.get("review_items"),
+                                "approval_review_items": _artifact_review_items_for_routing(
+                                    event.payload.get("review_items")
+                                ),
                             }
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
@@ -1827,6 +1836,39 @@ def _clean_artifact_review_items(
         seen.add(item_id)
         cleaned.append({"id": item_id[:160], "feedback": feedback[:2000]})
     return tuple(cleaned)
+
+
+def _artifact_review_items_for_routing(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list | tuple):
+        return []
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            continue
+        item_id = item_id.strip()
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        payload: dict[str, str] = {"id": item_id[:240]}
+        for field_name in (
+            "artifact_id",
+            "storage_key",
+            "filename",
+            "sha256",
+            "mime_type",
+            "kind",
+            "title",
+            "feedback",
+        ):
+            field_value = item.get(field_name)
+            if isinstance(field_value, str) and field_value.strip():
+                payload[field_name] = field_value.strip()[:500]
+        cleaned.append(payload)
+    return cleaned
 
 
 def _artifact_review_items_feedback_summary(
@@ -2479,7 +2521,13 @@ def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"
 
 
-def _runtime_timeout_seconds(mode: TaskMode, *, configured_seconds: float) -> float:
+def _runtime_timeout_seconds(
+    mode: TaskMode,
+    *,
+    configured_seconds: float,
+    request: str | None = None,
+    routing_decision: Mapping[str, object] | None = None,
+) -> float:
     del mode
     if (
         isinstance(configured_seconds, bool)
@@ -2487,8 +2535,60 @@ def _runtime_timeout_seconds(mode: TaskMode, *, configured_seconds: float) -> fl
         or not math.isfinite(configured_seconds)
         or configured_seconds <= 0
     ):
-        return 300.0
-    return max(1.0, min(float(configured_seconds), 3600.0))
+        configured_seconds = 300.0
+    bounded = max(1.0, min(float(configured_seconds), 3600.0))
+    if _requires_extended_multimedia_runtime(
+        request=request,
+        routing_decision=routing_decision,
+    ):
+        return max(bounded, min(_EXTENDED_MULTIMEDIA_RUNTIME_SECONDS, 3600.0))
+    return bounded
+
+
+def _requires_extended_multimedia_runtime(
+    *,
+    request: str | None,
+    routing_decision: Mapping[str, object] | None,
+) -> bool:
+    if isinstance(routing_decision, Mapping) and isinstance(
+        routing_decision.get("media_pipeline_plan"), Mapping
+    ):
+        return True
+    if not isinstance(request, str) or not request.strip():
+        return False
+    text = unicodedata.normalize("NFKC", request).casefold()
+    has_generation = any(
+        term in text
+        for term in (
+            "generate",
+            "create",
+            "produce",
+            "make",
+            "生成",
+            "制作",
+            "产出",
+            "直接生成",
+        )
+    )
+    if not has_generation:
+        return False
+    has_script = any(term in text for term in _MEDIA_PIPELINE_SCRIPT_TERMS)
+    has_downstream = any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS)
+    has_asset_pack = any(
+        term in text
+        for term in (
+            "全量专业资产",
+            "全量资产",
+            "专业资产",
+            "制作资产",
+            "图片资产",
+            "素材图",
+            "asset pack",
+            "asset sheet",
+            "production asset",
+        )
+    )
+    return has_script and (has_downstream or has_asset_pack)
 
 
 def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
@@ -3154,6 +3254,8 @@ _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS = (
     "from the previous",
     "previous script",
     "existing script",
+    "script below",
+    "following script",
     "基于",
     "根据",
     "刚才",
@@ -3161,6 +3263,15 @@ _MEDIA_PIPELINE_SCRIPT_REFERENCE_TERMS = (
     "前面",
     "已有",
     "现有",
+    "已确认",
+    "我提供",
+    "用户提供",
+    "提供的剧本",
+    "提供的脚本",
+    "以下剧本",
+    "以下脚本",
+    "剧本如下",
+    "脚本如下",
 )
 _MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS = (
     "from the previous",
@@ -3174,6 +3285,21 @@ _MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS = (
     "前面",
     "已有",
     "现有",
+    "已确认",
+    "我提供",
+    "用户提供",
+    "提供的剧本",
+    "提供的脚本",
+    "上传的剧本",
+    "上传的脚本",
+    "以下剧本",
+    "以下脚本",
+    "以下是剧本",
+    "以下是脚本",
+    "剧本如下",
+    "脚本如下",
+    "剧本正文",
+    "脚本正文",
     "这个剧本",
     "这个脚本",
     "这段剧本",
@@ -3214,6 +3340,15 @@ def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
     text = message.casefold()
     if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
         return None
+    if _is_provided_script_media_pipeline_request(text):
+        return _media_pipeline_plan(
+            source="provided_script",
+            script_status="completed",
+            summary=(
+                "多媒体请求已提供或确认剧本；可直接进入角色参考设定表、全量专业资产图、"
+                "分镜、单镜头视频、剪辑决策表和最终成片等后续阶段。"
+            ),
+        )
     if _is_media_pipeline_script_authoring_request(text):
         return _media_pipeline_plan(
             source="script_request",
@@ -3233,6 +3368,14 @@ def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
             ),
         )
     return None
+
+
+def _is_provided_script_media_pipeline_request(text: str) -> bool:
+    if not any(term in text for term in _MEDIA_PIPELINE_SCRIPT_TERMS):
+        return False
+    if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
+        return False
+    return any(term in text for term in _MEDIA_PIPELINE_CONCRETE_SCRIPT_REFERENCE_TERMS)
 
 
 def _media_pipeline_plan(

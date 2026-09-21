@@ -849,6 +849,16 @@ function compareAgentActivities(left: AgentWorkActivity, right: AgentWorkActivit
   return `${left.kind}:${left.title}`.localeCompare(`${right.kind}:${right.title}`, "zh-CN");
 }
 
+function compareRunEvents(left: RunEvent, right: RunEvent) {
+  if (left.sequence !== right.sequence) return left.sequence - right.sequence;
+  if (left.created_at !== right.created_at) return left.created_at.localeCompare(right.created_at);
+  return left.kind.localeCompare(right.kind);
+}
+
+function runEventsInSequence(detail: RunDetail) {
+  return [...detail.events].sort(compareRunEvents);
+}
+
 function dedupeAgentActivities(agent: AgentWorkItem) {
   const seen = new Set<string>();
   return [...agent.activity, ...agent.outputs].sort(compareAgentActivities).filter((activity) => {
@@ -1483,6 +1493,7 @@ function artifactFingerprint(artifact: RunArtifact | NonNullable<RunEvent["artif
     artifact.size_bytes ?? "",
     artifact.sha256 ?? "",
     artifact.download_url ?? "",
+    stablePayloadFingerprint(artifact.visual_review ?? null),
   ].join("\u001f");
 }
 
@@ -1500,6 +1511,7 @@ function eventFingerprint(event: RunEvent) {
     event.decision ?? "",
     stablePayloadFingerprint(event.payload),
     artifactFingerprint(event.artifact),
+    event.artifacts?.map(artifactFingerprint).join("\u001e") ?? "",
   ].join("\u001f");
 }
 
@@ -1581,6 +1593,8 @@ function fallbackArtifactForEvent(
   artifacts: RunArtifact[],
   consumedArtifactIds: Set<string>,
 ) {
+  if (event.artifacts && event.artifacts.length === 1) return event.artifacts[0];
+  if (event.artifacts && event.artifacts.length > 1) return null;
   if (event.artifact) return event.artifact;
   const explicitArtifactId =
     formatEventPayloadValue(event.payload.artifact_id) ||
@@ -1882,6 +1896,34 @@ function processItemsForEvent(
   agentNames: Map<string, string>,
   artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
 ): ProcessDetailTarget[] {
+  if (!artifact && event.artifacts && event.artifacts.length > 1) {
+    const baseSummary = eventSummaryText(event, agentNames, null, detail.events);
+    const baseRows = [
+      ...modelRowsForEvent(event, detail.events, agentNames),
+      ...eventDetailRows(event, agentNames),
+      { label: "产物数量", value: `${event.artifacts.length}` },
+    ];
+    const baseItem: ProcessDetailTarget = {
+      id: `${detail.id}-event-${event.sequence}-${index}`,
+      title: displayEventTitle(event, agentNames),
+      message: baseSummary,
+      badge: processBadgeForEvent(event),
+      rows: baseRows,
+      createdAt: event.created_at,
+      event,
+    };
+    const artifactItems = event.artifacts.map((item, artifactIndex) => ({
+      id: `${detail.id}-event-${event.sequence}-${index}-artifact-${item.id || artifactIndex}`,
+      title: item.title || `产物 ${artifactIndex + 1}`,
+      message: eventArtifactText(item) || [item.title, item.filename].filter((value) => value?.trim()).join(" · "),
+      badge: "中间产物",
+      rows: eventArtifactRows(item),
+      createdAt: event.created_at,
+      event,
+      artifact: item,
+    }));
+    return [baseItem, ...artifactItems];
+  }
   const baseRows = [
     ...modelRowsForEvent(event, detail.events, agentNames),
     ...eventDetailRows(event, agentNames),
@@ -1937,6 +1979,7 @@ function runProcessItems(
   agentNames: Map<string, string>,
   mainAgentModelName?: string,
 ): ProcessDetailTarget[] {
+  const events = runEventsInSequence(detail);
   const routingRows = processRoutingRows(detail, agentNames, mainAgentModelName);
   const routingAgentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
   const routingItem =
@@ -1953,7 +1996,7 @@ function runProcessItems(
         ]
       : [];
   const consumedArtifactIds = new Set<string>();
-  const eventItems = detail.events
+  const eventItems = events
     .filter(isActionEvent)
     .flatMap((event, index) => {
       const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
@@ -2117,7 +2160,7 @@ function outputActivityFromArtifact(
   index: number,
 ): AgentWorkActivity | null {
   const text = eventArtifactText(artifact);
-  const summary = text || artifact.title;
+  const summary = text || [artifact.title, artifact.filename].filter((item) => item?.trim()).join(" · ");
   if (!summary) return null;
   return {
     id: `${detail.id}-agent-${agent.key}-artifact-${artifact.id || index}`,
@@ -2137,6 +2180,7 @@ function buildAgentWorkItems(
   agentNames: Map<string, string>,
   mainAgentModelName?: string,
 ): AgentWorkItem[] {
+  const events = runEventsInSequence(detail);
   const groups = new Map<
     string,
     {
@@ -2178,18 +2222,23 @@ function buildAgentWorkItems(
     .filter(Boolean)
     .forEach((agentId) => ensureGroup(agentId));
 
-  detail.events.forEach((event) => {
+  events.forEach((event) => {
     const key = agentKeyFromEvent(event);
     eventAgentKeys.set(event.sequence, key);
     ensureGroup(key, event).events.push(event);
   });
 
   const artifactAgentKeys = new Map<string, string>();
-  detail.events.forEach((event) => {
+  events.forEach((event) => {
     const artifactId = artifactIdFromEvent(event);
     const key = eventAgentKeys.get(event.sequence) ?? agentKeyFromEvent(event);
     if (artifactId) artifactAgentKeys.set(artifactId, key);
-    if (event.artifact) {
+    event.artifacts?.forEach((artifact) => {
+      artifactAgentKeys.set(artifact.id, key);
+      const group = ensureGroup(key, event);
+      if (!group.artifacts.some((candidate) => candidate.id === artifact.id)) group.artifacts.push(artifact);
+    });
+    if (event.artifact && (!event.artifacts || event.artifacts.length === 0)) {
       const group = ensureGroup(key, event);
       if (!group.artifacts.some((artifact) => artifact.id === event.artifact?.id)) group.artifacts.push(event.artifact);
     }
@@ -2207,7 +2256,7 @@ function buildAgentWorkItems(
 
   const consumedArtifactIds = new Set<string>();
   const eventTargets = new Map<number, ProcessDetailTarget[]>();
-  detail.events
+  events
     .filter(isActionEvent)
     .forEach((event, index) => {
       const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
@@ -3004,7 +3053,7 @@ function ArtifactReviewApprovalCard({
                       ))}
                     </small>
                   ) : null}
-                  {itemArtifact && hasArtifactDownload(itemArtifact) ? (
+                  {itemArtifact ? (
                     <ArtifactFileCard artifact={itemArtifact} compact />
                   ) : null}
                   {decision === "rejected" ? (
@@ -3030,9 +3079,9 @@ function ArtifactReviewApprovalCard({
       ) : (
         <>
           {artifacts.length > 1 ? <p>本阶段共 {artifacts.length} 个文件，请按整组产物审核。</p> : null}
-          {artifacts.map((artifact) =>
-            hasArtifactDownload(artifact) ? <ArtifactFileCard key={artifact.id} artifact={artifact} compact /> : null,
-          )}
+          {artifacts.map((artifact) => (
+            <ArtifactFileCard key={artifact.id} artifact={artifact} compact />
+          ))}
           <label className="artifact-review-feedback">
             <span>退回意见</span>
             <textarea

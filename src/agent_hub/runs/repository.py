@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -82,6 +82,48 @@ class RunConflict(RuntimeError):
 
 class RunAlreadyActive(RuntimeError):
     """The run is already owned by another worker."""
+
+
+def _trailing_events_are_observer_only(events: tuple[RunEventRow, ...]) -> bool:
+    return bool(events) and all(event.kind == "observer.notice" for event in events)
+
+
+def _recover_runtime_artifact_review_wait(
+    routing_decision: Mapping[str, object] | None,
+    events: tuple[RunEventRow, ...],
+) -> dict[str, object] | None:
+    meaningful = tuple(event for event in events if event.kind != "observer.notice")
+    if not meaningful:
+        return None
+    if len(meaningful) != 1:
+        return None
+    event = meaningful[0]
+    if event.kind != EventKind.APPROVAL_REQUESTED.value:
+        return None
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    event_payload = payload.get("payload")
+    if not isinstance(event_payload, Mapping):
+        return None
+    if payload.get("action") != "artifact_review":
+        return None
+    if event_payload.get("approval_kind") != "runtime_artifact_review":
+        return None
+    approval_id = payload.get("approval_id")
+    stage_id = event_payload.get("stage_id")
+    artifact_id = event_payload.get("artifact_id")
+    if not isinstance(approval_id, str) or not isinstance(stage_id, str) or not isinstance(artifact_id, str):
+        return None
+    existing = {} if routing_decision is None else dict(routing_decision)
+    return {
+        **existing,
+        "reason": "runtime_artifact_review_required",
+        "approval_kind": "runtime_artifact_review",
+        "approval_id": approval_id,
+        "approval_action": payload.get("action"),
+        "approval_stage_id": stage_id,
+        "approval_artifact_id": artifact_id,
+        "approval_review_items": _artifact_review_items(event_payload.get("review_items")),
+    }
 
 
 _SENSITIVE_PUBLIC_KEYS = frozenset(
@@ -700,6 +742,46 @@ class RunRepository:
                 select(func.max(RunEventRow.sequence)).where(RunEventRow.run_id == row.id)
             )
             if latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence:
+                trailing_events = tuple(
+                    await session.scalars(
+                        select(RunEventRow)
+                        .where(
+                            RunEventRow.run_id == row.id,
+                            RunEventRow.sequence > checkpoint_sequence,
+                        )
+                        .order_by(RunEventRow.sequence)
+                    )
+                )
+                recovered_review = _recover_runtime_artifact_review_wait(
+                    row.routing_decision,
+                    trailing_events,
+                )
+                if recovered_review is not None:
+                    row.routing_decision = recovered_review
+                    row.status = RunStatus.WAITING_APPROVAL.value
+                    row.version += 1
+                    await session.flush()
+                    return self._record(row)
+                if _trailing_events_are_observer_only(trailing_events):
+                    return row, checkpoint
+                reason = "run recovery has unreplayable events after checkpoint"
+                await self.persist_event(
+                    session,
+                    tenant_id=row.tenant_id,
+                    run_id=row.id,
+                    event=RunEvent(
+                        kind=EventKind.RUNTIME_FAILED,
+                        sequence=latest_event_sequence + 1,
+                        run_id=row.id,
+                        reason=reason,
+                        payload={
+                            **runtime_failure_diagnostic_from_reason(reason),
+                            "checkpoint_sequence": checkpoint_sequence,
+                            "latest_event_sequence": latest_event_sequence,
+                            "trailing_event_kinds": tuple(event.kind for event in trailing_events),
+                        },
+                    ),
+                )
                 row.status = RunStatus.FAILED.value
                 row.version += 1
                 await session.flush()
@@ -802,8 +884,23 @@ class RunRepository:
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
             current = RunStatus(row.status)
-            if current in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+            if current in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
                 return self._record(row)
+            if current is RunStatus.FAILED:
+                has_failure_event = await session.scalar(
+                    select(func.count(RunEventRow.id)).where(
+                        RunEventRow.run_id == run_id,
+                        RunEventRow.kind.in_(
+                            (
+                                EventKind.RUNTIME_FAILED.value,
+                                EventKind.STEP_FAILED.value,
+                                EventKind.TOOL_FAILED.value,
+                            )
+                        ),
+                    )
+                )
+                if has_failure_event:
+                    return self._record(row)
             sequence = (
                 await session.scalar(
                     select(func.max(RunEventRow.sequence)).where(RunEventRow.run_id == run_id)
@@ -864,6 +961,47 @@ class RunRepository:
             row.delivered_at = func.now()
             await session.flush()
             return True
+
+    async def requeue_orphaned_queued_runs(self, limit: int = 100) -> int:
+        stale_before = datetime.now(UTC) - timedelta(seconds=10)
+        async with self._session_factory() as session, session.begin():
+            pending_outbox_exists = (
+                select(RunOutboxRow.id)
+                .where(
+                    RunOutboxRow.run_id == RunRow.id,
+                    RunOutboxRow.delivered.is_(False),
+                )
+                .exists()
+            )
+            rows = (
+                await session.scalars(
+                    select(RunRow)
+                    .where(
+                        RunRow.status == RunStatus.QUEUED.value,
+                        RunRow.mode.is_not(None),
+                        RunRow.updated_at < stale_before,
+                        ~pending_outbox_exists,
+                    )
+                    .order_by(RunRow.updated_at, RunRow.id)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            ).all()
+            for row in rows:
+                session.add(
+                    RunOutboxRow(
+                        id=uuid4(),
+                        tenant_id=row.tenant_id,
+                        run_id=row.id,
+                        task_name="agent_hub.runs.execute",
+                        idempotency_key=(
+                            f"{row.tenant_id}:{row.id}:worker-orphan-queued:{row.version}"
+                        ),
+                        payload={"run_id": str(row.id)},
+                    )
+                )
+            await session.flush()
+            return len(rows)
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
         async with self._session_factory() as session:
@@ -1161,7 +1299,7 @@ class RunRepository:
                 content_sha256=artifact.content_sha256,
                 payload=artifact.to_payload(),
             )
-            .on_conflict_do_nothing()
+            .on_conflict_do_nothing(index_elements=[RunArtifactRow.id])
         )
 
     @staticmethod
@@ -1173,6 +1311,28 @@ class RunRepository:
     ) -> None:
         assert event.checkpoint is not None
         checkpoint = event.checkpoint
+        raw_registry = checkpoint.state.get("artifact_registry")
+        if not isinstance(raw_registry, Mapping):
+            raise RuntimeError("runtime checkpoint artifact registry is invalid")
+        registry_ids: list[UUID] = []
+        for artifact_id in raw_registry:
+            if type(artifact_id) is not str:
+                raise RuntimeError("runtime checkpoint artifact registry is invalid")
+            try:
+                registry_ids.append(UUID(artifact_id))
+            except ValueError:
+                raise RuntimeError("runtime checkpoint artifact registry is invalid") from None
+        if registry_ids:
+            stored_ids = set(
+                await session.scalars(
+                    select(RunArtifactRow.id)
+                    .where(RunArtifactRow.tenant_id == tenant_id)
+                    .where(RunArtifactRow.run_id == run_id)
+                    .where(RunArtifactRow.id.in_(registry_ids))
+                )
+            )
+            if stored_ids != set(registry_ids):
+                raise RuntimeError("runtime checkpoint references unpersisted artifacts")
         await session.execute(
             insert(RunCheckpointRow)
             .values(
@@ -1351,14 +1511,26 @@ def _artifact_review_items(value: object) -> list[dict[str, str]]:
         if not isinstance(item, Mapping):
             continue
         item_id = item.get("id")
-        if not isinstance(item_id, str) or not item_id.strip() or item_id in seen:
+        if not isinstance(item_id, str):
+            continue
+        item_id = item_id.strip()
+        if not item_id or item_id in seen:
             continue
         seen.add(item_id)
-        cleaned: dict[str, str] = {"id": item_id.strip()}
-        for field_name in ("artifact_id", "filename", "sha256", "mime_type", "kind", "title", "feedback"):
+        cleaned: dict[str, str] = {"id": item_id[:240]}
+        for field_name in (
+            "artifact_id",
+            "storage_key",
+            "filename",
+            "sha256",
+            "mime_type",
+            "kind",
+            "title",
+            "feedback",
+        ):
             field_value = item.get(field_name)
             if isinstance(field_value, str) and field_value.strip():
-                cleaned[field_name] = field_value.strip()
+                cleaned[field_name] = field_value.strip()[:500]
         items.append(cleaned)
     return items
 

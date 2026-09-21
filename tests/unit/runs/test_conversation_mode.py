@@ -551,6 +551,42 @@ async def test_auto_submission_does_not_reuse_previous_direct_mode_for_script_fi
     assert plan["source"] == "script_request"
 
 
+async def test_auto_submission_routes_provided_script_asset_pack_as_media_pipeline() -> None:
+    repository = ConversationModeRepository(TaskMode.DIRECT)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=(
+            "以下剧本已确认，请按新短剧流程只执行资产拆解与资产图生成，"
+            "暂时不要生成分镜、视频或剪辑。必须生成全量专业资产图并停在用户审核。"
+            "剧本《霓虹龙脉》：雨夜的江城，外卖员林烬送单到废弃地铁站。"
+        ),
+        mode=TaskMode.AUTO,
+        conversation_id="conv-provided-script-assets",
+        idempotency_key="idem-provided-script-assets",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "current_artifact_delivery_request"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    plan = routing.get("media_pipeline_plan")
+    assert isinstance(plan, dict)
+    assert plan["source"] == "provided_script"
+    assert plan["stages"][0]["status"] == "completed"
+
+
 async def test_auto_submission_does_not_reuse_previous_direct_mode_for_script_generation() -> None:
     repository = ConversationModeRepository(TaskMode.DIRECT)
     router = WaitingRouter()

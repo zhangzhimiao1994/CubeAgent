@@ -1,0 +1,13 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "style",
+  "name": "fast_minimal",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "subtitle_style": "large safe-area captions",
+    "visual_language": "screen capture, cards, charts, concise motion",
+    "transition": "quick cut"
+  }
+}

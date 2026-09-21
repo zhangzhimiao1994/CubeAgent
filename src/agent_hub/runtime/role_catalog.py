@@ -147,6 +147,32 @@ def _daily_work_roles() -> tuple[RoleDefinition, ...]:
         _role("copywriter", "Copywriter", "execute", "Produce practical copy, scripts, titles, posts, and message variants.", ("What copy was produced?", "Which version is recommended?", "What needs review?"), ("copywriting",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         _role("video_editor", "Video Editor", "execute", "Produce edit structure, pacing, shot order, transitions, captions, and asset notes.", ("What prompt or edit structure was produced?", "Which sequence is recommended?", "What visual asset is missing?"), ("editing",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         RoleDefinition(
+            id="content_producer",
+            role="Content Producer",
+            purpose="execute",
+            mission=(
+                "Create and operate Content Studio projects for factual short-form content. "
+                "Use content_studio to create projects, run staged research/evidence/fact-check/"
+                "script/storyboard/assets/timeline/QC workflows, revise only affected stages, "
+                "approve script/final gates, and retry from the latest valid checkpoint."
+            ),
+            must_answer=(
+                "What Content Studio project operation was performed?",
+                "What project status and approval gate is next?",
+                "Which upstream or downstream stages were preserved or invalidated?",
+            ),
+            allowed_tools=("read_context", "content_studio"),
+            forbidden_actions=(
+                "do not store project state only in chat history",
+                "do not bypass fact check before script production",
+                "do not call multimedia generation directly for Content Studio state changes",
+            ),
+            skills=("content-production", "fact-checking", "video-planning"),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
             id="asset_generator",
             role="Asset Generator",
             purpose="execute",

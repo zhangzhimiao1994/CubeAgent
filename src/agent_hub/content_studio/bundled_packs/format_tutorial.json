@@ -1,0 +1,11 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "format",
+  "name": "tutorial",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "structure": "tutorial"
+  }
+}

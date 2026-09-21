@@ -217,6 +217,17 @@ class RolePlanner:
         else:
             role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
+        if request.mode is not TaskMode.DISCUSS and _is_content_studio_request(request.task):
+            content_specs = tuple(
+                spec for spec in catalog_specs if spec[0] == "content_producer"
+            )
+            roles = tuple(_assignment(spec, request) for spec in content_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
         if request.mode is not TaskMode.DISCUSS and _is_asset_locked_video_pipeline_request(
             request.task
         ):
@@ -962,6 +973,26 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "图生视频",
             "edit",
             "caption",
+        ),
+        "content_producer": (
+            "content studio",
+            "aigc",
+            "科普视频",
+            "教程视频",
+            "快讯视频",
+            "解释视频",
+            "事实核查",
+            "fact check",
+            "evidence",
+            "research",
+            "证据链",
+            "官方链接",
+            "脚本",
+            "分镜",
+            "预览",
+            "qc",
+            "douyin",
+            "抖音",
         ),
         "video_compositor": (
             "compose_video",
@@ -2027,14 +2058,21 @@ _CONCRETE_SCRIPT_CONTEXT_TERMS = (
     "提供的脚本",
     "上传的剧本",
     "上传的脚本",
+    "已确认剧本",
+    "已批准剧本",
+    "确认的剧本",
+    "批准的剧本",
     "以下剧本",
     "以下脚本",
     "以下是剧本",
     "以下是脚本",
+    "下面已确认剧本",
+    "下面已批准剧本",
     "剧本如下",
     "脚本如下",
     "剧本正文",
     "脚本正文",
+    "剧本角色",
     "这个剧本",
     "这个脚本",
     "这段剧本",
@@ -2120,17 +2158,21 @@ def _is_script_first_asset_image_request(task: str) -> bool:
     has_reference = any(term in normalized for term in _SCRIPT_MEDIA_REFERENCE_TERMS) or any(
         marker in normalized
         for marker in ("然后", "之后", "确认后", "再", "随后", "接着", "after", "then", "next")
-    )
+    ) or _has_concrete_script_context(task)
     has_asset_image = any(
         term in normalized
         for term in (
             "全量资产",
             "专业资产",
+            "全量专业资产",
+            "资产拆解",
             "图片",
             "图像",
             "资产图",
             "素材图",
+            "制作资产",
             "设定图",
+            "设定板",
             "参考图",
             "image",
             "images",
@@ -2139,6 +2181,44 @@ def _is_script_first_asset_image_request(task: str) -> bool:
         )
     )
     return has_script and has_reference and has_asset_image
+
+
+def _is_content_studio_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if "content_studio" in normalized or "content studio" in normalized:
+        return True
+    content_video_terms = (
+        "科普视频",
+        "教程视频",
+        "快讯视频",
+        "解释视频",
+        "短视频",
+        "60 秒",
+        "60秒",
+        "douyin",
+        "抖音",
+        "竖屏视频",
+        "content project",
+    )
+    factual_terms = (
+        "aigc",
+        "ai frontier",
+        "官方链接",
+        "官方文档",
+        "release notes",
+        "github release",
+        "论文",
+        "research",
+        "evidence",
+        "fact check",
+        "事实核查",
+        "证据链",
+        "claim",
+        "qc",
+    )
+    if not any(term in normalized for term in content_video_terms):
+        return False
+    return any(term in normalized for term in factual_terms)
 
 
 def _is_video_composition_request(task: str) -> bool:

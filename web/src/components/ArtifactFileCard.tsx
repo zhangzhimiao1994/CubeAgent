@@ -13,6 +13,10 @@ export function artifactFileName(artifact: ArtifactFile) {
   return artifact.filename?.trim() || artifact.title || artifact.id;
 }
 
+function artifactDisplayName(artifact: ArtifactFile) {
+  return artifact.title?.trim() || artifactFileName(artifact);
+}
+
 function formatFileSize(sizeBytes: number | null | undefined) {
   if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes < 0) return "";
   if (sizeBytes < 1024) return `${sizeBytes} B`;
@@ -34,6 +38,22 @@ function formatExpiry(expiresAt: string | null | undefined) {
   return `有效至 ${date.toLocaleString("zh-CN", { hour12: false })}`;
 }
 
+function visualReviewLabel(artifact: ArtifactFile) {
+  const review = artifact.visual_review;
+  if (!review?.summary?.trim()) return "";
+  return `${review.passed ? "视觉审核通过" : "视觉审核未通过"}：${review.summary.trim()}`;
+}
+
+function productionMetadataLabels(artifact: ArtifactFile) {
+  const metadata = artifact.production_metadata;
+  if (!metadata) return [];
+  return [
+    metadata.production_category ? `类别 ${metadata.production_category}` : "",
+    metadata.character_id ? `Character ${metadata.character_id}` : "",
+    metadata.look_id ? `Look ${metadata.look_id}` : "",
+  ].filter(Boolean);
+}
+
 function downloadLabel(mimeType: string | null | undefined) {
   if (mimeType?.startsWith("image/")) return "下载图片";
   if (mimeType?.startsWith("video/")) return "下载视频";
@@ -45,30 +65,45 @@ export function ArtifactFileCard({
   artifact,
   compact = false,
 }: {
-  artifact: ArtifactFile & { download_url: string };
+  artifact: ArtifactFile;
   compact?: boolean;
 }) {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
   const filename = artifactFileName(artifact);
+  const displayName = artifactDisplayName(artifact);
   const size = formatFileSize(artifact.size_bytes);
   const mimeType = artifact.mime_type?.trim();
   const checksum = artifact.sha256?.trim();
   const expiry = formatExpiry(artifact.expires_at);
-  const meta = [artifact.kind, size, mimeType, expiry].filter(Boolean);
+  const reviewMeta = visualReviewLabel(artifact);
+  const downloadUrl = artifact.download_url?.trim() || "";
+  const hasDownload = downloadUrl.length > 0;
+  const generationError =
+    artifact.generation_error?.trim() || (!hasDownload ? artifact.text?.trim() || "" : "");
+  const meta = [
+    filename !== displayName ? filename : "",
+    ...productionMetadataLabels(artifact),
+    reviewMeta,
+    generationError ? `生成失败：${generationError}` : "",
+    artifact.kind,
+    size,
+    mimeType,
+    expiry,
+  ].filter(Boolean);
   const isImage = mimeType?.startsWith("image/") ?? false;
   const actionLabel = downloadLabel(mimeType);
 
   useEffect(() => {
-    if (!isImage || compact) {
+    if (!isImage || compact || !hasDownload) {
       setPreviewUrl("");
       return undefined;
     }
     let cancelled = false;
     let objectUrl = "";
     void api
-      .downloadGeneratedFile(artifact.download_url)
+      .downloadGeneratedFile(downloadUrl)
       .then((downloaded) => {
         if (cancelled) return;
         objectUrl = URL.createObjectURL(downloaded.blob);
@@ -81,14 +116,15 @@ export function ArtifactFileCard({
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [artifact.download_url, compact, isImage]);
+  }, [compact, downloadUrl, hasDownload, isImage]);
 
   async function downloadFile(event: React.MouseEvent<HTMLButtonElement>) {
     event.stopPropagation();
+    if (!hasDownload) return;
     setDownloading(true);
     setError("");
     try {
-      const downloaded = await api.downloadGeneratedFile(artifact.download_url);
+      const downloaded = await api.downloadGeneratedFile(downloadUrl);
       const url = URL.createObjectURL(downloaded.blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -107,13 +143,13 @@ export function ArtifactFileCard({
   }
 
   return (
-    <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}${isImage ? " artifact-file-card-image" : ""}`}>
-      {previewUrl ? <img className="artifact-file-preview" src={previewUrl} alt={filename} /> : null}
+    <div className={`artifact-file-card${compact ? " artifact-file-card-compact" : ""}${isImage ? " artifact-file-card-image" : ""}${hasDownload ? "" : " artifact-file-card-missing"}`}>
+      {previewUrl ? <img className="artifact-file-preview" src={previewUrl} alt={displayName} /> : null}
       <span className="artifact-file-icon" aria-hidden="true">
         {isImage ? "IMG" : "FILE"}
       </span>
       <div className="artifact-file-main">
-        <strong>{filename}</strong>
+        <strong>{displayName}</strong>
         {meta.length > 0 ? (
           <small className="artifact-file-meta">
             {meta.map((item) => (
@@ -128,15 +164,21 @@ export function ArtifactFileCard({
           </small>
         ) : null}
       </div>
-      <button
-        type="button"
-        className="artifact-file-download"
-        onClick={downloadFile}
-        disabled={downloading}
-        aria-label={`下载 ${filename}`}
-      >
-        {downloading ? "下载中" : actionLabel}
-      </button>
+      {hasDownload ? (
+        <button
+          type="button"
+          className="artifact-file-download"
+          onClick={downloadFile}
+          disabled={downloading}
+          aria-label={`下载 ${filename}`}
+        >
+          {downloading ? "下载中" : actionLabel}
+        </button>
+      ) : (
+        <span className="artifact-file-download artifact-file-download-disabled">
+          待重试
+        </span>
+      )}
     </div>
   );
 }

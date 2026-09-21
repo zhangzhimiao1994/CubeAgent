@@ -1513,7 +1513,10 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
     expect(screen.getByText("running")).not.toBeNull();
-    expect(screen.getByText("markdown：短视频脚本")).not.toBeNull();
+    const artifactsSection = screen.getByRole("heading", { name: "产物" }).closest("article");
+    expect(artifactsSection).not.toBeNull();
+    expect(within(artifactsSection as HTMLElement).getByText("短视频脚本")).not.toBeNull();
+    expect(within(artifactsSection as HTMLElement).getByText("markdown")).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "暂停" }));
 
     await waitFor(() => expect(screen.getByText("paused")).not.toBeNull());
@@ -2113,6 +2116,80 @@ describe("operational management pages", () => {
     const artifactDetail = await screen.findByRole("dialog", { name: "活动详情" });
     const drawerDownload = within(artifactDetail).getByRole("button", { name: /下载 hello-world-python\.zip/ });
     expect((drawerDownload as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("shows every expanded multimedia event artifact in the agent work drawer", async () => {
+    const user = userEvent.setup();
+    const characterAsset = {
+      id: "media-tool-result:1",
+      kind: "image",
+      title: "角色锁定资产",
+      text: null,
+      filename: "kling-character.png",
+      mime_type: "image/png",
+      size_bytes: 1024,
+      sha256: "a".repeat(64),
+      download_url:
+        "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333331/download",
+    } as RunDetail["artifacts"][number] & { download_url: string };
+    const sceneAsset = {
+      id: "media-tool-result:2",
+      kind: "image",
+      title: "场景资产",
+      text: null,
+      filename: "kling-scene.png",
+      mime_type: "image/png",
+      size_bytes: 2048,
+      sha256: "b".repeat(64),
+      download_url:
+        "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333332/download",
+    } as RunDetail["artifacts"][number] & { download_url: string };
+    visibleRunDetail = {
+      ...runDetail,
+      status: "completed",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "asset_generator",
+          participants: [],
+          tool_name: "generate_multimedia",
+          step_id: "asset_generator_step",
+          action: null,
+          decision: null,
+          payload: { artifact_id: "media-tool-result" },
+          artifact: {
+            id: "media-tool-result",
+            kind: "tool_result",
+            title: "asset_generator",
+            text: null,
+          },
+          artifacts: [characterAsset, sceneAsset],
+        },
+      ],
+      artifacts: [],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "asset_generator",
+      },
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /查看 Agent 工作席/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+
+    expect(within(drawer).getAllByText(/角色锁定资产/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/场景资产/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/kling-character\.png/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/kling-scene\.png/).length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("asset_generator 输出：asset_generator")).toBeNull();
   });
 
   it("renders markdown tables inside assistant chat replies as real tables", async () => {
@@ -3205,7 +3282,7 @@ describe("operational management pages", () => {
             result: "采用灯谜游园会，压缩签到流程。",
           },
         },
-      ],
+      ].reverse(),
       artifacts: [
         ...runDetail.artifacts,
         {
@@ -4668,7 +4745,7 @@ describe("operational management pages", () => {
     await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
 
     const reviewCard = screen.getByLabelText("中间产物审核");
-    expect(within(reviewCard).getByText("角色参考设定表")).not.toBeNull();
+    expect(within(reviewCard).getByRole("heading", { name: "角色参考设定表" })).not.toBeNull();
     expect(within(reviewCard).getByText("character_model_sheet")).not.toBeNull();
     await user.click(within(reviewCard).getByRole("button", { name: "确认放行" }));
 

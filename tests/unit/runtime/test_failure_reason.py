@@ -82,6 +82,13 @@ def test_safe_runtime_failure_reason_keeps_non_secret_token_diagnostics() -> Non
     )
 
 
+def test_safe_runtime_failure_reason_names_empty_timeout_error() -> None:
+    assert (
+        safe_runtime_failure_reason(TimeoutError(), fallback="capability execution failed")
+        == "operation timed out"
+    )
+
+
 def test_safe_runtime_failure_diagnostic_classifies_provider_auth_failure() -> None:
     diagnostic = safe_runtime_failure_diagnostic(
         ModelTransportError("Authorization: Bearer sk-secret", status_code=401)
