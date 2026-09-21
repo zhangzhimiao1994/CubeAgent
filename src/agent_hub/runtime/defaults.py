@@ -47,6 +47,7 @@ from agent_hub.runtime.plugin_context import (
     requested_plugin_context_text,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.role_catalog import RoleDefinition, default_role_catalog
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
     RolePlanner,
@@ -802,6 +803,7 @@ def _dispatch_plan(
                 model="main",
             ),
         )
+    selected_roles = _roles_for_media_pipeline_plan(selected_roles, context)
     plan_allowed_tools = _plan_allowed_tools(
         selected_roles,
         context,
@@ -936,6 +938,64 @@ def _dispatch_plan(
         total_token_budget=context.token_budget,
         total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
         total_cost_usd=Decimal(0),
+    )
+
+
+def _roles_for_media_pipeline_plan(
+    selected_roles: tuple[RoleAssignment, ...],
+    context: TaskContext,
+) -> tuple[RoleAssignment, ...]:
+    if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
+        return selected_roles
+    by_id = {role.id: role for role in selected_roles}
+    catalog_roles = {
+        role.id: _assignment_from_definition(
+            role,
+            default_model=_string_or_default(
+                context.routing_decision.get("main_agent_model"),
+                "main",
+            ),
+        )
+        for role in default_role_catalog().roles_for(
+            mode=context.mode.value,
+            profile=TaskProfile.GENERAL.value,
+            high_risk=False,
+        )
+    }
+    stage_ids = (
+        "asset_generator",
+        "storyboard_artist",
+        "shot_video_generator",
+        "video_compositor",
+    )
+    ordered_ids: list[str] = []
+    if "copywriter" in by_id or _request_requires_asset_locked_pipeline_review(context.request):
+        ordered_ids.append("copywriter")
+    ordered_ids.extend(stage_ids)
+    roles: list[RoleAssignment] = []
+    for role_id in ordered_ids:
+        role = by_id.get(role_id) or catalog_roles.get(role_id)
+        if role is not None:
+            roles.append(role)
+    return tuple(roles)
+
+
+def _assignment_from_definition(
+    definition: RoleDefinition,
+    *,
+    default_model: str,
+) -> RoleAssignment:
+    return RoleAssignment(
+        id=definition.id,
+        role=definition.role,
+        purpose=RolePurpose(definition.purpose),
+        mission=definition.mission,
+        must_answer=definition.must_answer,
+        allowed_tools=definition.allowed_tools,
+        forbidden_actions=definition.forbidden_actions,
+        skills=definition.skills,
+        output_schema=definition.output_schema,
+        model=default_model,
     )
 
 

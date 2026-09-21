@@ -1408,9 +1408,13 @@ class RunRepository:
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {
+    public_payload = {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }
+    event_payload = public_payload.get("payload")
+    if isinstance(event_payload, dict) and isinstance(event_payload.get("trailing_event_kinds"), list):
+        event_payload["trailing_event_kinds"] = tuple(event_payload["trailing_event_kinds"])
+    return public_payload
 
 
 def _merged_artifact_review_entries(*values: object) -> list[dict[str, str]]:

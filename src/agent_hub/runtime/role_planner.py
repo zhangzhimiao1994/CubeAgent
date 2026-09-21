@@ -2131,7 +2131,7 @@ def _is_asset_locked_video_pipeline_request(task: str) -> bool:
     has_script_or_drama_context = (
         any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS)
         or "短剧" in normalized
-        or _has_concrete_script_context(task)
+        or _has_explicit_script_reference_context(normalized)
     )
     has_asset_lock_context = any(
         term in normalized
@@ -2186,6 +2186,8 @@ def _is_asset_locked_video_pipeline_request(task: str) -> bool:
 
 def _is_character_sheet_only_request(task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", task).casefold()
+    if any(term in normalized for term in ("计划里保留", "多媒体制作计划", "后续阶段")):
+        return False
     if not any(term in normalized for term in ("只生成", "仅生成", "只要", "仅要", "only")):
         return False
     if not any(
@@ -2221,9 +2223,57 @@ def _is_character_sheet_only_request(task: str) -> bool:
     )
 
 
+def _has_explicit_script_reference_context(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "provided script",
+            "script provided",
+            "script below",
+            "following script",
+            "previous script",
+            "existing script",
+            "above script",
+            "earlier script",
+            "the script above",
+            "我提供",
+            "用户提供",
+            "提供的剧本",
+            "提供的脚本",
+            "上传的剧本",
+            "上传的脚本",
+            "已确认剧本",
+            "已批准剧本",
+            "确认的剧本",
+            "批准的剧本",
+            "以下剧本",
+            "以下脚本",
+            "以下是剧本",
+            "以下是脚本",
+            "下面已确认剧本",
+            "下面已批准剧本",
+            "剧本如下",
+            "脚本如下",
+            "剧本正文",
+            "脚本正文",
+            "剧本角色",
+            "这个剧本",
+            "这个脚本",
+            "这段剧本",
+            "这段脚本",
+            "该剧本",
+            "该脚本",
+            "本剧本",
+            "本脚本",
+        )
+    )
+
+
 def _is_script_first_asset_image_request(task: str) -> bool:
     normalized = unicodedata.normalize("NFKC", task).casefold()
     if _is_asset_locked_video_pipeline_request(task):
+        return False
+    if _is_final_media_delivery_request(task):
         return False
     has_script = any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS) or (
         "短剧" in normalized
