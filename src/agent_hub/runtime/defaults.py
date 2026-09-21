@@ -947,6 +947,10 @@ def _roles_for_media_pipeline_plan(
 ) -> tuple[RoleAssignment, ...]:
     if not isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping):
         return selected_roles
+    if _is_deferred_media_script_plan_context(context) or _request_negates_video_delivery(
+        context.request
+    ):
+        return selected_roles
     by_id = {role.id: role for role in selected_roles}
     catalog_roles = {
         role.id: _assignment_from_definition(
@@ -978,6 +982,30 @@ def _roles_for_media_pipeline_plan(
         if role is not None:
             roles.append(role)
     return tuple(roles)
+
+
+def _request_negates_video_delivery(request: str) -> bool:
+    text = request.casefold()
+    return any(
+        term in text
+        for term in (
+            "不要生成视频",
+            "不用生成视频",
+            "不生成视频",
+            "暂时不要生成视频",
+            "暂不生成视频",
+            "不要剪辑成片",
+            "不用剪辑成片",
+            "不剪辑成片",
+            "不要成片",
+            "不成片",
+            "no video",
+            "do not generate video",
+            "don't generate video",
+            "do not compose",
+            "do not edit into final",
+        )
+    )
 
 
 def _assignment_from_definition(
