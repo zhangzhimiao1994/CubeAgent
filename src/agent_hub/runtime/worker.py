@@ -16,9 +16,6 @@ from agent_hub.app import (
     _ConfigBackedMultimediaGenerationExecutor,
 )
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
-from agent_hub.content_studio import AsyncContentStudioService
-from agent_hub.content_studio.packs import load_pack_registry
-from agent_hub.content_studio.repository import PersistentContentProjectStore
 from agent_hub.cognitive.pipeline import CognitiveLearningPipeline, CognitiveLearningTerminalHook
 from agent_hub.cognitive.repository import (
     PersistentCognitiveRecordRepository,
@@ -26,6 +23,9 @@ from agent_hub.cognitive.repository import (
 )
 from agent_hub.cognitive.service import CognitiveStateService, ExperienceService
 from agent_hub.config.service import ConfigService
+from agent_hub.content_studio import AsyncContentStudioService
+from agent_hub.content_studio.packs import load_pack_registry
+from agent_hub.content_studio.repository import PersistentContentProjectStore
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor

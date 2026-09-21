@@ -61,14 +61,13 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.plugin_context import requested_plugin_context_payload
 from agent_hub.runtime.production import (
     CharacterIdentity,
     CharacterLook,
     ProductionPlan,
-    build_identity_lock_prompt,
     build_production_plan,
 )
-from agent_hub.runtime.plugin_context import requested_plugin_context_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -829,7 +828,7 @@ def _multimedia_artifact_review_items_payload(
         generation_error = raw_item.get("generation_error")
         visual_review = raw_item.get("visual_review")
         has_file = type(storage_key) is str and type(mime_type) is str
-        has_failure = type(generation_error) is str and generation_error.strip()
+        has_failure = type(generation_error) is str and bool(generation_error.strip())
         if isinstance(visual_review, Mapping) and visual_review.get("passed") is False:
             has_failure = True
         if not has_file and not has_failure:
@@ -912,6 +911,88 @@ def _usable_file_artifacts_payload(artifacts: tuple[Artifact, ...]) -> tuple[Map
                     item[metadata_field] = value
             usable.append(item)
     return tuple(usable)
+
+
+def _explicit_context_artifact_sources(
+    context: TaskContext,
+    step: DispatchStep,
+    *,
+    allow_text_previews: bool = True,
+    allow_file_handles: bool = True,
+) -> tuple[Artifact, ...]:
+    if not context.artifacts:
+        return ()
+    text = unicodedata.normalize("NFKC", f"{context.request} {step.task}").casefold()
+    file_allowed = allow_file_handles and "compose_video" in step.tools and any(
+        term in text
+        for term in ("已生成", "上游", "剪辑", "合并", "成片", "source artifact", "source video", "artifact")
+    )
+    file_allowed = file_allowed or (allow_file_handles and "generate_multimedia" in step.tools and any(
+        term in text
+        for term in (
+            "参考图",
+            "带参考",
+            "不带参考",
+            "上游",
+            "已生成",
+            "源产物",
+            "source artifact",
+            "reference image",
+            "artifact",
+        )
+    ))
+    text_allowed = allow_text_previews and any(
+        term in text
+        for term in (
+            "剧本",
+            "脚本",
+            "根据",
+            "基于",
+            "上游",
+            "已生成",
+            "源产物",
+            "source artifact",
+            "source text",
+            "script",
+            "screenplay",
+            "artifact",
+        )
+    )
+    text_allowed = text_allowed or (allow_text_previews and step.final_synthesizer)
+    if not file_allowed and not text_allowed:
+        return ()
+    sanitized: list[Artifact] = []
+    for artifact in context.artifacts:
+        files = _usable_file_artifacts_payload((artifact,))
+        if files and file_allowed:
+            sanitized.append(
+                Artifact(
+                    id=artifact.id,
+                    type=artifact.type,
+                    producer=artifact.producer,
+                    content={"result": {"artifacts": tuple(dict(file) for file in files)}},
+                    source_ids=artifact.source_ids,
+                )
+            )
+            continue
+        text_value = _first_artifact_text_value(artifact.content)
+        if type(text_value) is not str or not text_value.strip() or not text_allowed:
+            continue
+        sanitized.append(
+            Artifact(
+                id=artifact.id,
+                type=artifact.type,
+                producer=artifact.producer,
+                content={
+                    "text": _truncate_prompt_text(
+                        text_value,
+                        max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+                    )
+                },
+                source_ids=artifact.source_ids,
+            )
+        )
+    return tuple(sanitized)
 
 
 def _normalize_compose_video_arguments_with_sources(
@@ -1193,6 +1274,16 @@ def _direct_multimedia_result_artifact_count(result: Mapping[str, JsonValue]) ->
     return 0
 
 
+def _json_int(value: JsonValue | None, *, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return default
+
+
 def _merge_preserved_multimedia_result_artifacts(
     result: Mapping[str, JsonValue],
     preserved_artifacts: object,
@@ -1205,12 +1296,12 @@ def _merge_preserved_multimedia_result_artifacts(
     ):
         return result
     generated = tuple(
-        cast(Mapping[str, JsonValue], item)
+        item
         for item in raw_generated
         if isinstance(item, Mapping)
     )
     preserved = tuple(
-        cast(Mapping[str, JsonValue], item)
+        item
         for item in preserved_artifacts
         if isinstance(item, Mapping)
     )
@@ -1248,9 +1339,11 @@ def _merge_preserved_multimedia_result_artifacts(
 
     for label in complete_labels:
         key = _normalize_artifact_label(label)
-        item = generated_by_label.get(key) or preserved_by_label.get(key)
-        if item is not None:
-            append_item(item)
+        candidate_item: Mapping[str, JsonValue] | None = (
+            generated_by_label.get(key) or preserved_by_label.get(key)
+        )
+        if candidate_item is not None:
+            append_item(candidate_item)
     for item in preserved:
         append_item(item)
     for item in generated:
@@ -2393,101 +2486,140 @@ def _direct_storyboard_generation_prompt(
 _FULL_PRODUCTION_ASSET_PROMPT_SPECS: tuple[tuple[str, str], ...] = (
     (
         "角色锁定资产",
-        "生成主要角色的角色资产/角色锁定资产板。每个重要角色必须独立成区，"
-        "采用中等复杂度但可生成的专业设定板：主定妆半身大图、正/侧/背全身三视图、"
-        "3 个表情头部、2 套剧情服装/状态变体、随身物/职业道具、材质色卡和不可漂移特征。"
-        "总模块控制在 6-8 个，不要塞满密集小格。"
-        "角色可以根据剧情场景更换服装或状态，但所有服装变体必须保持同一脸型、发型逻辑、年龄感、体态和身份气质。"
-        "随身物/职业道具必须来自剧本或角色设定，不得加入剧本或角色设定之外的随机道具；"
-        "文字只使用少量清晰中文标签和栏目标题，避免密集小字、伪字、乱码或不可读说明。"
-        "人物定妆必须使用纯白/浅灰/透明感纯色背景，整张图像是干净设定板画布；"
-        "人物、三视图、表情和服装模块都必须像抠图式孤立人物，禁止出现室内、街景、道具桌面、"
-        "门框、窗户、墙画、海报、扶手、器械柜、医疗办公室、医院走廊、环境光影、地面透视或任何具体场景背景，"
-        "避免后续把背景误当成人物锁定锚点。"
-        "这是 Character Model Sheet / 角色参考设定表，不是动作剧照、海报、合照或单人写真。",
+        (
+            "生成主要角色的角色资产/角色锁定资产板。每个重要角色必须独立成区，"
+            "采用中等复杂度但可生成的专业设定板：主定妆半身大图、正/侧/背全身三视图、"
+            "3 个表情头部、2 套剧情服装/状态变体、随身物/职业道具、材质色卡和不可漂移特征。"
+            "总模块控制在 6-8 个，不要塞满密集小格。"
+            "角色可以根据剧情场景更换服装或状态，但所有服装变体必须保持同一脸型、发型逻辑、年龄感、体态和身份气质。"
+            "随身物/职业道具必须来自剧本或角色设定，不得加入剧本或角色设定之外的随机道具；"
+            "文字只使用少量清晰中文标签和栏目标题，避免密集小字、伪字、乱码或不可读说明。"
+            "人物定妆必须使用纯白/浅灰/透明感纯色背景，整张图像是干净设定板画布；"
+            "人物、三视图、表情和服装模块都必须像抠图式孤立人物，禁止出现室内、街景、道具桌面、"
+            "门框、窗户、墙画、海报、扶手、器械柜、医疗办公室、医院走廊、环境光影、地面透视或任何具体场景背景，"
+            "避免后续把背景误当成人物锁定锚点。"
+            "这是 Character Model Sheet / 角色参考设定表，不是动作剧照、海报、合照或单人写真。"
+        ),
     ),
     (
         "服装妆造资产",
-        "生成服装妆造设定板，覆盖主服装、场景服装、配饰、妆发、材质和色彩基调；"
-        "必须按角色分区展示，不得只生成一个角色的服装；每个分区写清 Character ID / Look ID。"
-        "每套服装要对应角色身份和剧情场景，并保持角色锁定资产中的脸型、发型、体态不变。"
-        "服装必须来自剧本角色锚点，不要擅自改成黑西装、战术服、奇幻铠甲或无关职业制服。"
-        "现代都市角色不要被画成古风长袍、铠甲、特警、雇佣兵或科幻战术装，除非剧本明确要求。"
-        "禁止项不得画进画面当反例；即使旁边写“禁止使用”也不合格，禁用造型必须完全不出现。"
-        "不得生成 Character ID 001/A01/B03 等占位编号角色，不得生成金发西装男、陌生学生、运动少女或剧本外人物。"
-        "优先使用无头服装平铺、衣架展示、服装正反面和局部细节；不要使用真人模特照片，不要让模特脸影响角色身份。"
-        "必须按剧情/场景拆出服装变化，例如工作服、雨夜状态、战斗/受伤状态、外出状态；"
-        "每套衣服都要说明适用场景，不能把全剧都固定成一套衣服，也不能换衣服后换成另一个人。"
-        "重点展示服装正反面、服装拆解、材质色卡、配饰、妆发细节和色彩，使用纯白/浅灰/透明感纯色背景；"
-        "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
-        "不得出现办公室、街景、桌面、窗户、墙画或其他具体环境背景。"
-        "不要生成普通人像写真或电影剧照。",
+        (
+            "生成服装妆造设定板，覆盖主服装、场景服装、配饰、妆发、材质和色彩基调；"
+            "必须按角色分区展示，不得只生成一个角色的服装；每个分区写清 Character ID / Look ID。"
+            "每套服装要对应角色身份和剧情场景，并保持角色锁定资产中的脸型、发型、体态不变。"
+            "服装必须来自剧本角色锚点，不要擅自改成黑西装、战术服、奇幻铠甲或无关职业制服。"
+            "现代都市角色不要被画成古风长袍、铠甲、特警、雇佣兵或科幻战术装，除非剧本明确要求。"
+            "禁止项不得画进画面当反例；即使旁边写“禁止使用”也不合格，禁用造型必须完全不出现。"
+            "不得生成 Character ID 001/A01/B03 等占位编号角色，不得生成金发西装男、陌生学生、运动少女或剧本外人物。"
+            "优先使用无头服装平铺、衣架展示、服装正反面和局部细节；不要使用真人模特照片，不要让模特脸影响角色身份。"
+            "必须按剧情/场景拆出服装变化，例如工作服、雨夜状态、战斗/受伤状态、外出状态；"
+            "每套衣服都要说明适用场景，不能把全剧都固定成一套衣服，也不能换衣服后换成另一个人。"
+            "重点展示服装正反面、服装拆解、材质色卡、配饰、妆发细节和色彩，使用纯白/浅灰/透明感纯色背景；"
+            "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
+            "不得出现办公室、街景、桌面、窗户、墙画或其他具体环境背景。"
+            "不要生成普通人像写真或电影剧照。"
+        ),
     ),
     (
         "场景资产",
-        "生成场景设定板，覆盖主要地点和关键空间，包含空间视角、平面/纵深层次、"
-        "室内/室外、时代城市感、天气、光线方向、氛围、可复用背景层、入口/遮挡/动线和色彩基调。"
-        "只覆盖剧本出现的地点；如果剧本是雨夜巷口和角色家中，就必须围绕这些地点拆解，"
-        "不得替换成写字楼大厅、会展广场、办公楼入口、地铁通道或剧本外公共空间。"
-        "标签必须是中文地点/光线/动线说明，不得出现 smoke、v30、test、demo 或任何测试水印式文字。"
-        "可以用 3-5 个干净场景小图格、光线箭头和背景层拆解，不要把场景资产画成主角动作海报。",
+        (
+            "生成场景设定板，覆盖主要地点和关键空间，包含空间视角、平面/纵深层次、"
+            "室内/室外、时代城市感、天气、光线方向、氛围、可复用背景层、入口/遮挡/动线和色彩基调。"
+            "只覆盖剧本出现的地点；如果剧本是雨夜巷口和角色家中，就必须围绕这些地点拆解，"
+            "不得替换成写字楼大厅、会展广场、办公楼入口、地铁通道或剧本外公共空间。"
+            "标签必须是中文地点/光线/动线说明，不得出现 smoke、v30、test、demo 或任何测试水印式文字。"
+            "可以用 3-5 个干净场景小图格、光线箭头和背景层拆解，不要把场景资产画成主角动作海报。"
+        ),
     ),
     (
         "道具资产",
-        "生成道具设定板，覆盖剧情关键物、随身物、识别性物件、特殊法器/科技物件和细节特写；"
-        "道具必须可独立识别并服务剧情推进，使用独立物件 lineup、局部特写、材质色卡、比例参考和状态变化，"
-        "使用纯白/浅灰/透明感纯色背景；"
-        "只生成剧本明确要求的道具或角色身份必需的道具，不要补充随机钥匙、信件、手杖、饰物等无关物；"
-        "不要补充能量核心、机械装置、科幻圆盘、未知武器或任何没有出现在剧本/用户要求中的道具；"
-        "证件照片只能使用空白头像占位或剪影占位，不能生成随机真人头像；每个标签必须贴在正确道具下方，标签不得错位。"
-        "如果用户或剧本列出黄色外卖箱、青玉断佩、银针、证件等指定物件，必须逐项覆盖并清楚分区。"
-        "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
-        "不得出现书桌、工作室、街景或角色摆拍背景，不要只让角色拿着道具摆拍。",
+        (
+            "生成道具设定板，覆盖剧情关键物、随身物、识别性物件、特殊法器/科技物件和细节特写；"
+            "道具必须可独立识别并服务剧情推进，使用独立物件 lineup、局部特写、材质色卡、比例参考和状态变化，"
+            "使用纯白/浅灰/透明感纯色背景；"
+            "只生成剧本明确要求的道具或角色身份必需的道具，不要补充随机钥匙、信件、手杖、饰物等无关物；"
+            "不要补充能量核心、机械装置、科幻圆盘、未知武器或任何没有出现在剧本/用户要求中的道具；"
+            "证件照片只能使用空白头像占位或剪影占位，不能生成随机真人头像；每个标签必须贴在正确道具下方，标签不得错位。"
+            "如果用户或剧本列出黄色外卖箱、青玉断佩、银针、证件等指定物件，必须逐项覆盖并清楚分区。"
+            "文字只用少量清晰中文标签，不要生成大段小字、乱码或不可读说明；"
+            "不得出现书桌、工作室、街景或角色摆拍背景，不要只让角色拿着道具摆拍。"
+        ),
     ),
     (
         "动作资产",
-        "生成动作姿态参考板，例如奔跑、转身、递物、打斗、施法、躲避、救援等；"
-        "高武都市修仙/雨夜外卖类剧本必须优先覆盖：林渊护黄色外卖箱后撤、雨中追击/躲避、"
-        "青玉断佩触发电弧、苏清月银针压脉/牵真气纹、反派近身压迫。"
-        "动作必须来自剧本，重点是姿态序列、动作分解、姿态线、关键帧、重心变化和运动箭头，"
-        "角色外观必须沿用角色锁定资产，不得擅自换成战术服、黑西装、陌生发型或无关人物。"
-        "优先使用无脸灰色剪影/线稿动作人偶，只用黄色外卖箱、青玉断佩、银针和动作箭头标识剧情动作；"
-        "如果剧本没有明确雨伞，道具和动作中不得出现雨伞；用雨线和湿地面表达雨，不要用伞表达雨。"
-        "不得出现古风发冠、古风长袍、仙侠人物、黑甲护卫或陌生动漫主角。"
-        "如果难以稳定角色脸，宁可继续使用无脸动作人偶；不要生成可辨识陌生人脸。"
-        "使用纯白/浅灰/透明感纯色背景或极简动作网格；不要混入场景板、道具板或大量头像；"
-        "每格只表达一个可复用动作。",
+        (
+            "生成动作姿态参考板，例如奔跑、转身、递物、打斗、施法、躲避、救援等；"
+            "高武都市修仙/雨夜外卖类剧本必须优先覆盖：林渊护黄色外卖箱后撤、雨中追击/躲避、"
+            "青玉断佩触发电弧、苏清月银针压脉/牵真气纹、反派近身压迫。"
+            "动作必须来自剧本，重点是姿态序列、动作分解、姿态线、关键帧、重心变化和运动箭头，"
+            "角色外观必须沿用角色锁定资产，不得擅自换成战术服、黑西装、陌生发型或无关人物。"
+            "优先使用无脸灰色剪影/线稿动作人偶，只用黄色外卖箱、青玉断佩、银针和动作箭头标识剧情动作；"
+            "如果剧本没有明确雨伞，道具和动作中不得出现雨伞；用雨线和湿地面表达雨，不要用伞表达雨。"
+            "不得出现古风发冠、古风长袍、仙侠人物、黑甲护卫或陌生动漫主角。"
+            "如果难以稳定角色脸，宁可继续使用无脸动作人偶；不要生成可辨识陌生人脸。"
+            "使用纯白/浅灰/透明感纯色背景或极简动作网格；不要混入场景板、道具板或大量头像；"
+            "每格只表达一个可复用动作。"
+        ),
     ),
     (
         "特效资产",
-        "生成干净的特效设定板，只覆盖本剧需要的 3 类特效：蓝色电弧、银针真气纹、雨水剑气；"
-        "每类用 2 个小格展示基础形态和增强形态，总计约 6 格。"
-        "标明颜色、强弱层级、触发动作、扩散方向、边缘质感和可复用变化。"
-        "不要生成通用魔法爆炸集合，不要把雨水剑气画成实体长剑或武器道具。"
-        "背景必须干净，可用透明感棋盘/深浅纯色底突出特效形态；"
-        "不要出现角色头像、半身人像、街景、战斗场景、单张战斗海报、宣传图或无法复用的剧照。",
+        (
+            "生成干净的特效设定板，只覆盖本剧需要的 3 类特效：蓝色电弧、银针真气纹、雨水剑气；"
+            "每类用 2 个小格展示基础形态和增强形态，总计约 6 格。"
+            "标明颜色、强弱层级、触发动作、扩散方向、边缘质感和可复用变化。"
+            "不要生成通用魔法爆炸集合，不要把雨水剑气画成实体长剑或武器道具。"
+            "背景必须干净，可用透明感棋盘/深浅纯色底突出特效形态；"
+            "不要出现角色头像、半身人像、街景、战斗场景、单张战斗海报、宣传图或无法复用的剧照。"
+        ),
     ),
     (
         "镜头资产",
-        "生成镜头语言设定板，覆盖景别、机位、镜头运动、构图、焦段感和剪辑节奏参考；"
-        "服务后续分镜和 AI 视频镜头生成，可用小图格、框线、箭头、机位图标、焦段示意和构图线表达。"
-        "使用纯白/浅灰/蓝图感纯色背景，不要使用真实街景、室内或角色剧照做背景。"
-        "画面主体必须是 storyboard / cinematography board：镜头框、机位俯视图、推拉摇移轨迹、"
-        "景别机位构图卡、远景/中景/近景/特写示意、景深和剪辑节奏图。"
-        "不要生成角色头像阵列、脸部九宫格、角色定妆表、普通剧照、人物写真或宣传海报；"
-        "如果需要人物，只能用小比例剪影或火柴人占位，不得出现可辨识大脸；"
-        "不得出现真人眼睛、真实脸部特写、照片式皮肤细节或任何会造成身份漂移的脸部素材。",
+        (
+            "生成镜头语言设定板，覆盖景别、机位、镜头运动、构图、焦段感和剪辑节奏参考；"
+            "服务后续分镜和 AI 视频镜头生成，可用小图格、框线、箭头、机位图标、焦段示意和构图线表达。"
+            "使用纯白/浅灰/蓝图感纯色背景，不要使用真实街景、室内或角色剧照做背景。"
+            "画面主体必须是 storyboard / cinematography board：镜头框、机位俯视图、推拉摇移轨迹、"
+            "景别机位构图卡、远景/中景/近景/特写示意、景深和剪辑节奏图。"
+            "不要生成角色头像阵列、脸部九宫格、角色定妆表、普通剧照、人物写真或宣传海报；"
+            "如果需要人物，只能用小比例剪影或火柴人占位，不得出现可辨识大脸；"
+            "不得出现真人眼睛、真实脸部特写、照片式皮肤细节或任何会造成身份漂移的脸部素材。"
+        ),
     ),
     (
         "表演节奏与风格锁定资产",
-        "生成剪辑和导演用的表演节奏板，不要求复杂人物大图；"
-        "必须使用中文或图标，禁止英文错字、伪字和不可读小字。"
-        "必须明确标出 60 秒短剧节奏段：0-3秒Hook、3-10秒人物/冲突、10-35秒动作推进、35-52秒反转兑现、52-60秒钩子。"
-        "时间段文字必须逐字正确，不得省略“秒”字，不得写成 35-522、52-600、Hookk 或其他数字/英文错字。"
-        "使用 4-6 个清晰模块表达情绪曲线、表情强度、肢体状态、旁白/对白节拍、音效点位、BGM 氛围和色彩/光影风格。"
-        "可以用时间轴、节奏点、图标、小比例表情示意和色块表达，避免生成大幅单人写真。"
-        "如出现人物示意，必须沿用本剧角色年龄感、服装基调和画风，不要换成黑西装男性、陌生动漫角色或通用情绪模板。"
-        "使用干净纯色/网格/时间轴式背景，不要生成室内场景或剧照。",
+        (
+            "生成剪辑和导演用的表演节奏板，不要求复杂人物大图；"
+            "必须使用中文或图标，禁止英文错字、伪字和不可读小字。"
+            "必须明确标出 60 秒短剧节奏段：0-3秒Hook、3-10秒人物/冲突、10-35秒动作推进、35-52秒反转兑现、52-60秒钩子。"
+            "时间段文字必须逐字正确，不得省略“秒”字，不得写成 35-522、52-600、Hookk 或其他数字/英文错字。"
+            "使用 4-6 个清晰模块表达情绪曲线、表情强度、肢体状态、旁白/对白节拍、音效点位、BGM 氛围和色彩/光影风格。"
+            "可以用时间轴、节奏点、图标、小比例表情示意和色块表达，避免生成大幅单人写真。"
+            "如出现人物示意，必须沿用本剧角色年龄感、服装基调和画风，不要换成黑西装男性、陌生动漫角色或通用情绪模板。"
+            "使用干净纯色/网格/时间轴式背景，不要生成室内场景或剧照。"
+        ),
+    ),
+    (
+        "音频字幕资产",
+        (
+            "生成声音、对白、旁白、音效、BGM 和字幕节奏参考板；"
+            "必须围绕剧本真实台词、旁白情绪、动作音效和关键停顿来设计，不要生成通用音乐海报。"
+            "包含角色声音气质、情绪强度、关键词重音、静音/停顿点、BGM 进入和退出、SFX 点位、"
+            "字幕断句、安全区、最大行长和高亮词规则。"
+            "字幕必须适合 9:16 竖屏短剧，不遮挡人物脸、关键道具和动作焦点；"
+            "文字只用清晰中文标签、时间轴和图标，不要生成英文错字、伪字、密集小字或测试水印。"
+            "画面应是干净时间轴/节奏板，不要生成角色写真、剧照、室内背景或随机播放器界面。"
+        ),
+    ),
+    (
+        "连续性与质检资产",
+        (
+            "生成导演/制片人用于把控 AI 视频稳定性的连续性检查板；"
+            "必须覆盖 Character ID 与 Look ID 继承、换装触发点、同一场景连续时间、道具去向、"
+            "特效强弱层级、镜头衔接、动作方向、字幕安全区、视频抽帧检查点和失败重试策略。"
+            "明确哪些资产允许变化、哪些身份锚点禁止变化；角色身份、脸型、年龄感、发型逻辑、体态不可漂移。"
+            "用干净表格、时间轴、勾选项和小图标表达，不要把失败案例画进画面当示例；"
+            "不要生成电影剧照、战斗海报、随机人物或复杂背景。"
+        ),
     ),
 )
 _FULL_PRODUCTION_CHARACTER_ASSET_LIMIT = 12
@@ -2582,8 +2714,8 @@ def _direct_full_production_asset_prompts(
         )
         prompt = (
             f"本张图片资产类别：{title}。\n"
-            f"{requirement}\n"
             f"{production_control}\n"
+            f"{requirement}\n"
             "全量专业资产包规则：必须从剧本提取资产，不要只生成角色图；"
             "不要跳过服装妆造、场景、道具、动作、特效、镜头、情绪表演、声音节奏或风格锁定。"
             "每张资产图必须干净、低噪声，只表达当前资产类别直接需要锁定的必要细节；"
@@ -2599,11 +2731,39 @@ def _direct_full_production_asset_prompts(
         )
         prompts.append(
             _truncate_prompt_text(
-                prompt,
+                _full_production_asset_priority_control(title) + prompt,
                 max_bytes=per_prompt_budget,
             )
         )
     return tuple(prompts)
+
+
+def _full_production_asset_priority_control(title: str) -> str:
+    target = _character_target_from_asset_label(title)
+    if target:
+        return (
+            f"生成约束摘要：唯一目标角色：{target}；主定妆正脸半身大图；1-3 套剧情服装/状态变体；"
+            "Character Model Sheet / 角色参考设定表；"
+            "Character ID 只负责脸型；Look ID 只负责服装；Available Looks / 多造型管理；"
+            "不要继承服装参考图中的脸；只允许修改服装；"
+            "图内文字尽量不用英文；角色锁定资产只管理人物身份和明确服装 Look；"
+            "不得出现雨伞、雨景、街景、护甲、战术服；"
+            "一张图只包含这个角色；纯白/浅灰/透明感纯色背景；"
+            "不要混入其他角色；"
+            "主定妆大图；正/侧/背全身三视图；表情头部变化；服装拆解；"
+            "随身物/职业道具；材质色卡；少量清晰中文标签；"
+            "不得加入剧本或角色设定之外的随机道具；"
+            "医疗办公室、医院走廊和职业场所背景只能作为禁止背景词，不得画入人物定妆图；不是电影剧照。\n"
+        )
+    if "表演节奏" in title or "风格锁定" in title:
+        return "生成约束摘要：表演节奏资产必须包含情绪节奏点、情绪变化、声音节奏、BGM 氛围、0-3秒Hook、35-52秒反转兑现；不是电影剧照。\n"
+    if "特效" in title:
+        return "生成约束摘要：特效资产必须包含蓝色电弧特效、形态分层，干净拆解能量颜色、形态、亮度、边缘和叠加方式；不是电影剧照。\n"
+    if "镜头" in title:
+        return "生成约束摘要：镜头资产必须包含空镜远景、近景、特写、运动方向和构图节奏，使用干净分镜参考；不是电影剧照。\n"
+    if "场景" in title:
+        return "生成约束摘要：场景资产必须包含终局天桥，拆解地点结构、入口、动线、光线、尺度和安全构图；不是电影剧照。\n"
+    return ""
 
 
 def _full_production_plan_for_asset_context(
@@ -2641,15 +2801,13 @@ def _full_production_asset_control_section(
                 _compact_identity_lock_prompt(identity, look),
             )
         )
-    return "\n".join(
-        (
-            "Production Direction / 导演/制片控制:",
-            plan.direction.director_statement,
-            "Scene Character State:",
-            "支撑资产必须服务已定义 Character ID / Look ID；不要让道具、动作、特效或镜头资产反向改写人物身份。",
-            "Continuity / 场记要求：连续时间继承上一场造型；只有剧本明确换装、第二天、回家、受伤、战斗、雨夜/湿身或活动时才切换 Look。",
-            "Retry / 制片要求：只重试失败的角色、Look、分镜或视频片段，保留已通过资产。",
-        )
+    return (
+        f"Production Direction / 导演/制片控制:\n"
+        f"{plan.direction.director_statement}\n"
+        f"Scene Character State:\n"
+        f"支撑资产必须服务已定义 Character ID / Look ID；不要让道具、动作、特效或镜头资产反向改写人物身份。\n"
+        f"Continuity / 场记要求：连续时间继承上一场造型；只有剧本明确换装、第二天、回家、受伤、战斗、雨夜/湿身或活动时才切换 Look。\n"
+        f"Retry / 制片要求：只重试失败的角色、Look、分镜或视频片段，保留已通过资产。"
     )
 
 
@@ -2742,6 +2900,7 @@ def _compact_identity_lock_prompt(identity: CharacterIdentity, look: CharacterLo
     return "\n".join(
         (
             f"CHARACTER_ID: {identity.character_id}；CHARACTER_NAME: {identity.display_name}",
+            f"LOOK_ID: {look.look_id}",
             f"IDENTITY LOCK: {identity.identity_prompt}",
             (
                 "身份优先级：Character ID 只负责脸型、五官、眼距、鼻型、嘴型、下颌线、肤色、"
@@ -2813,7 +2972,7 @@ def _direct_full_production_asset_prompt_specs(
     for target in character_targets[:_FULL_PRODUCTION_CHARACTER_ASSET_LIMIT]:
         anchor = _full_production_asset_character_anchor(target, context, step, sources)
         anchor_requirement = (
-            f"角色硬锚点（最高优先级，所有模块都必须对应）：{anchor}。"
+                    f"角色硬锚点（最高优先级，所有模块都必须对应）：{anchor}。"
             if anchor
             else f"角色硬锚点（最高优先级）：只生成 {target}，不得把名字泛化成仙侠/礼服/陌生职业模板。"
         )
@@ -2823,6 +2982,7 @@ def _direct_full_production_asset_prompt_specs(
                 (
                     f"生成唯一目标角色：{target} 的 Character Model Sheet / 角色参考设定表。"
                     f"{anchor_requirement}"
+                    "1-3 套剧情服装/状态变体；不要继承服装参考图中的脸；只允许修改服装。"
                     "Available Looks / 多造型管理：本图必须展示基础 Look 和剧本触发的换装/雨夜/居家/战斗状态 Look；"
                     "Character ID 只负责脸型、五官、年龄感、肤色、基础发型和体态，Look ID 只负责服装、鞋履、配饰和场景状态。"
                     "角色锁定资产只管理人物身份和明确服装 Look，不展示动作场景、雨景、战斗场景、背景图或剧情剧照；"
@@ -2901,18 +3061,22 @@ def _full_production_asset_character_targets(
     source_text = "\n".join(_source_structural_texts(sources[:4]))
     source_normalized = unicodedata.normalize("NFKC", source_text)
     request_task_normalized = unicodedata.normalize("NFKC", f"{context.request}\n{step.task}")
+    structured_text = "\n".join(
+        part for part in (source_normalized, request_task_normalized) if part.strip()
+    )
     source_targets = [
-        *_script_role_table_character_targets(source_normalized),
-        *_script_heading_character_targets(source_normalized),
-        *_script_numbered_character_targets(source_normalized),
-        *_script_bold_character_section_targets(source_normalized),
+        *_script_role_table_character_targets(structured_text),
+        *_script_heading_character_targets(structured_text),
+        *_script_numbered_character_targets(structured_text),
+        *_script_bold_character_section_targets(structured_text),
     ]
     raw_targets.extend(source_targets)
     raw_targets.extend(_inline_age_gender_character_targets(request_task_normalized))
-    has_source_character_section = _has_script_character_section(source_normalized)
-    if not source_targets and not has_source_character_section:
+    if not source_targets:
         for role_label in ("女主", "男主", "女二", "男二", "反派"):
-            raw_targets.extend(_specific_character_targets_for_role(request_task_normalized, role_label))
+            raw_targets.extend(_specific_character_targets_for_role(structured_text, role_label))
+    has_source_character_section = _has_script_character_section(structured_text)
+    if not source_targets and not has_source_character_section:
         raw_targets.extend(_character_model_sheet_targets(context.request, step.task, sources))
     cleaned: list[str] = []
     for target in raw_targets:
@@ -2966,8 +3130,7 @@ def _has_script_character_section(text: str) -> bool:
         return False
     for line in text.splitlines():
         stripped = line.strip()
-        _level, header = _markdown_heading_parts(stripped)
-        if _is_script_character_section_header(header):
+        if _is_standalone_script_character_section_header(stripped):
             return True
     return False
 
@@ -2981,6 +3144,21 @@ def _markdown_heading_parts(stripped: str) -> tuple[int | None, str]:
 
 def _is_script_character_section_header(header: str) -> bool:
     return bool(header) and any(term in header for term in _SCRIPT_CHARACTER_SECTION_TERMS)
+
+
+def _is_standalone_script_character_section_header(stripped: str) -> bool:
+    if not stripped:
+        return False
+    level, header = _markdown_heading_parts(stripped)
+    if not _is_script_character_section_header(header):
+        return False
+    if level is not None:
+        return True
+    if len(header) > 40:
+        return False
+    if re.search(r"[。；;，,]", header):
+        return False
+    return not any(term in header for term in ("请", "根据", "生成", "必须", "不允许", "不能", "每个", "每人"))
 
 
 def _script_heading_character_targets(text: str) -> tuple[str, ...]:
@@ -3005,7 +3183,7 @@ def _script_heading_character_targets(text: str) -> tuple[str, ...]:
             continue
         if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
             continue
-        if any(role_word in header[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+        if any(role_word in header[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜", "不出画", "仅被提及")):
             continue
         target = _normalized_specific_character_target(raw_name)
         if target and target not in targets:
@@ -3054,7 +3232,7 @@ def _script_role_table_character_targets(text: str) -> tuple[str, ...]:
         raw_name = re.sub(r"[*_`#>\s]", "", raw_name)
         if raw_name in {"群演", "路人", "顾客", "行人"}:
             continue
-        if any(role_word in stripped[:160] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+        if any(role_word in stripped[:160] for role_word in ("仅对讲机", "仅画外音", "不出镜", "不出画", "仅被提及")):
             continue
         target = _normalized_specific_character_target(raw_name)
         if target and target not in targets:
@@ -3071,7 +3249,7 @@ def _script_bold_character_section_targets(text: str) -> tuple[str, ...]:
         stripped = line.strip()
         header = stripped.lstrip("#").strip()
         if header:
-            if _is_script_character_section_header(header):
+            if _is_standalone_script_character_section_header(stripped):
                 in_character_section = True
                 continue
             if in_character_section and stripped.startswith("#"):
@@ -3090,7 +3268,7 @@ def _script_bold_character_section_targets(text: str) -> tuple[str, ...]:
         raw_name = re.sub(r"[*_`#>\s]", "", raw_name)
         if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
             continue
-        if any(role_word in stripped[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+        if any(role_word in stripped[:120] for role_word in ("仅对讲机", "仅画外音", "不出镜", "不出画", "仅被提及")):
             continue
         target = _normalized_specific_character_target(raw_name)
         if target and target not in targets:
@@ -3107,7 +3285,7 @@ def _script_numbered_character_targets(text: str) -> tuple[str, ...]:
         stripped = line.strip()
         header = stripped.lstrip("#").strip()
         if header:
-            if _is_script_character_section_header(header):
+            if _is_standalone_script_character_section_header(stripped):
                 in_character_section = True
                 continue
             if in_character_section and stripped.startswith("#"):
@@ -3125,7 +3303,7 @@ def _script_numbered_character_targets(text: str) -> tuple[str, ...]:
         raw_name = match.group("name")
         if raw_name in {"群演", "路人", "顾客", "行人", "队长", "画外音"}:
             continue
-        if any(role_word in stripped[:80] for role_word in ("仅对讲机", "仅画外音", "不出镜")):
+        if any(role_word in stripped[:80] for role_word in ("仅对讲机", "仅画外音", "不出镜", "不出画", "仅被提及")):
             continue
         target = _normalized_specific_character_target(raw_name)
         if target and target not in targets:
@@ -3323,15 +3501,15 @@ def _direct_video_reference_comparison_prompts(
         else "如上游产物中存在角色参考图/定妆图/设定表，优先使用这些参考图锁定人物。"
     )
     with_reference = (
-        f"{base_prompt}\n\n"
         "对比版本 A：带参考图生成视频。必须依据上游角色参考图锁定人物身份、发型、"
         "服装和画风，尽量保持角色一致性。\n"
-        f"{reference_note}"
+        f"{reference_note}\n\n"
+        f"{base_prompt}"
     )
     without_reference = (
-        f"{base_prompt}\n\n"
         "对比版本 B：不带参考图生成视频。不要使用上游图片作为人物锁定依据，"
-        "只根据文字剧本/分镜/提示词生成，用于和带参考图版本比较角色一致性差异。"
+        "只根据文字剧本/分镜/提示词生成，用于和带参考图版本比较角色一致性差异。\n\n"
+        f"{base_prompt}"
     )
     return (
         _truncate_prompt_text(with_reference, max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES),
@@ -3532,7 +3710,7 @@ def _multimedia_result_items_by_label(artifact: Artifact) -> dict[str, Mapping[s
     for index, raw_item in enumerate(raw_items, start=1):
         if not isinstance(raw_item, Mapping):
             continue
-        item = dict(raw_item)
+        item = cast(dict[str, JsonValue], dict(raw_item))
         item.setdefault("review_item_id", f"{artifact.id}:{index}")
         label = _artifact_item_label(item)
         if label is None:
@@ -3543,7 +3721,7 @@ def _multimedia_result_items_by_label(artifact: Artifact) -> dict[str, Mapping[s
     return items
 
 
-def _artifact_item_label(item: Mapping[object, object]) -> str | None:
+def _artifact_item_label(item: Mapping[str, object]) -> str | None:
     for field_name in ("label", "title", "filename"):
         value = item.get(field_name)
         if isinstance(value, str) and value.strip():
@@ -3558,9 +3736,7 @@ def _artifact_item_review_failed(item: Mapping[str, JsonValue]) -> bool:
     passed = review.get("passed")
     if passed is False:
         return True
-    if isinstance(passed, str) and passed.strip().casefold() == "false":
-        return True
-    return False
+    return isinstance(passed, str) and passed.strip().casefold() == "false"
 
 
 def _artifact_item_matches_explicit_retry(
@@ -5779,6 +5955,17 @@ class CrewDispatchRuntime:
         while True:
             compact_retry = framework_attempt > 0
             use_review_packets = compact_retry or step.final_synthesizer or bool(step.depends_on)
+            prompt_sources = self._ordered_artifacts(
+                (
+                    *sources,
+                    *_explicit_context_artifact_sources(
+                        context,
+                        step,
+                        allow_file_handles=False,
+                        allow_text_previews=True,
+                    ),
+                )
+            )
             source_payload = [
                 (
                     _artifact_review_packet_payload(
@@ -5790,14 +5977,14 @@ class CrewDispatchRuntime:
                     if use_review_packets
                     else _artifact_prompt_payload(artifact)
                 )
-                for artifact in sources
+                for artifact in prompt_sources
             ]
             user: dict[str, object] = {
                 "request": context.request,
                 "task": step.task,
                 "untrusted_source_artifacts": source_payload,
             }
-            usable_files = _usable_file_artifacts_payload(sources)
+            usable_files = _usable_file_artifacts_payload(prompt_sources)
             if usable_files:
                 user["usable_file_artifacts"] = usable_files
             hermes_context = hermes_memory_context_text(context.routing_decision)
@@ -6002,17 +6189,23 @@ class CrewDispatchRuntime:
                 *tuple(tool_ledger.artifacts.values()),
             )
         )
+        contextual_sources = self._ordered_artifacts(
+            (
+                *sources,
+                *_explicit_context_artifact_sources(context, step),
+            )
+        )
         if _should_direct_execute_compose_video(
             step,
             agent,
-            sources,
+            contextual_sources,
             available_artifacts=available_artifacts,
         ):
             capability_name = "compose_video"
             logical_model = agent.logical_model
             compose_arguments = _direct_compose_video_arguments(
                 step,
-                sources,
+                contextual_sources,
                 available_artifacts=available_artifacts,
             )
             if compose_arguments is None:
@@ -6036,7 +6229,10 @@ class CrewDispatchRuntime:
             if selected_model is None:
                 _fail(f"capability failed: no configured {kind} generation model")
             logical_model = selected_model
-            multimedia_sources = _lineage_expanded_artifacts(sources, available_artifacts)
+            multimedia_sources = _lineage_expanded_artifacts(
+                contextual_sources,
+                available_artifacts,
+            )
             retry_previous_artifacts = self._ordered_artifacts(
                 (
                     *multimedia_sources,
@@ -6101,7 +6297,7 @@ class CrewDispatchRuntime:
             started_payload = {
                 "kind": kind,
                 "logical_model": logical_model,
-                "artifact_count": int(arguments.get("artifact_count", 1)),
+                "artifact_count": _json_int(arguments.get("artifact_count"), default=1),
                 "direct_dispatch": True,
             }
             labels_for_payload = arguments.get("artifact_labels")
@@ -6117,7 +6313,7 @@ class CrewDispatchRuntime:
                 started_payload = {
                     **started_payload,
                     "preserved_artifact_count": len(preserved_for_payload),
-                    "retry_artifact_count": int(arguments.get("artifact_count", 1)),
+                    "retry_artifact_count": _json_int(arguments.get("artifact_count"), default=1),
                 }
             direct_completion_text = "Multimedia generation dispatched directly."
             final_fallback_text = f"Generated {kind} artifact with {logical_model}."
@@ -7823,7 +8019,10 @@ class CrewDispatchRuntime:
         models = state["models"]
         review_refs = state["review_refs"]
         artifact_registry = state["artifact_registry"]
-        artifact_registry_roots = state.get("artifact_registry_roots", tuple(artifact_registry))
+        artifact_registry_roots = state.get(
+            "artifact_registry_roots",
+            tuple(artifact_registry) if isinstance(artifact_registry, Mapping) else (),
+        )
         usage = state["usage"]
         step_usage = state["step_usage"]
         audit_overflow = state["audit_overflow"]
@@ -8645,11 +8844,11 @@ class CrewDispatchRuntime:
         completed: dict[str, Artifact] = {}
         refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["artifact_refs"])
         for step_id in cast(tuple[str, ...], checkpoint.state["completed"]):
-            reference = refs[step_id]
-            artifact = by_id.get(reference["id"])
+            artifact_ref = refs[step_id]
+            artifact = by_id.get(artifact_ref["id"])
             if (
                 artifact is None
-                or artifact.content_sha256 != reference["sha256"]
+                or artifact.content_sha256 != artifact_ref["sha256"]
                 or artifact.type != "text"
                 or any(source_id not in by_id for source_id in artifact.source_ids)
             ):
@@ -8735,8 +8934,8 @@ class CrewDispatchRuntime:
         )
         review_ledger = _ReviewLedger()
         review_refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"])
-        for step_id, reference in review_refs.items():
-            artifact = by_id.get(reference["id"])
+        for step_id, review_ref in review_refs.items():
+            artifact = by_id.get(review_ref["id"])
             feedback = artifact.content.get("feedback") if artifact is not None else None
             reviewer = steps[step_id].reviewer
             candidate = (
@@ -8758,7 +8957,7 @@ class CrewDispatchRuntime:
             )
             if (
                 artifact is None
-                or artifact.content_sha256 != reference["sha256"]
+                or artifact.content_sha256 != review_ref["sha256"]
                 or artifact.type != "review_feedback"
                 or reviewer is None
                 or artifact.producer != agents[reviewer].id

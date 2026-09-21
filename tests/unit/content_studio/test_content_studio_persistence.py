@@ -1,3 +1,5 @@
+# mypy: disable-error-code="no-untyped-def"
+
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +21,7 @@ from agent_hub.content_studio import (
     InMemoryContentProjectStore,
     PackRegistry,
     ProjectStatus,
+    ProviderAttempt,
     QCReport,
     ResearchBundle,
     ResearchQuestion,
@@ -27,6 +30,7 @@ from agent_hub.content_studio import (
     Timeline,
     content_project_from_payload,
     content_project_to_payload,
+    record_content_project_provider_attempt,
 )
 
 
@@ -143,6 +147,49 @@ async def test_provider_attempt_ledger_persists_successful_expensive_stages() ->
 
     assert tuple(attempt for attempt in resumed.provider_attempts if attempt.stage == "assets") == asset_attempts
     assert restarted.provider_call_count("assets") == 0
+
+
+def test_provider_attempt_ledger_keeps_failed_then_successful_history() -> None:
+    service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
+    project = service.create_content_project(
+        title="Attempt history",
+        topic="AIGC attempt history",
+        source_urls=(),
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="fast_minimal",
+        execution_mode="demo",
+    )
+    failed = ProviderAttempt(
+        stage="voice",
+        idempotency_key=f"{project.project_id}:voice",
+        status="failed",
+        result_hash="",
+        error_code="tts_timeout",
+    )
+    succeeded = ProviderAttempt(
+        stage="voice",
+        idempotency_key=f"{project.project_id}:voice",
+        status="completed",
+        result_hash="voice-result",
+        provider_task_id="voice.mp3",
+    )
+
+    with_failure = record_content_project_provider_attempt(project, failed)
+    with_success = record_content_project_provider_attempt(with_failure, succeeded)
+    deduped = record_content_project_provider_attempt(with_success, succeeded)
+
+    assert tuple(attempt.status for attempt in deduped.provider_attempts if attempt.stage == "voice") == (
+        "failed",
+        "completed",
+    )
+    assert tuple(event.status for event in deduped.project_events if event.kind == "provider_attempt") == (
+        "failed",
+        "completed",
+    )
+    assert any("tts_timeout" in event.summary for event in deduped.project_events)
 
 
 async def test_retry_stage_regenerates_existing_preview_without_restarting_assets() -> None:

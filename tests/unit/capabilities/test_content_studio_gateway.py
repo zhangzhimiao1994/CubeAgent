@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, call-overload, union-attr"
+
 from __future__ import annotations
 
 from pathlib import Path

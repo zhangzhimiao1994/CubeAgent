@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
-from typing import Annotated, Any, Protocol, cast
+from types import TracebackType
+from typing import Annotated, Protocol, cast
 
 from fastapi import APIRouter, Depends, Request, status
 from pydantic import BaseModel, Field, field_validator
@@ -568,11 +569,18 @@ def _project_payload(project: ContentProject) -> dict[str, object]:
     return raw
 
 
-async def _call_service(method: object, *args: object, **kwargs: object) -> Any:
-    return await method(*args, **_supported_kwargs(method, kwargs))  # type: ignore[misc]
+async def _call_service(
+    method: Callable[..., Awaitable[ContentProject]],
+    *args: object,
+    **kwargs: object,
+) -> ContentProject:
+    return await method(*args, **_supported_kwargs(method, kwargs))
 
 
-def _supported_kwargs(method: object, kwargs: dict[str, object]) -> dict[str, object]:
+def _supported_kwargs(
+    method: Callable[..., Awaitable[ContentProject]],
+    kwargs: dict[str, object],
+) -> dict[str, object]:
     signature = inspect.signature(method)
     if any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -582,16 +590,30 @@ def _supported_kwargs(method: object, kwargs: dict[str, object]) -> dict[str, ob
     return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
+class _ServiceScope(Protocol):
+    def __enter__(self) -> object: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> object: ...
+
+
 def _service_scope(
     service: ContentStudioServiceProtocol,
     principal: AuthenticatedPrincipal,
-) -> object:
+) -> _ServiceScope:
     scoped_to = getattr(getattr(service, "_store", None), "scoped_to", None)
     if scoped_to is None:
         return nullcontext()
-    return scoped_to(
+    return cast(
+        _ServiceScope,
+        scoped_to(
         tenant_id=principal.tenant_id,
         owner_user_id=principal.user_id,
+        ),
     )
 
 

@@ -51,6 +51,12 @@ class FakeMediaRunner:
                 return CommandResult(stdout="", stderr="")
             output = Path(command[-1])
             output.parent.mkdir(parents=True, exist_ok=True)
+            if "%03d" in output.name:
+                for index in range(1, 4):
+                    output.with_name(output.name.replace("%03d", f"{index:03d}")).write_bytes(
+                        f"frame:{index}".encode()
+                    )
+                return CommandResult(stdout="", stderr="")
             output.write_bytes(f"rendered:{output.name}".encode())
             return CommandResult(stdout="", stderr="")
         raise AssertionError(f"unexpected command: {command}")
@@ -239,6 +245,47 @@ def test_silence_qc_fails_long_silence(tmp_path: Path) -> None:
     check = adapter._silence_check(tmp_path / "preview.mp4", 30)
 
     assert check.status == "failed"
+
+
+def test_video_reviewer_extracts_frames_and_checks_subtitle_text(tmp_path: Path) -> None:
+    image, audio = _media_files(tmp_path)
+    runner = FakeMediaRunner()
+    adapter = ContentStudioMediaAdapter(runner=runner, ffmpeg_binary="ffmpeg", ffprobe_binary="ffprobe")
+
+    preview = adapter.render_preview(
+        _request(
+            image=image,
+            audio=audio,
+            subtitles=(
+                SubtitleCue(
+                    "SUB001",
+                    0,
+                    2000,
+                    "这是一条带有口口占位符的字幕",
+                    80,
+                    1500,
+                    920,
+                    220,
+                    ("CLAIM001",),
+                ),
+            ),
+        ),
+        tmp_path / "reviewed",
+    )
+
+    frame_check = preview.qc.check("video_reviewer_frame_sampling")
+    text_check = preview.qc.check("subtitle_text_review")
+    assert frame_check.status == "passed"
+    assert "3 frames" in frame_check.details
+    assert len(preview.qc.review_frames) == 3
+    assert all(frame.path.name.startswith("review-frame-") for frame in preview.qc.review_frames)
+    assert text_check.status == "failed"
+    assert "SUB001" in text_check.details
+    assert any(
+        "fps=1/" in " ".join(command)
+        for command in runner.commands
+        if Path(command[0]).name == "ffmpeg"
+    )
 
 
 @pytest.mark.skipif(

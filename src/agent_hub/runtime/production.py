@@ -7,7 +7,6 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-
 _CHARACTER_ID_RE = re.compile(r"\bCHAR_[A-Z0-9]{2,16}_[0-9]{3}\b")
 _LOOK_ID_RE = re.compile(r"\bLOOK_[0-9]{3}\b")
 _ROLE_NAME_RE = re.compile(

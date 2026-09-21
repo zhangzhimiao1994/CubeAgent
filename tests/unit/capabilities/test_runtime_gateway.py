@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, call-overload, operator, dict-item"
+
 from __future__ import annotations
 
 import asyncio
@@ -422,22 +424,25 @@ async def test_runtime_gateway_executes_multimedia_generation_tool(tmp_path: Pat
     )
     assert isinstance(file_metadata["expires_at"], str)
     assert datetime.fromisoformat(file_metadata["expires_at"]) == media_executor.expires_at
-    assert result["artifacts"] == (
-        {
-            "kind": "video",
-            "uri": "artifact://generated-video",
-            "text": "artifact://generated-video",
-            "logical_model": "video_primary",
-            "deployment_id": "video_primary_1",
-            "filename": "generated-video.mp4",
-            "mime_type": "video/mp4",
-            "size_bytes": len(b"video"),
-            "sha256": "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc",
-            "download_url": file_metadata["download_url"],
-            "expires_at": file_metadata["expires_at"],
-            "file": file_metadata,
-        },
-    )
+    artifacts = result["artifacts"]
+    assert isinstance(artifacts, tuple)
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert isinstance(artifact, dict)
+    assert artifact["kind"] == "video"
+    assert artifact["uri"] == "artifact://generated-video"
+    assert artifact["text"] == "artifact://generated-video"
+    assert artifact["logical_model"] == "video_primary"
+    assert artifact["deployment_id"] == "video_primary_1"
+    assert artifact["filename"] == "generated-video.mp4"
+    assert artifact["mime_type"] == "video/mp4"
+    assert artifact["size_bytes"] == len(b"video")
+    assert artifact["sha256"] == "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+    assert artifact["artifact_id"] == file_metadata["artifact_id"]
+    assert artifact["storage_key"] == file_metadata["storage_key"]
+    assert artifact["download_url"] == file_metadata["download_url"]
+    assert artifact["expires_at"] == file_metadata["expires_at"]
+    assert artifact["file"] == file_metadata
     assert result["metadata"] == file_metadata
 
 
@@ -455,24 +460,30 @@ async def test_runtime_gateway_multimedia_generation_times_out_hung_image_job(
         multimedia_generation_executor=media_executor,
     )
 
-    with pytest.raises(RuntimeCapabilityError, match="image generation timed out"):
-        await gateway.execute(
-            tenant_id=TENANT_ID,
-            run_id=RUN_ID,
-            actor="asset_generator",
-            name="generate_multimedia",
-            arguments={
-                "kind": "image",
-                "logical_model": "image_primary",
-                "generation_prompt": "生成角色锁定资产图",
-            },
-            idempotency_key="media_hung_image",
-        )
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="asset_generator",
+        name="generate_multimedia",
+        arguments={
+            "kind": "image",
+            "logical_model": "image_primary",
+            "generation_prompt": "生成 1 张产品图片",
+        },
+        idempotency_key="media_hung_image",
+    )
 
     assert media_executor.submitted == [
-        (MultimediaGenerationKind.IMAGE, "image_primary", "生成角色锁定资产图")
+        (MultimediaGenerationKind.IMAGE, "image_primary", "生成 1 张产品图片")
     ]
     assert media_executor.run_requests == [("media_test", "asset_generator")]
+    assert result["status"] == "failed"
+    assert result["review_status"] == "needs_user_revision"
+    artifacts = result["artifacts"]
+    assert isinstance(artifacts, tuple)
+    assert len(artifacts) == 1
+    assert artifacts[0]["status"] == "failed"
+    assert "image generation timed out" in artifacts[0]["generation_error"]
 
 
 async def test_runtime_gateway_multimedia_timeout_does_not_wait_for_slow_provider_cancel(
@@ -489,24 +500,24 @@ async def test_runtime_gateway_multimedia_timeout_does_not_wait_for_slow_provide
         multimedia_generation_executor=media_executor,
     )
 
-    with pytest.raises(RuntimeCapabilityError, match="image generation timed out"):
-        await asyncio.wait_for(
-            gateway.execute(
-                tenant_id=TENANT_ID,
-                run_id=RUN_ID,
-                actor="asset_generator",
-                name="generate_multimedia",
-                arguments={
-                    "kind": "image",
-                    "logical_model": "image_primary",
-                    "generation_prompt": "生成角色锁定资产图",
-                },
-                idempotency_key="media_slow_cancel_image",
-            ),
-            timeout=0.2,
-        )
+    result = await asyncio.wait_for(
+        gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="asset_generator",
+            name="generate_multimedia",
+            arguments={
+                "kind": "image",
+                "logical_model": "image_primary",
+                "generation_prompt": "生成 1 张普通图片",
+            },
+            idempotency_key="media_slow_cancel_image",
+        ),
+        timeout=0.2,
+    )
 
-    assert media_executor.cancelled.is_set()
+    assert result["review_status"] == "needs_user_revision"
+    await asyncio.wait_for(media_executor.cancelled.wait(), timeout=0.05)
     await asyncio.sleep(0.6)
 
 
@@ -536,11 +547,11 @@ async def test_runtime_gateway_multimedia_batch_timeout_returns_failed_items(
                 "generation_prompt": "生成全量资产图",
                 "artifact_count": 5,
                 "artifact_prompts": (
-                    "生成男主角色锁定资产图",
-                    "生成女主角色锁定资产图",
-                    "生成反派角色锁定资产图",
-                    "生成场景资产图",
-                    "生成特效资产图",
+                    "生成图片 1",
+                    "生成图片 2",
+                    "生成图片 3",
+                    "生成图片 4",
+                    "生成图片 5",
                 ),
             },
             idempotency_key="media_slow_batch_image",

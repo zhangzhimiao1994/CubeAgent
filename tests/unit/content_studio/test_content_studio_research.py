@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, attr-defined"
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -66,6 +68,45 @@ class FakeResearchGateway:
         }
 
 
+class SourceTypeResearchGateway:
+    def __init__(self) -> None:
+        self.search_calls: list[dict[str, object]] = []
+        self.fetch_calls: list[str] = []
+
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        allowed_hosts: tuple[str, ...],
+    ) -> Sequence[Mapping[str, object]]:
+        self.search_calls.append(
+            {"query": query, "limit": limit, "allowed_hosts": allowed_hosts}
+        )
+        lowered = query.casefold()
+        if "release notes" in lowered:
+            return ({"url": "https://openai.com/release-notes/aigc-model"},)
+        if "github release" in lowered:
+            return ({"url": "https://github.com/openai/example/releases/tag/v1"},)
+        if "paper" in lowered:
+            return ({"url": "https://arxiv.org/abs/2609.12345"},)
+        if "official demo" in lowered:
+            return ({"url": "https://huggingface.co/spaces/openai/aigc-demo"},)
+        return ()
+
+    async def fetch(self, url: str) -> Mapping[str, object]:
+        self.fetch_calls.append(url)
+        return {
+            "url": url,
+            "publisher": "Source Publisher",
+            "retrieved_at": "2026-09-21T10:00:00Z",
+            "published_at": "2026-09-01T00:00:00Z",
+            "content": f"Evidence content from {url} for source coverage.",
+            "license": "source_terms",
+            "locator": "body",
+        }
+
+
 class RecordingExtractionProvider:
     def __init__(self, payload: Mapping[str, object]) -> None:
         self.payload = payload
@@ -128,6 +169,34 @@ def domain_pack() -> PackManifest:
             "official_hosts": ("openai.com",),
             "source_types": {"openai.com": "official_docs", "example-news.com": "secondary_media"},
             "default_license": "public-web",
+        },
+    )
+
+
+def broad_domain_pack() -> PackManifest:
+    return PackManifest(
+        pack_type="domain",
+        name="aigc",
+        version="1.0.0",
+        schema_version="1.0",
+        compatible_core=">=0.1",
+        settings={
+            "source_priority": (
+                "official_docs",
+                "release_notes",
+                "github_release",
+                "paper",
+                "official_demo",
+            ),
+            "allowed_hosts": ("openai.com", "github.com", "arxiv.org", "huggingface.co"),
+            "official_hosts": ("openai.com", "github.com", "huggingface.co"),
+            "source_types": {
+                "openai.com": "official_docs",
+                "github.com": "github_release",
+                "arxiv.org": "paper",
+                "huggingface.co": "official_demo",
+            },
+            "default_license": "source_terms",
         },
     )
 
@@ -254,6 +323,57 @@ async def test_questions_are_available_before_retrieval_and_stages_can_run_indep
     assert bundle.evidence
 
 
+async def test_retrieve_expands_authoritative_source_types_and_records_coverage() -> None:
+    gateway = SourceTypeResearchGateway()
+    adapter = ResearchAdapter(
+        gateway=gateway,
+        extraction_provider=RecordingExtractionProvider({"claims": []}),
+    )
+
+    bundle = await adapter.retrieve(
+        topic="AIGC model release",
+        source_urls=("https://platform.openai.com/docs/models",),
+        domain_pack=broad_domain_pack(),
+        questions=(),
+    )
+
+    assert len(gateway.search_calls) >= 5
+    assert any("release notes" in str(call["query"]).casefold() for call in gateway.search_calls)
+    assert any("github release" in str(call["query"]).casefold() for call in gateway.search_calls)
+    assert bundle.source_priority == (
+        "official_docs",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+    )
+    assert bundle.retrieval_plan
+    assert len(bundle.source_candidates) >= 5
+    assert {item.source_type for item in bundle.source_candidates} >= {
+        "official_docs",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+    }
+    evidence_types = {item.source_type for item in bundle.evidence}
+    assert {
+        "official_docs",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+    }.issubset(evidence_types)
+    coverage = {item.source_type: item.status for item in bundle.source_coverage}
+    assert coverage == {
+        "official_docs": "covered",
+        "release_notes": "covered",
+        "github_release": "covered",
+        "paper": "covered",
+        "official_demo": "covered",
+    }
+
+
 async def test_fact_check_rejects_empty_claim_graph() -> None:
     bundle = await ResearchAdapter(
         gateway=FakeResearchGateway(),
@@ -374,7 +494,7 @@ async def test_official_classification_uses_host_allowlist_not_docs_substring() 
         questions=adapter.plan_questions("docs substring", pack),
     )
 
-    assert bundle.evidence[0].source_type == "web"
+    assert bundle.evidence[0].source_type == "secondary_media"
     assert bundle.evidence[0].publisher == "Blog"
 
 

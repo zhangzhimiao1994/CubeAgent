@@ -17,6 +17,14 @@ const STAGES = [
 
 type Stage = (typeof STAGES)[number];
 
+const PHASE_ACTIONS: Array<{ label: string; until: Stage; description: string }> = [
+  { label: "1. 运行 Research / Fact Check", until: "FACT_CHECKED", description: "只完成调研、证据图和事实核验。" },
+  { label: "2. 生成 Plan / Script", until: "SCRIPT_READY", description: "生成内容计划、Hook 和脚本，随后等待脚本批准。" },
+  { label: "3. 生成 Storyboard / Assets", until: "ASSETS_READY", description: "脚本批准后生成分镜和素材，随后等待版权/素材审核。" },
+  { label: "4. 生成 Voice / Timeline / Preview", until: "PREVIEW_RENDERED", description: "版权批准后生成配音、时间线和预览。" },
+  { label: "5. 运行 Video QC", until: "QC_REVIEW", description: "对预览做质量检查，终片批准仍需人工确认。" },
+];
+
 type AssetSummary = {
   asset_id: string;
   title: string;
@@ -28,6 +36,17 @@ type EvidenceSummary = {
   evidence_id: string;
   title: string;
   source_url: string;
+};
+
+type HistoryItem = {
+  id: string;
+  sequence: number;
+  title: string;
+  stage: string;
+  status: string;
+  summary: string;
+  artifactRefs: string[];
+  payload?: unknown;
 };
 
 const contentStudioProjectKey = (projectId: string) => ["content-studio-project", projectId] as const;
@@ -189,6 +208,7 @@ export function ContentStudioPage() {
   const claimNeedsEvidence = claimStatus === "supported" || claimStatus === "partially_supported";
   const canUpdateClaim = Boolean(activeProjectId && claimId.trim() && (!claimNeedsEvidence || claimEvidenceIds.length > 0));
   const statusSummary = useMemo(() => projectStatusSummary(visibleProject), [visibleProject]);
+  const historyItems = useMemo(() => collectProjectHistory(visibleProject), [visibleProject]);
   const anyActionPending =
     runProject.isPending ||
     reviseScript.isPending ||
@@ -249,15 +269,16 @@ export function ContentStudioPage() {
           <button type="submit" disabled={createProject.isPending}>
             {createProject.isPending ? "创建中..." : "创建项目"}
           </button>
-          {STAGES.map((stage) => (
+          {PHASE_ACTIONS.map((phase) => (
             <button
-              key={stage}
+              key={phase.until}
               type="button"
               className="secondary-action"
               disabled={!activeProjectId || anyActionPending}
-              onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: stage })}
+              title={phase.description}
+              onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: phase.until })}
             >
-              运行到 {stage}
+              {phase.label}
             </button>
           ))}
         </div>
@@ -329,6 +350,39 @@ export function ContentStudioPage() {
           <ApprovalPill approved={Boolean(visibleProject?.script_approved)} approvedText="脚本已批准" pendingText="脚本待批准" />
           <ApprovalPill approved={Boolean(visibleProject?.rights_approved)} approvedText="版权已批准" pendingText="版权待批准" />
           <ApprovalPill approved={Boolean(visibleProject?.final_approved)} approvedText="终片已批准" pendingText="终片待批准" />
+        </div>
+      </section>
+
+      <section className="section-band" aria-label="项目历史">
+        <p className="eyebrow">History</p>
+        <h3>项目历史与产物记录</h3>
+        <p className="content-studio-helper">按发生顺序保留调研、事实链、脚本、素材、配音、渲染、QC、失败和重试记录。</p>
+        <div className="content-studio-history" role="list">
+          {historyItems.length ? (
+            historyItems.map((item) => (
+              <article key={item.id} className="content-studio-history-item" role="listitem">
+                <div>
+                  <span className="content-studio-history-index">{item.sequence}</span>
+                  <strong>{item.title}</strong>
+                  <small>
+                    {item.stage} · {item.status}
+                  </small>
+                </div>
+                <p>{item.summary}</p>
+                {item.artifactRefs.length ? (
+                  <p className="content-studio-history-refs">关联产物：{item.artifactRefs.join("、")}</p>
+                ) : null}
+                {item.payload ? (
+                  <details>
+                    <summary>查看历史详情</summary>
+                    <pre className="json-preview">{JSON.stringify(item.payload, null, 2)}</pre>
+                  </details>
+                ) : null}
+              </article>
+            ))
+          ) : (
+            <p>暂无历史记录。</p>
+          )}
         </div>
       </section>
 
@@ -569,7 +623,7 @@ export function ContentStudioPage() {
       </section>
 
       <div className="resource-list content-studio-grid" aria-label="Content Studio 状态分区">
-        <StudioPanel title="Research" value={visibleProject?.research_bundle} />
+        <ResearchPanel value={visibleProject?.research_bundle} />
         <StudioPanel title="Evidence" value={visibleProject?.evidence_graph} />
         <StudioPanel title="Fact Check" value={visibleProject?.fact_check_report} />
         <StudioPanel title="Plan" value={visibleProject?.content_plan} />
@@ -597,6 +651,56 @@ function ApprovalPill({
     <span className={approved ? "status-pill status-pill-success" : "status-pill status-pill-muted"}>
       {approved ? approvedText : pendingText}
     </span>
+  );
+}
+
+function ResearchPanel({ value }: { value: unknown }) {
+  const coverage = arrayValue(recordValue(value)?.source_coverage);
+  const candidates = arrayValue(recordValue(value)?.source_candidates);
+  const evidence = arrayValue(recordValue(value)?.evidence);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>Research</h3>
+      <p>{value ? `${evidence.length} 条证据 · ${coverage.length} 类来源覆盖 · ${candidates.length} 个候选源` : "等待调研"}</p>
+      {coverage.length ? (
+        <div className="content-studio-source-coverage" aria-label="Research 来源覆盖">
+          {coverage.map((item, index) => {
+            const row = recordValue(item);
+            const sourceType = stringValue(row?.source_type) ?? `source-${index + 1}`;
+            const status = stringValue(row?.status) ?? "unknown";
+            const required = Boolean(row?.required);
+            return (
+              <span key={`${sourceType}-${index}`} className={status === "covered" ? "status-pill status-pill-success" : "status-pill status-pill-muted"}>
+                {sourceType} · {required ? "必需" : "补充"} · {status}
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+      {candidates.length ? (
+        <details>
+          <summary>查看候选源池</summary>
+          <ul className="content-studio-source-list">
+            {candidates.slice(0, 16).map((item, index) => {
+              const row = recordValue(item);
+              return (
+                <li key={`${stringValue(row?.source_url) ?? "source"}-${index}`}>
+                  <strong>{stringValue(row?.source_type) ?? "source"}</strong>
+                  <span>{stringValue(row?.source_url) ?? "unknown"}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
   );
 }
 
@@ -731,6 +835,138 @@ function parseEvidenceIdText(value: string): string[] {
   );
 }
 
+function collectProjectHistory(project: ContentStudioProject | undefined): HistoryItem[] {
+  if (!project) return [];
+  const items = [
+    ...collectProjectEvents(project),
+    ...collectProviderAttemptHistory(project),
+  ];
+  const keyed = new Map<string, HistoryItem>();
+  for (const item of items) {
+    keyed.set(item.id, item);
+  }
+  if (!keyed.size) {
+    for (const item of collectCurrentArtifactHistory(project)) {
+      keyed.set(item.id, item);
+    }
+  }
+  return Array.from(keyed.values()).sort((left, right) => left.sequence - right.sequence);
+}
+
+function collectProjectEvents(project: ContentStudioProject): HistoryItem[] {
+  const record = project as Record<string, unknown>;
+  const rawEvents = record.project_events ?? record.events ?? record.history;
+  if (!Array.isArray(rawEvents)) return [];
+  return rawEvents.flatMap((raw, index): HistoryItem[] => {
+    if (!isRecord(raw)) return [];
+    const id = stringValue(raw.event_id) ?? stringValue(raw.id) ?? `event-${index + 1}`;
+    return [
+      {
+        id,
+        sequence: numberValue(raw.sequence) ?? index + 1,
+        title: stringValue(raw.title) ?? stringValue(raw.kind) ?? "项目事件",
+        stage: stringValue(raw.stage) ?? "project",
+        status: stringValue(raw.status) ?? "",
+        summary: stringValue(raw.summary) ?? valueSummary(raw.payload),
+        artifactRefs: stringArray(raw.artifact_refs),
+        payload: raw.payload ?? raw,
+      },
+    ];
+  });
+}
+
+function collectProviderAttemptHistory(project: ContentStudioProject): HistoryItem[] {
+  const record = project as Record<string, unknown>;
+  const rawAttempts = record.provider_attempts;
+  if (!Array.isArray(rawAttempts)) return [];
+  const offset = collectProjectEvents(project).length + 1;
+  return rawAttempts.flatMap((raw, index): HistoryItem[] => {
+    if (!isRecord(raw)) return [];
+    const stage = stringValue(raw.stage) ?? "provider";
+    const status = stringValue(raw.status) ?? "";
+    const idempotencyKey = stringValue(raw.idempotency_key) ?? `${stage}-${index + 1}`;
+    const resultHash = stringValue(raw.result_hash) ?? "";
+    const eventId = `provider-${idempotencyKey}-${status}-${resultHash}`;
+    return [
+      {
+        id: eventId,
+        sequence: offset + index,
+        title: `${stage} Provider 调用`,
+        stage,
+        status,
+        summary: providerAttemptSummary(raw, stage, status),
+        artifactRefs: stringArray(raw.provider_task_id ? [raw.provider_task_id] : []),
+        payload: raw,
+      },
+    ];
+  });
+}
+
+function collectCurrentArtifactHistory(project: ContentStudioProject): HistoryItem[] {
+  const stages: Array<[string, string, unknown]> = [
+    ["Research 调研", "research", project.research_bundle],
+    ["Evidence 事实链", "evidence", project.evidence_graph],
+    ["Fact Check 核验", "fact_check", project.fact_check_report],
+    ["Content Plan 计划", "plan", project.content_plan],
+    ["Script 脚本", "script", project.script],
+    ["Storyboard 分镜", "storyboard", project.storyboard],
+    ["Assets 素材", "assets", project.asset_manifest],
+    ["Voice 配音", "voice", project.voice_track],
+    ["Timeline 时间线", "timeline", project.timeline],
+    ["QC 质检", "qc", project.qc_report],
+  ];
+  return stages.flatMap(([title, stage, value], index): HistoryItem[] => {
+    if (!value) return [];
+    return [
+      {
+        id: `current-${stage}`,
+        sequence: index + 1,
+        title,
+        stage,
+        status: "current",
+        summary: valueSummary(value),
+        artifactRefs: artifactRefsFromValue(value),
+        payload: value,
+      },
+    ];
+  });
+}
+
+function providerAttemptSummary(raw: Record<string, unknown>, stage: string, status: string): string {
+  const errorCode = stringValue(raw.error_code);
+  const providerTaskId = stringValue(raw.provider_task_id);
+  const resultHash = stringValue(raw.result_hash);
+  if (status === "completed") return `${stage} 调用完成：${providerTaskId ?? resultHash ?? "已完成"}`;
+  if (errorCode) return `${stage} 调用失败：${errorCode}`;
+  return `${stage} 调用状态：${status || "unknown"}`;
+}
+
+function artifactRefsFromValue(value: unknown): string[] {
+  if (!isRecord(value)) return [];
+  const refs = [
+    stringValue(value.audio_artifact_id),
+    stringValue(value.preview_artifact_id),
+    stringValue(value.final_artifact_id),
+    stringValue(value.asset_id),
+    stringValue(value.claim_id),
+    stringValue(value.evidence_id),
+  ].filter((item): item is string => Boolean(item));
+  const nested = Object.values(value).flatMap((item) => {
+    if (!Array.isArray(item)) return [];
+    return item.flatMap((entry) => {
+      if (!isRecord(entry)) return [];
+      return [
+        stringValue(entry.asset_id),
+        stringValue(entry.claim_id),
+        stringValue(entry.evidence_id),
+        stringValue(entry.shot_id),
+        stringValue(entry.segment_id),
+      ].filter((inner): inner is string => Boolean(inner));
+    });
+  });
+  return Array.from(new Set([...refs, ...nested])).slice(0, 12);
+}
+
 function valueSummary(value: unknown): string {
   if (!value) return "暂无产物";
   if (isRecord(value)) {
@@ -747,6 +983,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item).trim()).filter(Boolean);
 }

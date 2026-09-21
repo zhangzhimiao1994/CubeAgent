@@ -1,3 +1,5 @@
+# mypy: disable-error-code="arg-type, return-value, no-untyped-call, no-untyped-def"
+
 from __future__ import annotations
 
 import wave
@@ -7,15 +9,23 @@ from uuid import uuid4
 
 import pytest
 
-from agent_hub.app import _ConfigBackedContentStudioProductionProvider, _write_demo_signal_wav
+from agent_hub.app import (
+    _ConfigBackedContentStudioProductionProvider,
+    _content_studio_research_bundle,
+    _qc_report_from_media,
+    _write_demo_signal_wav,
+)
 from agent_hub.content_studio import (
     AssetManifest,
     AssetRecord,
     ContentStudioService,
+    Evidence,
     InMemoryContentProjectStore,
     PackRegistry,
     ProjectStatus,
+    ResearchQuestion,
 )
+from agent_hub.content_studio.media import MediaQCCheck, MediaQCResult
 from agent_hub.multimodal.generation import MultimediaGenerationKind, MultimediaGenerationResult
 
 
@@ -75,6 +85,77 @@ async def test_content_studio_voice_keeps_demo_blocker_without_audio_generation(
     assert voiced.voice_track is not None
     assert voiced.voice_track.source == "demo_signal"
     assert any("BLOCKER" in item for item in voiced.voice_track.pronunciation_report)
+
+
+def test_production_research_bundle_keeps_source_coverage_for_workbench() -> None:
+    service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
+    project = service.create_content_project(
+        title="AIGC research metadata",
+        topic="AIGC research metadata",
+        source_urls=("https://openai.com/release-notes/example",),
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="fast_minimal",
+        execution_mode="production",
+    )
+    questions = (ResearchQuestion("RQ001", "What changed?"),)
+    evidence = (
+        Evidence(
+            evidence_id="EV001",
+            source_url="https://openai.com/release-notes/example",
+            source_type="release_notes",
+            publisher="OpenAI",
+            published_at=None,
+            retrieved_at="2026-09-21T10:00:00Z",
+            content_hash="hash1",
+            locator="body",
+            excerpt="Release note evidence.",
+            license="source_terms",
+        ),
+        Evidence(
+            evidence_id="EV002",
+            source_url="https://github.com/openai/example/releases/tag/v1",
+            source_type="github_release",
+            publisher="GitHub",
+            published_at=None,
+            retrieved_at="2026-09-21T10:01:00Z",
+            content_hash="hash2",
+            locator="body",
+            excerpt="GitHub release evidence.",
+            license="source_terms",
+        ),
+    )
+
+    bundle = _content_studio_research_bundle(project, questions, evidence)
+
+    assert bundle.source_priority[:3] == ("official_docs", "official_blog", "release_notes")
+    coverage = {item.source_type: item.status for item in bundle.source_coverage}
+    assert coverage["release_notes"] == "covered"
+    assert coverage["github_release"] == "covered"
+    assert coverage["official_docs"] == "missing"
+    assert {item.source_url for item in bundle.source_candidates} >= {
+        "https://openai.com/release-notes/example",
+        "https://github.com/openai/example/releases/tag/v1",
+    }
+
+
+def test_video_reviewer_failures_are_visible_and_block_final_approval() -> None:
+    project = _voice_ready_project()
+    media_qc = MediaQCResult(
+        checks=(
+            MediaQCCheck("encoding", "passed", "ok"),
+            MediaQCCheck("video_reviewer_frame_sampling", "passed", "视频审核员已抽取 3 frames。"),
+            MediaQCCheck("subtitle_text_review", "failed", "SUB001 疑似错字或乱码。"),
+        )
+    )
+
+    report = _qc_report_from_media(project, media_qc)
+
+    assert "video reviewer: video_reviewer_frame_sampling passed - 视频审核员已抽取 3 frames。" in report.checked_items
+    assert "video reviewer: subtitle_text_review failed - SUB001 疑似错字或乱码。" in report.checked_items
+    assert "video reviewer QC failed: subtitle_text_review" in report.blockers
 
 
 def _voice_ready_project():

@@ -23,6 +23,8 @@ from agent_hub.content_studio import (
     PackManifest,
     ResearchBundle,
     ResearchQuestion,
+    ResearchSourceCandidate,
+    ResearchSourceCoverage,
 )
 
 
@@ -137,27 +139,55 @@ class ResearchAdapter:
         allowed_hosts = _settings_tuple(pack_settings, "allowed_hosts")
         if not allowed_hosts:
             raise ResearchValidationError("domain pack must define allowed_hosts")
+        source_priority = _source_priority(pack_settings)
         planned_questions = tuple(questions) or self.plan_questions(normalized_topic, domain_pack)
         urls: list[str] = []
+        source_type_by_url: dict[str, str] = {}
+        source_candidates: list[ResearchSourceCandidate] = []
         for url in source_urls:
             normalized_url = _allowed_url(url, allowed_hosts)
             if normalized_url not in urls:
                 urls.append(normalized_url)
-        query = f"{normalized_topic} " + " ".join(question.text for question in planned_questions)
-        for result in await self._gateway.search(
-            query.strip(),
-            limit=self._search_limit,
-            allowed_hosts=allowed_hosts,
-        ):
-            result_url = result.get("url")
-            if type(result_url) is not str:
-                continue
-            try:
-                normalized_url = _allowed_url(result_url, allowed_hosts)
-            except ResearchValidationError:
-                continue
-            if normalized_url not in urls:
-                urls.append(normalized_url)
+            detected_type = _source_type_for_url(normalized_url, pack_settings)
+            source_type_by_url[normalized_url] = detected_type
+            source_candidates.append(
+                ResearchSourceCandidate(
+                    source_type=detected_type,
+                    source_url=normalized_url,
+                    priority=0,
+                    rationale="user supplied source URL",
+                )
+            )
+        for priority, source_type in enumerate(source_priority, start=1):
+            query = _source_type_query(normalized_topic, planned_questions, source_type)
+            for result in await self._gateway.search(
+                query,
+                limit=self._search_limit,
+                allowed_hosts=allowed_hosts,
+            ):
+                result_url = result.get("url")
+                if type(result_url) is not str:
+                    continue
+                try:
+                    normalized_url = _allowed_url(result_url, allowed_hosts)
+                except ResearchValidationError:
+                    continue
+                detected_type = _source_type_for_url(
+                    normalized_url,
+                    pack_settings,
+                    source_type_hint=source_type,
+                )
+                source_candidates.append(
+                    ResearchSourceCandidate(
+                        source_type=detected_type,
+                        source_url=normalized_url,
+                        priority=priority,
+                        rationale=f"{source_type} search result",
+                    )
+                )
+                if normalized_url not in urls:
+                    urls.append(normalized_url)
+                    source_type_by_url[normalized_url] = detected_type
         evidence = []
         for index, url in enumerate(urls, start=1):
             fetched = await self._gateway.fetch(url)
@@ -167,11 +197,22 @@ class ResearchAdapter:
                     evidence_id=f"EV{index:03d}",
                     requested_url=url,
                     settings=pack_settings,
+                    source_type_hint=source_type_by_url.get(url),
                 )
             )
         if not evidence:
             raise ResearchValidationError("research retrieval produced no evidence")
-        return ResearchBundle(questions=planned_questions, evidence=tuple(evidence))
+        return ResearchBundle(
+            questions=planned_questions,
+            evidence=tuple(evidence),
+            source_priority=source_priority,
+            retrieval_plan=tuple(
+                f"{index}. Search {source_type.replace('_', ' ')} sources before using lower-priority material"
+                for index, source_type in enumerate(source_priority, start=1)
+            ),
+            source_coverage=_research_source_coverage(source_priority, tuple(evidence)),
+            source_candidates=_dedupe_source_candidates(tuple(source_candidates)),
+        )
 
     async def extract(
         self,
@@ -330,6 +371,36 @@ def _settings_tuple(settings: Mapping[str, object], key: str) -> tuple[str, ...]
     return tuple(str(item).strip().casefold() for item in raw if str(item).strip())
 
 
+def _source_priority(settings: Mapping[str, object]) -> tuple[str, ...]:
+    return _settings_tuple(settings, "source_priority") or (
+        "official_docs",
+        "official_blog",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+        "secondary_media",
+    )
+
+
+def _source_type_query(
+    topic: str,
+    questions: Sequence[ResearchQuestion],
+    source_type: str,
+) -> str:
+    labels = {
+        "official_docs": "official documentation docs",
+        "official_blog": "official blog announcement",
+        "release_notes": "release notes changelog",
+        "github_release": "GitHub release",
+        "paper": "paper arxiv technical report",
+        "official_demo": "official demo example",
+        "secondary_media": "reputable secondary media analysis",
+    }
+    question_text = " ".join(question.text for question in questions)
+    return f"{topic} {labels.get(source_type, source_type.replace('_', ' '))} {question_text}".strip()
+
+
 def _allowed_url(url: str, allowed_hosts: tuple[str, ...]) -> str:
     candidate = _nonblank(url, "source_url")
     parsed = urlsplit(candidate)
@@ -363,11 +434,11 @@ def _evidence_from_fetched(
     evidence_id: str,
     requested_url: str,
     settings: Mapping[str, object],
+    source_type_hint: str | None = None,
 ) -> Evidence:
     fetched_url = fetched.get("url")
     source_url = requested_url if type(fetched_url) is not str else fetched_url.strip()
     source_url = _allowed_url(source_url, _settings_tuple(settings, "allowed_hosts"))
-    host = (urlsplit(source_url).hostname or "").casefold()
     retrieved_at = _required_string(fetched, "retrieved_at")
     _iso_datetime(retrieved_at, "retrieved_at")
     content = _required_string(fetched, "content")
@@ -385,7 +456,7 @@ def _evidence_from_fetched(
     return Evidence(
         evidence_id=evidence_id,
         source_url=source_url,
-        source_type=_source_type_for_host(host, settings),
+        source_type=_source_type_for_url(source_url, settings, source_type_hint=source_type_hint),
         publisher=publisher,
         published_at=published_at,
         retrieved_at=retrieved_at,
@@ -396,16 +467,93 @@ def _evidence_from_fetched(
     )
 
 
-def _source_type_for_host(host: str, settings: Mapping[str, object]) -> str:
-    source_types = settings.get("source_types")
-    if isinstance(source_types, Mapping):
-        value = source_types.get(host)
-        if type(value) is str and value.strip():
-            return value.strip()
+def _source_type_for_url(
+    url: str,
+    settings: Mapping[str, object],
+    *,
+    source_type_hint: str | None = None,
+) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    configured_type = _configured_source_type_for_host(host, settings)
     official_hosts = _settings_tuple(settings, "official_hosts")
-    if official_hosts and _host_allowed(host, official_hosts):
+    configured_official = bool(configured_type and configured_type not in {"secondary_media", "web"})
+    official_host = configured_official or bool(official_hosts and _host_allowed(host, official_hosts))
+    if official_host:
+        path_detected = _source_type_for_path(host, path)
+        if path_detected is not None:
+            return path_detected
+    if configured_type:
+        return configured_type
+    if source_type_hint and source_type_hint != "secondary_media" and official_host:
+        return source_type_hint
+    if official_host:
         return "official_docs"
     return "web"
+
+
+def _configured_source_type_for_host(host: str, settings: Mapping[str, object]) -> str | None:
+    source_types = settings.get("source_types")
+    if isinstance(source_types, Mapping):
+        for configured_host, configured_type in source_types.items():
+            if type(configured_host) is not str or type(configured_type) is not str:
+                continue
+            normalized_host = configured_host.strip().casefold()
+            if normalized_host and (host == normalized_host or host.endswith(f".{normalized_host}")):
+                return configured_type.strip()
+    return None
+
+
+def _source_type_for_path(host: str, path: str) -> str | None:
+    if (host == "github.com" or host.endswith(".github.com")) and "/releases" in path:
+        return "github_release"
+    if host == "arxiv.org" or host.endswith(".arxiv.org"):
+        return "paper"
+    if "/release" in path or "/changelog" in path or "/updates" in path:
+        return "release_notes"
+    if "/blog" in path or "/news" in path or "/announcements" in path:
+        return "official_blog"
+    if "/demo" in path or "/examples" in path or "/spaces/" in path:
+        return "official_demo"
+    if "/docs" in path or "/documentation" in path or "/guide" in path:
+        return "official_docs"
+    return None
+
+
+def _research_source_coverage(
+    source_priority: tuple[str, ...],
+    evidence: tuple[Evidence, ...],
+) -> tuple[ResearchSourceCoverage, ...]:
+    evidence_by_type: dict[str, list[str]] = {}
+    for item in evidence:
+        evidence_by_type.setdefault(item.source_type, []).append(item.evidence_id)
+    return tuple(
+        ResearchSourceCoverage(
+            source_type=source_type,
+            required=source_type != "secondary_media",
+            evidence_ids=tuple(evidence_by_type.get(source_type, ())),
+            status="covered" if evidence_by_type.get(source_type) else "missing",
+            note="source category has retrieved evidence"
+            if evidence_by_type.get(source_type)
+            else "source category was searched but produced no accepted evidence",
+        )
+        for source_type in source_priority
+    )
+
+
+def _dedupe_source_candidates(
+    candidates: tuple[ResearchSourceCandidate, ...],
+) -> tuple[ResearchSourceCandidate, ...]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ResearchSourceCandidate] = []
+    for candidate in candidates:
+        key = (candidate.source_type, candidate.source_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return tuple(deduped)
 
 
 def _excerpt(content: str) -> str:

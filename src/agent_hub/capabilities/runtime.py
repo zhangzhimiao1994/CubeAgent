@@ -946,7 +946,7 @@ class RuntimeCapabilityGateway:
 
     def _consume_background_multimedia_execution_result(
         self,
-        future: asyncio.Future[object],
+        future: asyncio.Future[_MultimediaPromptExecution],
     ) -> None:
         try:
             future.result()
@@ -1646,6 +1646,7 @@ def _failed_multimedia_prompt_execution(
         "kind": kind.value,
         "label": label,
         "title": label,
+        "status": "failed",
         "generation_prompt": item_prompt,
         "visual_review": _visual_review_payload(review),
         "generation_error": error_text,
@@ -2019,7 +2020,7 @@ def _content_project_payload(project: object) -> Mapping[str, JsonValue]:
     value = _jsonify_content_value(project)
     if not isinstance(value, Mapping):
         raise RuntimeCapabilityError("content_studio result is invalid")
-    return cast(Mapping[str, JsonValue], value)
+    return value
 
 
 async def _call_content_studio_service(method: object, **kwargs: object) -> object:

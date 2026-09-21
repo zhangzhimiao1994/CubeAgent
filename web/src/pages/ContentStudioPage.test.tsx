@@ -71,6 +71,49 @@ const contentProject: TestProject = {
     blockers: [],
     summary: "演示预览可播放，但未进入正式生产。",
   },
+  project_events: [
+    {
+      event_id: "event-1",
+      sequence: 1,
+      kind: "stage_completed",
+      stage: "research",
+      status: "RESEARCH_READY",
+      title: "Research 调研",
+      summary: "3 个研究问题，2 条证据",
+      artifact_refs: ["EV001"],
+      payload: { questions: ["AIGC 发生了什么？"] },
+    },
+    {
+      event_id: "event-2",
+      sequence: 2,
+      kind: "stage_failed",
+      stage: "voice",
+      status: "failed",
+      title: "阶段失败",
+      summary: "tts_timeout: qwen-tts 首次调用超时",
+      artifact_refs: [],
+      payload: { error_code: "tts_timeout" },
+    },
+    {
+      event_id: "event-3",
+      sequence: 3,
+      kind: "provider_attempt",
+      stage: "voice",
+      status: "completed",
+      title: "Voice Provider 调用",
+      summary: "voice 调用完成：voice.mp3",
+      artifact_refs: ["voice.mp3"],
+      payload: { provider_task_id: "voice.mp3" },
+    },
+  ],
+  provider_attempts: [
+    {
+      stage: "voice",
+      status: "failed",
+      idempotency_key: "project-123:voice",
+      error_code: "tts_timeout",
+    },
+  ],
 };
 
 const otherProject: TestProject = {
@@ -177,6 +220,9 @@ describe("ContentStudioPage", () => {
     expect(screen.getByText("版权待批准")).not.toBeNull();
     expect(screen.getByText("终片待批准")).not.toBeNull();
     expect(screen.getByText("女主定妆资产")).not.toBeNull();
+    expect(screen.getByText("Research 调研")).not.toBeNull();
+    expect(screen.getByText("tts_timeout: qwen-tts 首次调用超时")).not.toBeNull();
+    expect(screen.getByText("关联产物：voice.mp3")).not.toBeNull();
     expect(screen.getAllByText("查看结构化详情").length).toBeGreaterThan(0);
   });
 
@@ -213,7 +259,7 @@ describe("ContentStudioPage", () => {
     render(<TestApp initialPath="/content-studio?project=project-123" />);
 
     expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "运行到 QC_REVIEW" }));
+    await user.click(screen.getByRole("button", { name: "5. 运行 Video QC" }));
     await waitFor(() => expect(screen.getByText("QC 通过，可进入终片批准。")).not.toBeNull());
     visibleProject = {
       ...contentProject,
@@ -235,7 +281,7 @@ describe("ContentStudioPage", () => {
     render(<TestApp initialPath="/content-studio?project=project-123" />);
 
     expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "运行到 RESEARCH_READY" }));
+    await user.click(screen.getByRole("button", { name: "1. 运行 Research / Fact Check" }));
     await user.clear(screen.getByLabelText("项目 ID"));
     await user.type(screen.getByLabelText("项目 ID"), "project-456");
     await user.click(screen.getByRole("button", { name: "打开项目" }));
@@ -308,7 +354,7 @@ describe("ContentStudioPage", () => {
     await waitFor(() => expect(screen.getByText("版权已批准")).not.toBeNull());
     expect((screen.getByRole("button", { name: "批准终片" }) as HTMLButtonElement).disabled).toBe(true);
 
-    await user.click(screen.getByRole("button", { name: "运行到 QC_REVIEW" }));
+    await user.click(screen.getByRole("button", { name: "5. 运行 Video QC" }));
     await waitFor(() => expect((screen.getByRole("button", { name: "批准终片" }) as HTMLButtonElement).disabled).toBe(false));
     await user.click(screen.getByRole("button", { name: "批准终片" }));
 

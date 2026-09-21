@@ -2143,9 +2143,7 @@ def _is_asset_locked_video_pipeline_request(task: str) -> bool:
         and not _requires_media_generation_before_composition(task)
         and not _is_script_first_media_generation_request(task)
     )
-    if existing_composition_only:
-        return False
-    return True
+    return not existing_composition_only
 
 
 def _is_script_first_asset_image_request(task: str) -> bool:

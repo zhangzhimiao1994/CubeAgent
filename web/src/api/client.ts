@@ -830,6 +830,8 @@ const ContentStudioProjectSchema = z
     voice_track: z.unknown().nullable().optional(),
     timeline: z.unknown().nullable().optional(),
     qc_report: z.unknown().nullable().optional(),
+    provider_attempts: z.array(z.unknown()).default([]),
+    project_events: z.array(z.unknown()).default([]),
   })
   .passthrough();
 

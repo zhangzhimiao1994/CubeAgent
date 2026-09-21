@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, union-attr"
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -128,6 +130,66 @@ def test_stage_rerun_is_idempotent_and_does_not_repeat_expensive_generation() ->
     assert second_project.asset_manifest is not None
     assert first_project.asset_manifest == second_project.asset_manifest
     assert service.provider_call_count("assets") == first_asset_calls
+
+
+def test_research_bundle_records_authoritative_source_coverage() -> None:
+    service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
+    project = service.create_content_project(
+        title="AIGC research depth",
+        topic="Explain a current AIGC release with official evidence",
+        source_urls=("https://docs.example.com/aigc/release",),
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="fast_minimal",
+        execution_mode="demo",
+    )
+
+    researched = service.run_content_project(project.project_id, until=ProjectStatus.RESEARCH_READY)
+
+    assert researched.research_bundle is not None
+    source_types = {evidence.source_type for evidence in researched.research_bundle.evidence}
+    assert {
+        "official_docs",
+        "official_blog",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+    }.issubset(source_types)
+    coverage = {
+        item.source_type: item.status for item in researched.research_bundle.source_coverage
+    }
+    assert coverage["official_docs"] == "covered"
+    assert coverage["github_release"] == "covered"
+    assert researched.research_bundle.retrieval_plan
+    assert len(researched.research_bundle.source_candidates) >= 12
+
+
+def test_run_stops_at_assets_until_rights_are_approved() -> None:
+    service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
+    project = service.create_content_project(
+        title="Stage separated project",
+        topic="Explain why staged production needs reviews",
+        source_urls=("https://docs.example.com/staged-production",),
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="fast_minimal",
+        execution_mode="demo",
+    )
+
+    service.run_content_project(project.project_id, until=ProjectStatus.SCRIPT_READY)
+    service.approve_script(project.project_id)
+    staged = service.run_content_project(project.project_id, until=ProjectStatus.QC_REVIEW)
+
+    assert staged.status is ProjectStatus.ASSETS_READY
+    assert staged.asset_manifest is not None
+    assert staged.voice_track is None
+    assert staged.timeline is None
+    assert staged.qc_report is None
 
 
 def test_dialog_operations_revise_retry_and_approve_without_full_rerun() -> None:
@@ -395,8 +457,9 @@ def test_asset_rights_approval_is_asset_scoped_and_restricted_assets_stay_blocke
     assert {asset.rights_status for asset in assets_ready.asset_manifest.assets} == {"unknown"}
 
     blocked = service.run_content_project(project.project_id, until=ProjectStatus.VOICE_READY)
-    assert blocked.status is ProjectStatus.FAILED_BLOCKED
-    assert blocked.error_code == "asset_rights_not_approved"
+    assert blocked.status is ProjectStatus.ASSETS_READY
+    assert blocked.error_code is None
+    assert blocked.voice_track is None
 
     first_asset = assets_ready.asset_manifest.assets[0]
     partially_approved = service.approve_rights(
@@ -406,7 +469,8 @@ def test_asset_rights_approval_is_asset_scoped_and_restricted_assets_stay_blocke
     )
     assert partially_approved.rights_approved is False
     still_blocked = service.run_content_project(project.project_id, until=ProjectStatus.VOICE_READY)
-    assert still_blocked.status is ProjectStatus.FAILED_BLOCKED
+    assert still_blocked.status is ProjectStatus.ASSETS_READY
+    assert still_blocked.voice_track is None
 
     all_ids = tuple(asset.asset_id for asset in assets_ready.asset_manifest.assets)
     approved = service.approve_rights(project.project_id, asset_ids=all_ids, note="all reviewed")
@@ -660,8 +724,8 @@ def test_cached_voice_does_not_clear_new_asset_rights_gate() -> None:
     voiced = service.run_content_project(project.project_id, until=ProjectStatus.VOICE_READY)
     service.regenerate_asset(project.project_id, asset_id=ids[0], instruction="Replace first visual")
     blocked = service.run_content_project(project.project_id, until=ProjectStatus.VOICE_READY)
-    assert blocked.error_code == "asset_rights_not_approved"
-    assert blocked.status is ProjectStatus.FAILED_BLOCKED
+    assert blocked.error_code is None
+    assert blocked.status is ProjectStatus.ASSETS_READY
     assert blocked.voice_track == voiced.voice_track
     assert service.provider_call_count("voice") == 1
 

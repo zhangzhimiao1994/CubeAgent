@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from hashlib import sha256
 from types import UnionType
-from typing import Final, Protocol, get_args, get_origin, get_type_hints
+from typing import Any, Final, Protocol, cast, get_args, get_origin, get_type_hints
 from uuid import uuid4
 from weakref import WeakValueDictionary
 
@@ -251,9 +251,30 @@ class AtomicClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchSourceCoverage:
+    source_type: str
+    required: bool
+    evidence_ids: tuple[str, ...]
+    status: str
+    note: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSourceCandidate:
+    source_type: str
+    source_url: str
+    priority: int
+    rationale: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchBundle:
     questions: tuple[ResearchQuestion, ...]
     evidence: tuple[Evidence, ...]
+    source_priority: tuple[str, ...] = ()
+    retrieval_plan: tuple[str, ...] = ()
+    source_coverage: tuple[ResearchSourceCoverage, ...] = ()
+    source_candidates: tuple[ResearchSourceCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +376,19 @@ class QCReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectEvent:
+    event_id: str
+    sequence: int
+    kind: str
+    stage: str
+    status: str
+    title: str
+    summary: str
+    artifact_refs: tuple[str, ...] = ()
+    payload: dict[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderAttempt:
     stage: str
     idempotency_key: str
@@ -392,6 +426,7 @@ class ContentProject:
     qc_report: QCReport | None = None
     completed_stage_keys: frozenset[str] = frozenset()
     provider_attempts: tuple[ProviderAttempt, ...] = ()
+    project_events: tuple[ProjectEvent, ...] = ()
     revision: int = 0
 
 
@@ -500,6 +535,20 @@ class ContentStudioService:
             owner_user_id=owner_user_id,
             execution_mode=execution_mode,
         )
+        project = append_content_project_event(
+            project,
+            kind="project_created",
+            stage="project",
+            status=ProjectStatus.DRAFT.value,
+            title="项目创建",
+            summary=f"{project.title} · {project.topic}",
+            payload={
+                "topic": project.topic,
+                "source_urls": project.source_urls,
+                "execution_mode": project.execution_mode,
+                "pack_versions": _pack_versions(project.packs),
+            },
+        )
         return self._store.save(project)
 
     def get_content_project(self, project_id: str) -> ContentProject:
@@ -544,6 +593,15 @@ class ContentStudioService:
                 {"research", "evidence_graph", "fact_check", "plan", "script"},
             ),
         )
+        updated = append_content_project_event(
+            updated,
+            kind="revision",
+            stage="script",
+            status=ProjectStatus.SCRIPT_READY.value,
+            title="脚本修改",
+            summary=hook,
+            payload=_stage_event_payload(updated, "script"),
+        )
         return self._store.save(updated)
 
     def approve_script(self, project_id: str) -> ContentProject:
@@ -553,13 +611,22 @@ class ContentStudioService:
         self._validate_script_claims(project)
         if project.script_approved:
             return project
+        updated = replace(
+            project,
+            status=ProjectStatus.SCRIPT_APPROVED,
+            script_approved=True,
+            error_code=None,
+            error_message=None,
+        )
         return self._store.save(
-            replace(
-                project,
-                status=ProjectStatus.SCRIPT_APPROVED,
-                script_approved=True,
-                error_code=None,
-                error_message=None,
+            append_content_project_event(
+                updated,
+                kind="approval",
+                stage="script",
+                status=ProjectStatus.SCRIPT_APPROVED.value,
+                title="脚本批准",
+                summary="脚本已通过人工批准，可继续进入分镜和素材阶段",
+                payload=_stage_event_payload(updated, "script"),
             )
         )
 
@@ -590,6 +657,15 @@ class ContentStudioService:
                 {"research", "evidence_graph", "fact_check", "plan", "script", "storyboard", "voice"},
             ),
         )
+        updated = append_content_project_event(
+            updated,
+            kind="revision",
+            stage="storyboard",
+            status=ProjectStatus.STORYBOARD_READY.value,
+            title="分镜修改",
+            summary=instruction.strip() or "分镜已修改",
+            payload=_stage_event_payload(updated, "storyboard"),
+        )
         return self._store.save(updated)
 
     def regenerate_asset(
@@ -615,7 +691,7 @@ class ContentStudioService:
                 assets.append(asset)
                 continue
             replaced_any = True
-            revision = int(asset.generation_params.get("revision", 1)) + 1
+            revision = _int_metadata(asset.generation_params.get("revision", 1)) + 1
             assets.append(
                 replace(
                     asset,
@@ -656,6 +732,16 @@ class ContentStudioService:
             ),
         )
         self._provider_calls["assets"] += 1
+        updated = append_content_project_event(
+            updated,
+            kind="revision",
+            stage="assets",
+            status=ProjectStatus.ASSETS_READY.value,
+            title="单素材重生成",
+            summary=f"{asset_id}: {instruction.strip() or '重新生成'}",
+            artifact_refs=(asset_id,),
+            payload=_stage_event_payload(updated, "assets"),
+        )
         return self._store.save(updated)
 
     def regenerate_voice(self, project_id: str, *, instruction: str = "") -> ContentProject:
@@ -691,6 +777,16 @@ class ContentStudioService:
                 project.completed_stage_keys,
                 {"research", "evidence_graph", "fact_check", "plan", "script", "storyboard", "assets", "voice"},
             ),
+        )
+        updated = append_content_project_event(
+            updated,
+            kind="revision",
+            stage="voice",
+            status=ProjectStatus.VOICE_READY.value,
+            title="配音重生成",
+            summary=instruction.strip() or "配音已重新生成",
+            artifact_refs=(voice.audio_artifact_id,),
+            payload=_stage_event_payload(updated, "voice"),
         )
         return self._store.save(updated)
 
@@ -758,6 +854,20 @@ class ContentStudioService:
                 {"research", "evidence_graph", "fact_check", "plan", "script", "storyboard", "assets", "voice"},
             ),
         )
+        updated = append_content_project_event(
+            updated,
+            kind="approval",
+            stage="rights",
+            status="approved" if rights_approved else "partially_approved",
+            title="素材版权批准",
+            summary=f"批准 {len(target_ids)} 个素材：{note.strip()}",
+            artifact_refs=tuple(sorted(target_ids)),
+            payload={
+                "approved_asset_ids": tuple(sorted(target_ids)),
+                "rights_approved": rights_approved,
+                "note": note.strip(),
+            },
+        )
         return self._store.save(updated)
 
     def approve_final(self, project_id: str) -> ContentProject:
@@ -773,13 +883,22 @@ class ContentStudioService:
         self._validate_script_claims(project)
         if project.final_approved:
             return project
+        updated = replace(
+            project,
+            status=ProjectStatus.FINAL_APPROVED,
+            final_approved=True,
+            error_code=None,
+            error_message=None,
+        )
         return self._store.save(
-            replace(
-                project,
-                status=ProjectStatus.FINAL_APPROVED,
-                final_approved=True,
-                error_code=None,
-                error_message=None,
+            append_content_project_event(
+                updated,
+                kind="approval",
+                stage="final",
+                status=ProjectStatus.FINAL_APPROVED.value,
+                title="终片批准",
+                summary="终片已通过人工批准，可进入最终渲染",
+                payload=_stage_event_payload(updated, "qc"),
             )
         )
 
@@ -788,6 +907,15 @@ class ContentStudioService:
         if _stage_output_exists(project, ProjectStatus.FINAL_RENDERED):
             return project
         updated = _invalidate_project_for_stage(project, stage)
+        updated = append_content_project_event(
+            updated,
+            kind="retry_requested",
+            stage=stage.value,
+            status="requested",
+            title="阶段重试",
+            summary=f"从 {stage.value} 阶段继续或重新生成受影响内容",
+            payload={"stage": stage.value},
+        )
         self._store.save(updated)
         return self.run_content_project(project_id, until=stage)
 
@@ -814,6 +942,8 @@ class ContentStudioService:
             if project.status in {ProjectStatus.FAILED_BLOCKED, ProjectStatus.FAILED_RETRYABLE}:
                 return self._store.save(project)
             if stage is ProjectStatus.SCRIPT_READY and not project.script_approved and _stage_index(until) > _stage_index(ProjectStatus.SCRIPT_READY):
+                return self._store.save(project)
+            if stage is ProjectStatus.ASSETS_READY and not project.rights_approved and _stage_index(until) > _stage_index(ProjectStatus.ASSETS_READY):
                 return self._store.save(project)
         return self._store.save(project)
 
@@ -872,6 +1002,21 @@ class ContentStudioService:
                 if key in {"research", "evidence_graph", "fact_check"}
             ),
         )
+        updated = append_content_project_event(
+            updated,
+            kind="revision",
+            stage="fact_check",
+            status=status.value,
+            title="事实状态修正",
+            summary=f"{claim_id} → {status.value}: {note.strip()}",
+            artifact_refs=(claim_id,) + tuple(evidence_ids),
+            payload={
+                "claim_id": claim_id,
+                "status": status.value,
+                "note": note.strip(),
+                "evidence_ids": evidence_ids,
+            },
+        )
         return self._store.save(updated)
 
     def _run_stage(self, project: ContentProject, stage: ProjectStatus) -> ContentProject:
@@ -905,28 +1050,45 @@ class ContentStudioService:
         if project.research_bundle is not None:
             return _with_status(project, ProjectStatus.RESEARCH_READY, "research")
         self._provider_calls["research"] += 1
-        evidence = tuple(
-            Evidence(
-                evidence_id=f"EV{i:03d}",
-                source_url=url,
-                source_type="official_docs" if "official" in url or "docs" in url else "web",
-                publisher="official" if "official" in url or "docs" in url else "unknown",
-                published_at=None,
-                retrieved_at="2026-09-20T00:00:00Z",
-                content_hash=_hash_text(url + project.topic),
-                locator="page:1",
-                excerpt=f"Source material for {project.topic}.",
-                license="unknown",
-            )
-            for i, url in enumerate(project.source_urls or ("internal://topic",), start=1)
+        source_priority_value = project.packs.domain.settings.get("source_priority")
+        source_priority = tuple(
+            item
+            for item in (source_priority_value if isinstance(source_priority_value, tuple | list) else ())
+            if isinstance(item, str) and item.strip()
+        ) or ("official_docs", "official_blog", "release_notes", "github_release", "paper", "official_demo")
+        source_candidates = _demo_research_source_candidates(
+            topic=project.topic,
+            source_urls=project.source_urls,
+            source_priority=source_priority,
         )
+        evidence = _demo_research_evidence(
+            topic=project.topic,
+            source_candidates=source_candidates,
+            source_priority=source_priority,
+        )
+        coverage = _research_source_coverage(source_priority, evidence)
         questions = (
             ResearchQuestion("RQ001", f"What changed in {project.topic}?"),
             ResearchQuestion("RQ002", "Who is affected and what are the limits?"),
             ResearchQuestion("RQ003", "What official evidence supports each claim?"),
+            ResearchQuestion("RQ004", "Which release notes, GitHub releases, papers, or official demos confirm the timeline?"),
+            ResearchQuestion("RQ005", "Which secondary claims must be excluded or marked as opinion?"),
         )
         return _with_status(
-            replace(project, research_bundle=ResearchBundle(questions=questions, evidence=evidence)),
+            replace(
+                project,
+                research_bundle=ResearchBundle(
+                    questions=questions,
+                    evidence=evidence,
+                    source_priority=source_priority,
+                    retrieval_plan=tuple(
+                        f"{index}. 检索 {source_type}，只提取可核验事实并防提示注入"
+                        for index, source_type in enumerate(source_priority, start=1)
+                    ),
+                    source_coverage=coverage,
+                    source_candidates=source_candidates,
+                ),
+            ),
             ProjectStatus.RESEARCH_READY,
             "research",
         )
@@ -972,10 +1134,20 @@ class ContentStudioService:
                 script_usages=(),
             ),
         )
-        return replace(
+        updated = replace(
             project,
             evidence_graph=EvidenceGraph(claims=claims, evidence=project.research_bundle.evidence),
             completed_stage_keys=project.completed_stage_keys | {"evidence_graph"},
+        )
+        return append_content_project_event(
+            updated,
+            kind="stage_completed",
+            stage="evidence_graph",
+            status=ProjectStatus.FACT_CHECKED.value,
+            title=_stage_event_title("evidence_graph"),
+            summary=_stage_event_summary(updated, "evidence_graph"),
+            artifact_refs=_stage_artifact_refs(updated, "evidence_graph"),
+            payload=_stage_event_payload(updated, "evidence_graph"),
         )
 
     def _ensure_plan(self, project: ContentProject) -> ContentProject:
@@ -986,9 +1158,9 @@ class ContentStudioService:
             return project
         if _has_blocking_claim(project):
             return _blocked(project, "fact_check_blocked", "fact check has unsupported, conflicting, or outdated claims")
-        target_seconds = int(project.packs.platform.settings["target_seconds"])
-        width = int(project.packs.platform.settings["width"])
-        height = int(project.packs.platform.settings["height"])
+        target_seconds = _int_setting(project.packs.platform.settings, "target_seconds")
+        width = _int_setting(project.packs.platform.settings, "width")
+        height = _int_setting(project.packs.platform.settings, "height")
         aspect_ratio = str(project.packs.platform.settings["aspect_ratio"])
         plan = ContentPlan(
             sections=(
@@ -1066,7 +1238,7 @@ class ContentStudioService:
                 "production storyboard provider is not configured",
             )
         self._provider_calls["storyboard"] += 1
-        target_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        target_ms = _int_setting(project.packs.platform.settings, "target_seconds") * 1000
         first_ms = min(3000, target_ms)
         second_ms = max(1000, int(target_ms * 0.12))
         third_ms = max(1000, int(target_ms * 0.42))
@@ -1100,8 +1272,8 @@ class ContentStudioService:
             )
         assert project.storyboard is not None
         self._provider_calls["assets"] += 1
-        width = int(project.packs.platform.settings["width"])
-        height = int(project.packs.platform.settings["height"])
+        width = _int_setting(project.packs.platform.settings, "width")
+        height = _int_setting(project.packs.platform.settings, "height")
         assets = tuple(
             AssetRecord(
                 asset_id=f"ASSET{i:03d}",
@@ -1154,9 +1326,9 @@ class ContentStudioService:
             return project
         if not _asset_rights_clear(project):
             return _blocked(project, "asset_rights_not_approved", "asset rights must be approved before render")
-        width = int(project.packs.platform.settings["width"])
-        height = int(project.packs.platform.settings["height"])
-        duration_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        width = _int_setting(project.packs.platform.settings, "width")
+        height = _int_setting(project.packs.platform.settings, "height")
+        duration_ms = _int_setting(project.packs.platform.settings, "target_seconds") * 1000
         timeline = Timeline(
             width=width,
             height=height,
@@ -1218,6 +1390,8 @@ class ContentStudioService:
             minors=(),
             checked_items=(
                 "resolution/aspect/codec",
+                "video reviewer frame extraction",
+                "video reviewer subtitle text review",
                 "black/frozen frame placeholder",
                 "audio presence placeholder",
                 "subtitle safe area",
@@ -1385,9 +1559,12 @@ class AsyncContentStudioService:
                 updated = await self._production_provider.run_content_project(project, until=until)
                 return await self._store.save(updated)
             for stage in _RUN_ORDER[:_stage_index(until) + 1]:
+                def run_until(service: ContentStudioService, target: ProjectStatus = stage) -> ContentProject:
+                    return service.run_content_project(project_id, until=target)
+
                 project = await self._apply(
                     project,
-                    lambda service, target=stage: service.run_content_project(project_id, until=target),
+                    run_until,
                 )
                 if project.status in {ProjectStatus.FAILED_BLOCKED, ProjectStatus.FAILED_RETRYABLE}:
                     break
@@ -1514,7 +1691,15 @@ _CLEARED_RIGHTS = frozenset({"approved", "cleared", "owned", "licensed"})
 
 
 def _blocked(project: ContentProject, code: str, message: str) -> ContentProject:
-    return replace(project, status=ProjectStatus.FAILED_BLOCKED, error_code=code, error_message=message)
+    return append_content_project_event(
+        replace(project, status=ProjectStatus.FAILED_BLOCKED, error_code=code, error_message=message),
+        kind="stage_failed",
+        stage="blocked",
+        status="failed",
+        title="阶段失败",
+        summary=f"{code}: {message}",
+        payload={"error_code": code, "error_message": message},
+    )
 
 
 def _asset_rights_clear(project: ContentProject) -> bool:
@@ -1522,6 +1707,199 @@ def _asset_rights_clear(project: ContentProject) -> bool:
         project.rights_approved and project.asset_manifest and project.asset_manifest.assets
         and all(asset.rights_status in _CLEARED_RIGHTS for asset in project.asset_manifest.assets)
     )
+
+
+def _demo_research_source_candidates(
+    *,
+    topic: str,
+    source_urls: tuple[str, ...],
+    source_priority: tuple[str, ...],
+) -> tuple[ResearchSourceCandidate, ...]:
+    candidates: list[ResearchSourceCandidate] = []
+    seen: set[str] = set()
+
+    def add(source_type: str, source_url: str, rationale: str) -> None:
+        key = source_url.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(
+            ResearchSourceCandidate(
+                source_type=source_type,
+                source_url=source_url,
+                priority=len(candidates) + 1,
+                rationale=rationale,
+            )
+        )
+
+    for url in source_urls:
+        add(_demo_source_type_for_url(url), url, "用户提供来源，优先核验")
+    for source_type in source_priority:
+        for url in _demo_source_urls_for_type(source_type, topic):
+            add(source_type, url, f"Domain Pack 推荐的 {source_type} 来源")
+    return tuple(candidates)
+
+
+def _demo_research_evidence(
+    *,
+    topic: str,
+    source_candidates: tuple[ResearchSourceCandidate, ...],
+    source_priority: tuple[str, ...],
+) -> tuple[Evidence, ...]:
+    evidence: list[Evidence] = []
+    covered: set[str] = set()
+    for source_type in source_priority:
+        if source_type == "secondary_media":
+            continue
+        candidate = next(
+            (item for item in source_candidates if item.source_type == source_type),
+            None,
+        )
+        if candidate is None:
+            continue
+        evidence.append(
+            _demo_evidence_record(
+                evidence_id=f"EV{len(evidence) + 1:03d}",
+                topic=topic,
+                source_url=candidate.source_url,
+                source_type=source_type,
+                publisher=_demo_publisher_for_source_type(source_type),
+            )
+        )
+        covered.add(source_type)
+    for candidate in source_candidates:
+        if candidate.source_type in covered or candidate.source_type == "secondary_media":
+            continue
+        evidence.append(
+            _demo_evidence_record(
+                evidence_id=f"EV{len(evidence) + 1:03d}",
+                topic=topic,
+                source_url=candidate.source_url,
+                source_type=candidate.source_type,
+                publisher=_demo_publisher_for_source_type(candidate.source_type),
+            )
+        )
+        covered.add(candidate.source_type)
+    return tuple(evidence)
+
+
+def _demo_evidence_record(
+    *,
+    evidence_id: str,
+    topic: str,
+    source_url: str,
+    source_type: str,
+    publisher: str,
+) -> Evidence:
+    return Evidence(
+        evidence_id=evidence_id,
+        source_url=source_url,
+        source_type=source_type,
+        publisher=publisher,
+        published_at=None,
+        retrieved_at="2026-09-20T00:00:00Z",
+        content_hash=_hash_text(source_url + topic),
+        locator="page:1",
+        excerpt=f"Authoritative source material for {topic} from {source_type}.",
+        license="unknown",
+    )
+
+
+def _demo_source_type_for_url(url: str) -> str:
+    normalized = url.casefold()
+    if "github.com" in normalized and ("release" in normalized or "/tag/" in normalized):
+        return "github_release"
+    if "arxiv.org" in normalized or "paper" in normalized:
+        return "paper"
+    if "release" in normalized or "changelog" in normalized:
+        return "release_notes"
+    if "demo" in normalized:
+        return "official_demo"
+    if "blog" in normalized:
+        return "official_blog"
+    if "official" in normalized or "docs" in normalized:
+        return "official_docs"
+    return "secondary_media"
+
+
+def _demo_source_urls_for_type(source_type: str, topic: str) -> tuple[str, ...]:
+    slug = _hash_text(topic)[:10]
+    if source_type == "official_docs":
+        return (
+            f"https://docs.example.com/aigc/{slug}",
+            f"https://platform.example.com/docs/{slug}",
+        )
+    if source_type == "official_blog":
+        return (
+            f"https://official.example.com/blog/{slug}",
+            f"https://company.example.com/news/{slug}",
+        )
+    if source_type == "release_notes":
+        return (
+            f"https://official.example.com/release-notes/{slug}",
+            f"https://changelog.example.com/aigc/{slug}",
+        )
+    if source_type == "github_release":
+        return (
+            f"https://github.com/example/aigc/releases/tag/{slug}",
+            "https://github.com/example/aigc/releases",
+        )
+    if source_type == "paper":
+        return (
+            "https://arxiv.org/abs/0000.00000",
+            "https://papers.example.com/aigc-system-card",
+        )
+    if source_type == "official_demo":
+        return (
+            f"https://official.example.com/demo/{slug}",
+            f"https://video.example.com/official-demo/{slug}",
+        )
+    if source_type == "secondary_media":
+        return (
+            f"https://example-news.com/aigc/{slug}",
+            f"https://analysis.example.com/aigc/{slug}",
+        )
+    return (f"https://example.com/research/{slug}",)
+
+
+def _demo_publisher_for_source_type(source_type: str) -> str:
+    if source_type in {
+        "official_docs",
+        "official_blog",
+        "release_notes",
+        "github_release",
+        "official_demo",
+    }:
+        return "official"
+    if source_type == "paper":
+        return "research_paper"
+    return "secondary"
+
+
+def _research_source_coverage(
+    source_priority: tuple[str, ...],
+    evidence: tuple[Evidence, ...],
+) -> tuple[ResearchSourceCoverage, ...]:
+    coverage: list[ResearchSourceCoverage] = []
+    for source_type in source_priority:
+        evidence_ids = tuple(item.evidence_id for item in evidence if item.source_type == source_type)
+        required = source_type != "secondary_media"
+        coverage.append(
+            ResearchSourceCoverage(
+                source_type=source_type,
+                required=required,
+                evidence_ids=evidence_ids,
+                status="covered" if evidence_ids else "missing",
+                note=(
+                    "已覆盖权威来源"
+                    if evidence_ids and required
+                    else "补充参考来源"
+                    if evidence_ids
+                    else "缺少该来源类型，进入脚本前应补检索"
+                ),
+            )
+        )
+    return tuple(coverage)
 
 
 def _artifact_revision(artifact_id: str) -> int:
@@ -1575,12 +1953,25 @@ def _stage_index(status: ProjectStatus) -> int:
 
 
 def _with_status(project: ContentProject, status: ProjectStatus, stage_key: str) -> ContentProject:
-    return replace(
+    already_completed = stage_key in project.completed_stage_keys
+    updated = replace(
         project,
         status=project.status if _status_rank(project.status) > _status_rank(status) else status,
         error_code=None,
         error_message=None,
         completed_stage_keys=project.completed_stage_keys | {stage_key},
+    )
+    if already_completed:
+        return updated
+    return append_content_project_event(
+        updated,
+        kind="stage_completed",
+        stage=stage_key,
+        status=status.value,
+        title=_stage_event_title(stage_key),
+        summary=_stage_event_summary(updated, stage_key),
+        artifact_refs=_stage_artifact_refs(updated, stage_key),
+        payload=_stage_event_payload(updated, stage_key),
     )
 
 
@@ -1598,13 +1989,226 @@ def _record_provider_attempt(
         result_hash=_hash_text(str(_to_json(result))),
         provider_task_id=provider_task_id,
     )
-    return replace(
-        project,
-        provider_attempts=tuple(
-            item for item in project.provider_attempts if item.idempotency_key != attempt.idempotency_key
-        )
-        + (attempt,),
+    return record_content_project_provider_attempt(project, attempt)
+
+
+def record_content_project_provider_attempt(
+    project: ContentProject,
+    attempt: ProviderAttempt,
+) -> ContentProject:
+    if any(_same_provider_attempt(item, attempt) for item in project.provider_attempts):
+        return project
+    updated = replace(project, provider_attempts=project.provider_attempts + (attempt,))
+    return append_content_project_event(
+        updated,
+        kind="provider_attempt",
+        stage=attempt.stage,
+        status=attempt.status,
+        title=f"{_stage_event_title(attempt.stage)} Provider 调用",
+        summary=_provider_attempt_summary(attempt),
+        artifact_refs=(attempt.provider_task_id,) if attempt.provider_task_id else (),
+        payload={
+            "stage": attempt.stage,
+            "idempotency_key": attempt.idempotency_key,
+            "status": attempt.status,
+            "result_hash": attempt.result_hash,
+            "provider_task_id": attempt.provider_task_id,
+            "error_code": attempt.error_code,
+        },
     )
+
+
+def append_content_project_event(
+    project: ContentProject,
+    *,
+    kind: str,
+    stage: str,
+    status: str,
+    title: str,
+    summary: str,
+    artifact_refs: tuple[str, ...] = (),
+    payload: dict[str, object] | None = None,
+) -> ContentProject:
+    if project.project_events:
+        latest = project.project_events[-1]
+        if (
+            latest.kind == kind
+            and latest.stage == stage
+            and latest.status == status
+            and latest.summary == summary
+            and latest.payload == payload
+        ):
+            return project
+    sequence = len(project.project_events) + 1
+    event = ProjectEvent(
+        event_id=f"{project.project_id}:event:{sequence:04d}",
+        sequence=sequence,
+        kind=kind,
+        stage=stage,
+        status=status,
+        title=title,
+        summary=summary,
+        artifact_refs=artifact_refs,
+        payload=payload,
+    )
+    return replace(project, project_events=project.project_events + (event,))
+
+
+def _same_provider_attempt(left: ProviderAttempt, right: ProviderAttempt) -> bool:
+    return (
+        left.stage == right.stage
+        and left.idempotency_key == right.idempotency_key
+        and left.status == right.status
+        and left.result_hash == right.result_hash
+        and left.provider_task_id == right.provider_task_id
+        and left.error_code == right.error_code
+    )
+
+
+def _provider_attempt_summary(attempt: ProviderAttempt) -> str:
+    if attempt.status == "completed":
+        detail = attempt.provider_task_id or attempt.result_hash[:12]
+        return f"{attempt.stage} 调用完成：{detail}"
+    if attempt.error_code:
+        return f"{attempt.stage} 调用失败：{attempt.error_code}"
+    return f"{attempt.stage} 调用状态：{attempt.status}"
+
+
+def _stage_event_title(stage_key: str) -> str:
+    titles = {
+        "research": "Research 调研",
+        "evidence_graph": "Evidence 事实链",
+        "fact_check": "Fact Check 核验",
+        "plan": "Content Plan 计划",
+        "script": "Script 脚本",
+        "storyboard": "Storyboard 分镜",
+        "assets": "Assets 素材",
+        "voice": "Voice 配音",
+        "timeline": "Timeline 时间线",
+        "preview": "Preview 预览",
+        "preview_render": "Preview 预览",
+        "qc": "QC 质检",
+        "final_render": "Final Render 终片",
+    }
+    return titles.get(stage_key, stage_key)
+
+
+def _stage_event_summary(project: ContentProject, stage_key: str) -> str:
+    payload = _stage_event_payload(project, stage_key)
+    if stage_key == "research":
+        return f"{payload.get('question_count', 0)} 个研究问题，{payload.get('evidence_count', 0)} 条证据"
+    if stage_key == "evidence_graph":
+        return f"{payload.get('claim_count', 0)} 条 Atomic Claim，{payload.get('evidence_count', 0)} 条证据"
+    if stage_key == "script":
+        return f"{payload.get('hook_count', 0)} 个 Hook，{payload.get('segment_count', 0)} 段脚本"
+    if stage_key == "storyboard":
+        return f"{payload.get('shot_count', 0)} 个镜头"
+    if stage_key == "assets":
+        return f"{payload.get('asset_count', 0)} 个素材"
+    if stage_key == "voice":
+        return str(payload.get("audio_artifact_id") or "配音已生成")
+    if stage_key == "timeline":
+        return f"{payload.get('track_count', 0)} 条轨道，{payload.get('duration_ms', 0)}ms"
+    if stage_key in {"preview", "preview_render"}:
+        return str(payload.get("preview_artifact_id") or "预览已生成")
+    if stage_key == "qc":
+        return (
+            f"{payload.get('blocker_count', 0)} 个 BLOCKER，"
+            f"{payload.get('major_count', 0)} 个 MAJOR，{payload.get('minor_count', 0)} 个 MINOR"
+        )
+    if stage_key == "final_render":
+        return str(payload.get("final_artifact_id") or "终片已生成")
+    return "阶段已完成"
+
+
+def _stage_event_payload(project: ContentProject, stage_key: str) -> dict[str, object]:
+    if stage_key == "research" and project.research_bundle is not None:
+        return {
+            "question_count": len(project.research_bundle.questions),
+            "evidence_count": len(project.research_bundle.evidence),
+            "questions": tuple(question.text for question in project.research_bundle.questions),
+            "evidence_ids": tuple(evidence.evidence_id for evidence in project.research_bundle.evidence),
+        }
+    if stage_key == "evidence_graph" and project.evidence_graph is not None:
+        return {
+            "claim_count": len(project.evidence_graph.claims),
+            "evidence_count": len(project.evidence_graph.evidence),
+            "claim_ids": tuple(claim.claim_id for claim in project.evidence_graph.claims),
+            "evidence_ids": tuple(evidence.evidence_id for evidence in project.evidence_graph.evidence),
+        }
+    if stage_key == "fact_check" and project.fact_check_report is not None:
+        return {
+            "blocking_claim_ids": project.fact_check_report.blocking_claim_ids,
+            "notes": project.fact_check_report.notes,
+        }
+    if stage_key == "plan" and project.content_plan is not None:
+        return {
+            "target_seconds": project.content_plan.target_seconds,
+            "sections": project.content_plan.sections,
+            "platform_constraints": project.content_plan.platform_constraints,
+        }
+    if stage_key == "script" and project.script is not None:
+        return {
+            "hook_count": len(project.script.hooks),
+            "segment_count": len(project.script.segments),
+            "hooks": project.script.hooks,
+            "segment_ids": tuple(segment.segment_id for segment in project.script.segments),
+        }
+    if stage_key == "storyboard" and project.storyboard is not None:
+        return {
+            "shot_count": len(project.storyboard.shots),
+            "shot_ids": tuple(shot.shot_id for shot in project.storyboard.shots),
+        }
+    if stage_key == "assets" and project.asset_manifest is not None:
+        return {
+            "asset_count": len(project.asset_manifest.assets),
+            "asset_ids": tuple(asset.asset_id for asset in project.asset_manifest.assets),
+            "rights_statuses": tuple(asset.rights_status for asset in project.asset_manifest.assets),
+        }
+    if stage_key == "voice" and project.voice_track is not None:
+        return {
+            "audio_artifact_id": project.voice_track.audio_artifact_id,
+            "timestamp_level": project.voice_track.timestamp_level,
+            "source": project.voice_track.source,
+            "pronunciation_report": project.voice_track.pronunciation_report,
+        }
+    if stage_key == "timeline" and project.timeline is not None:
+        return {
+            "duration_ms": project.timeline.duration_ms,
+            "width": project.timeline.width,
+            "height": project.timeline.height,
+            "track_count": len(project.timeline.tracks),
+            "tracks": tuple(project.timeline.tracks.keys()),
+        }
+    if stage_key in {"preview", "preview_render"} and project.timeline is not None:
+        return {"preview_artifact_id": project.timeline.preview_artifact_id}
+    if stage_key == "qc" and project.qc_report is not None:
+        return {
+            "blocker_count": len(project.qc_report.blockers),
+            "major_count": len(project.qc_report.majors),
+            "minor_count": len(project.qc_report.minors),
+            "blockers": project.qc_report.blockers,
+            "majors": project.qc_report.majors,
+            "minors": project.qc_report.minors,
+            "checked_items": project.qc_report.checked_items,
+        }
+    if stage_key == "final_render" and project.timeline is not None:
+        return {"final_artifact_id": project.timeline.final_artifact_id}
+    return {}
+
+
+def _stage_artifact_refs(project: ContentProject, stage_key: str) -> tuple[str, ...]:
+    payload = _stage_event_payload(project, stage_key)
+    refs: list[str] = []
+    for key in ("audio_artifact_id", "preview_artifact_id", "final_artifact_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            refs.append(value)
+    for key in ("asset_ids", "evidence_ids", "claim_ids", "shot_ids", "segment_ids"):
+        value = payload.get(key)
+        if isinstance(value, tuple):
+            refs.extend(str(item) for item in value if str(item))
+    return tuple(refs)
 
 
 def _keep_stages(existing: frozenset[str], allowed: set[str]) -> frozenset[str]:
@@ -1722,6 +2326,23 @@ def _hash_text(text: str) -> str:
     return sha256(text.encode("utf-8")).hexdigest()
 
 
+def _int_setting(settings: Mapping[str, object], field: str) -> int:
+    value = settings[field]
+    if not isinstance(value, int):
+        raise TypeError(f"platform setting {field} must be an integer")
+    return value
+
+
+def _int_metadata(value: object) -> int:
+    if isinstance(value, bool):
+        raise TypeError("metadata integer must not be a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    raise TypeError("metadata value must be an integer")
+
+
 def _pack_versions(packs: LockedPacks) -> dict[str, str]:
     return {
         "domain": packs.domain.version,
@@ -1745,7 +2366,7 @@ def content_project_from_payload(payload: Mapping[str, object]) -> ContentProjec
     raw_project = payload.get("project")
     if not isinstance(raw_project, Mapping):
         raise ValueError("content project payload is missing project")  # noqa: TRY004 - invalid serialized value
-    return _from_json(raw_project, ContentProject)
+    return cast(ContentProject, _from_json(raw_project, ContentProject))
 
 
 def _to_json(value: object) -> object:
@@ -1762,16 +2383,16 @@ def _to_json(value: object) -> object:
     return value
 
 
-def _from_json[T](value: object, annotation: object) -> T:
+def _from_json(value: object, annotation: object) -> Any:
     if annotation is object:
-        return _restore_json_object(value)  # type: ignore[return-value]
+        return _restore_json_object(value)
     origin = get_origin(annotation)
     args = get_args(annotation)
     if isinstance(annotation, type) and issubclass(annotation, Enum):
-        return annotation(value)  # type: ignore[return-value]
+        return annotation(value)
     if origin in (UnionType, __import__("typing").Union):
         if value is None and type(None) in args:
-            return None  # type: ignore[return-value]
+            return None
         for item in args:
             if item is not type(None):
                 return _from_json(value, item)
@@ -1779,17 +2400,17 @@ def _from_json[T](value: object, annotation: object) -> T:
         item_type = args[0] if args else object
         if not isinstance(value, list | tuple):
             raise ValueError("expected list for tuple field")
-        return tuple(_from_json(item, item_type) for item in value)  # type: ignore[return-value]
+        return tuple(_from_json(item, item_type) for item in value)
     if origin is frozenset:
         item_type = args[0] if args else object
         if not isinstance(value, list | tuple | set | frozenset):
             raise ValueError("expected list for frozenset field")
-        return frozenset(_from_json(item, item_type) for item in value)  # type: ignore[return-value]
+        return frozenset(_from_json(item, item_type) for item in value)
     if origin is dict:
         value_type = args[1] if len(args) > 1 else object
         if not isinstance(value, Mapping):
             raise ValueError("expected object for dict field")
-        return {str(key): _from_json(item, value_type) for key, item in value.items()}  # type: ignore[return-value]
+        return {str(key): _from_json(item, value_type) for key, item in value.items()}
     if isinstance(annotation, type) and is_dataclass(annotation):
         if not isinstance(value, Mapping):
             raise ValueError("expected object for dataclass field")
@@ -1801,7 +2422,7 @@ def _from_json[T](value: object, annotation: object) -> T:
                 if field.name in value
             }
         )
-    return value  # type: ignore[return-value]
+    return value
 
 
 def _restore_json_object(value: object) -> object:
@@ -1831,17 +2452,22 @@ __all__ = [
     "LockedPacks",
     "PackManifest",
     "PackRegistry",
+    "ProjectEvent",
     "ProjectStatus",
     "ProviderAttempt",
     "QCReport",
     "ResearchBundle",
     "ResearchQuestion",
+    "ResearchSourceCandidate",
+    "ResearchSourceCoverage",
     "ScriptDraft",
     "ScriptSegment",
     "Shot",
     "Storyboard",
     "Timeline",
     "VoiceTrack",
+    "append_content_project_event",
     "content_project_from_payload",
     "content_project_to_payload",
+    "record_content_project_provider_attempt",
 ]

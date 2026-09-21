@@ -4,8 +4,8 @@ from agent_hub.runtime.production import (
     CharacterIdentity,
     CharacterLook,
     DeterministicIdentityValidator,
-    build_production_plan,
     build_identity_lock_prompt,
+    build_production_plan,
     production_metadata_for_label,
 )
 

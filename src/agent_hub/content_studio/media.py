@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -124,17 +125,17 @@ class _LegacyMediaTimeline:
     width: int
     height: int
     duration_ms: int
-    visuals: tuple[VisualClip, ...]
-    audio: tuple[AudioClip, ...]
-    subtitles: tuple[SubtitleCue, ...]
-    claims: tuple[ClaimReference, ...] = ()
+    visuals: tuple[_LegacyVisualClip, ...]
+    audio: tuple[_LegacyAudioClip, ...]
+    subtitles: tuple[_LegacySubtitleCue, ...]
+    claims: tuple[_LegacyClaimReference, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class _LegacyRenderRequest:
     title: str
     output_basename: str
-    timeline: MediaTimeline
+    timeline: _LegacyMediaTimeline
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
 
@@ -233,7 +234,7 @@ class _LegacyOneShotContentStudioMediaAdapter:
             duration = f"{visual.duration_ms / 1000:.3f}"
             filter_expr = _canvas_filter()
             if visual.mime_type == "video/mp4":
-                command = (
+                command: tuple[str, ...] = (
                     ffmpeg,
                     "-y",
                     "-i",
@@ -486,7 +487,7 @@ def _validate_request(request: RenderRequest) -> None:
         _validate_existing_file(audio.path, "audio")
         if audio.mime_type not in SUPPORTED_AUDIO_MIME_TYPES:
             raise ContentStudioMediaError("unsupported audio clip MIME type")
-        if audio.role == "voiceover" and audio.synthetic and not audio.demo_signal:
+        if audio.source == "demo_signal":
             raise ContentStudioMediaError("voiceover audio must be caller-provided")
     for cue in timeline.subtitles:
         _validate_clip_time(cue.start_ms, cue.duration_ms)
@@ -668,7 +669,7 @@ def _claim_coverage_check(
 
 
 def _demo_signal_check(audio: Sequence[AudioClip]) -> MediaQCCheck:
-    if any(item.demo_signal for item in audio):
+    if any(item.source == "demo_signal" for item in audio):
         return MediaQCCheck(
             "demo_signal",
             "warning",
@@ -797,8 +798,17 @@ class MediaQCCheck:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoReviewFrame:
+    frame_id: str
+    path: Path
+    timestamp_ms: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class MediaQCResult:
     checks: tuple[MediaQCCheck, ...]
+    review_frames: tuple[VideoReviewFrame, ...] = ()
 
     @property
     def technical_passed(self) -> bool:
@@ -1007,12 +1017,19 @@ class ContentStudioMediaAdapter:
         return payload
 
     def _qc(self, request: RenderRequest, artifact: MediaArtifact) -> MediaQCResult:
+        frame_check, review_frames = self._video_reviewer_frame_sampling(
+            artifact.path,
+            request.timeline.duration_ms,
+            request.timeout_seconds,
+        )
         checks = [
             _v2_encoding_check(request, artifact),
             _v2_duration_fps_check(request, artifact),
             _v2_subtitle_safe_area_check(request.timeline),
             _v2_subtitle_layout_check(request.timeline),
+            _subtitle_text_review_check(request.timeline.subtitles),
             _claim_coverage_check(request.timeline.claims, request.timeline.subtitles),
+            frame_check,
             self._black_frame_check(artifact.path, request.timeout_seconds),
             self._silence_check(artifact.path, request.timeout_seconds),
             _v2_demo_signal_check(request.timeline.audio),
@@ -1020,7 +1037,59 @@ class ContentStudioMediaAdapter:
             MediaQCCheck("face_identity", "not_detected", "人脸/人物身份一致性未由本地媒体适配器检测。"),
             MediaQCCheck("factual_truth", "not_detected", "事实真实性未由本地媒体适配器检测。"),
         ]
-        return MediaQCResult(checks=tuple(checks))
+        return MediaQCResult(checks=tuple(checks), review_frames=review_frames)
+
+    def _video_reviewer_frame_sampling(
+        self,
+        path: Path,
+        duration_ms: int,
+        timeout_seconds: int,
+    ) -> tuple[MediaQCCheck, tuple[VideoReviewFrame, ...]]:
+        ffmpeg = self._resolve_binary(self._ffmpeg_binary, "ffmpeg")
+        review_dir = path.parent / f"{path.stem}-review-frames"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        pattern = review_dir / "review-frame-%03d.jpg"
+        duration_seconds = max(1.0, duration_ms / 1000)
+        target_count = 3 if duration_seconds < 45 else min(8, max(3, round(duration_seconds / 12)))
+        interval_seconds = max(1, round(duration_seconds / target_count))
+        self._runner.run(
+            (
+                ffmpeg,
+                "-y",
+                "-i",
+                str(path),
+                "-vf",
+                f"fps=1/{interval_seconds},scale=360:-1",
+                "-frames:v",
+                str(target_count),
+                str(pattern),
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+        frames = tuple(sorted(review_dir.glob("review-frame-*.jpg")))
+        if not frames:
+            return (
+                MediaQCCheck("video_reviewer_frame_sampling", "failed", "视频审核员未能抽取任何审核帧。"),
+                (),
+            )
+        review_frames = tuple(
+            VideoReviewFrame(
+                frame_id=f"FRAME{index:03d}",
+                path=frame,
+                timestamp_ms=round((index - 1) * duration_ms / max(1, len(frames))),
+                sha256=_sha256(frame),
+            )
+            for index, frame in enumerate(frames, start=1)
+        )
+        status = "passed" if len(review_frames) >= min(3, target_count) else "warning"
+        return (
+            MediaQCCheck(
+                "video_reviewer_frame_sampling",
+                status,
+                f"视频审核员已抽取 {len(review_frames)} frames 用于画面、字幕、错字和异常内容复核。",
+            ),
+            review_frames,
+        )
 
     def _black_frame_check(self, path: Path, timeout_seconds: int) -> MediaQCCheck:
         ffmpeg = self._resolve_binary(self._ffmpeg_binary, "ffmpeg")
@@ -1118,7 +1187,7 @@ def _v2_visual_command(ffmpeg: str, request: RenderRequest, clip: VisualClip, ou
     duration = f"{clip.duration_ms / 1000:.3f}"
     prefix = (ffmpeg, "-y")
     if clip.mime_type == "video/mp4":
-        input_args = ("-i", str(clip.path), "-t", duration)
+        input_args: tuple[str, ...] = ("-i", str(clip.path), "-t", duration)
     else:
         input_args = ("-loop", "1", "-t", duration, "-i", str(clip.path))
     return (
@@ -1276,6 +1345,27 @@ def _v2_subtitle_layout_check(timeline: MediaTimeline) -> MediaQCCheck:
     return MediaQCCheck("subtitle_layout", "passed", "字幕文本按框宽换行后未超过声明高度。")
 
 
+def _subtitle_text_review_check(subtitles: Sequence[SubtitleCue]) -> MediaQCCheck:
+    suspicious: list[str] = []
+    for cue in subtitles:
+        text = cue.text.strip()
+        if any(marker in text for marker in ("口口", "□□", "??", "？？", "�")):
+            suspicious.append(cue.cue_id)
+            continue
+        if re.search(r"([，。！？,.!?])\1{1,}", text):
+            suspicious.append(cue.cue_id)
+            continue
+        if len(text) > 34 and not any(separator in text for separator in ("，", "。", "！", "？", ",", ".", "!", "?")):
+            suspicious.append(cue.cue_id)
+    if suspicious:
+        return MediaQCCheck(
+            "subtitle_text_review",
+            "failed",
+            "视频审核员发现疑似错字、乱码、占位符或异常长句字幕: " + ", ".join(suspicious),
+        )
+    return MediaQCCheck("subtitle_text_review", "passed", "字幕文本未发现常见错字/乱码/占位符风险。")
+
+
 def _v2_demo_signal_check(audio: Sequence[AudioClip]) -> MediaQCCheck:
     if any(item.source == "demo_signal" for item in audio):
         return MediaQCCheck("demo_signal", "warning", "音频为测试 demo signal，不代表真实人声/TTS。")
@@ -1299,5 +1389,6 @@ __all__ = [
     "RenderRequest",
     "SubprocessMediaRunner",
     "SubtitleCue",
+    "VideoReviewFrame",
     "VisualClip",
 ]

@@ -1313,7 +1313,7 @@ class RunRepository:
         checkpoint = event.checkpoint
         raw_registry = checkpoint.state.get("artifact_registry")
         if not isinstance(raw_registry, Mapping):
-            raise RuntimeError("runtime checkpoint artifact registry is invalid")
+            raise TypeError("runtime checkpoint artifact registry is invalid")
         registry_ids: list[UUID] = []
         for artifact_id in raw_registry:
             if type(artifact_id) is not str:

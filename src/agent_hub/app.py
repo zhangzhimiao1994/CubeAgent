@@ -98,12 +98,16 @@ from agent_hub.content_studio import (
     QCReport,
     ResearchBundle,
     ResearchQuestion,
+    ResearchSourceCandidate,
+    ResearchSourceCoverage,
     ScriptDraft,
     ScriptSegment,
     Shot,
     Storyboard,
     Timeline,
     VoiceTrack,
+    append_content_project_event,
+    record_content_project_provider_attempt,
 )
 from agent_hub.content_studio.media import (
     AudioClip,
@@ -112,6 +116,7 @@ from agent_hub.content_studio.media import (
     ContentStudioMediaError,
     FinalRenderApproval,
     MediaTimeline,
+    MediaQCCheck,
     RenderRequest,
     SubtitleCue,
     VisualClip,
@@ -184,6 +189,7 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.resource_context import ResourceContextArtifactLoader
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.scheduler.service import SchedulerService
@@ -820,7 +826,7 @@ class _ConfigBackedContentStudioProductionProvider:
             ResearchQuestion("RQ004", "60 秒抖音科普应该用什么例子讲清楚？"),
         )
         claims = self._claims_from_evidence(project, evidence)
-        bundle = ResearchBundle(questions=questions, evidence=evidence)
+        bundle = _content_studio_research_bundle(project, questions, evidence)
         graph = EvidenceGraph(claims=claims, evidence=evidence)
         return _content_studio_status(
             replace(project, research_bundle=bundle, evidence_graph=graph),
@@ -854,7 +860,7 @@ class _ConfigBackedContentStudioProductionProvider:
                     Evidence(
                         evidence_id=evidence_id,
                         source_url=str(response.url),
-                        source_type=_source_type_for_host(project, host),
+                        source_type=_source_type_for_url(project, str(response.url)),
                         publisher=_publisher_for_host(host),
                         published_at=None,
                         retrieved_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -941,7 +947,7 @@ class _ConfigBackedContentStudioProductionProvider:
             return _content_studio_status(project, ProjectStatus.PLAN_READY, "plan")
         if project.fact_check_report is None:
             return _content_studio_blocked(project, "fact_check_required", "fact check must finish before planning")
-        target_seconds = int(project.packs.platform.settings["target_seconds"])
+        target_seconds = _content_studio_int_setting(project, "target_seconds")
         plan = ContentPlan(
             sections=(
                 "0-3s Hook: 先用一句话说清 AIGC 不是玄学",
@@ -1014,7 +1020,7 @@ class _ConfigBackedContentStudioProductionProvider:
             return _content_studio_blocked(project, "script_required", "script must be ready before storyboard")
         if not project.script_approved:
             return replace(project, status=ProjectStatus.SCRIPT_READY)
-        target_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        target_ms = _content_studio_int_setting(project, "target_seconds") * 1000
         durations = (3000, 7000, 12000, 12000, 10000, 10000, max(6000, target_ms - 54000))
         start = 0
         shots: list[Shot] = []
@@ -1078,7 +1084,7 @@ class _ConfigBackedContentStudioProductionProvider:
         assets: list[AssetRecord] = []
         errors: list[str] = []
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 errors.append(str(result))
             else:
                 assets.append(result)
@@ -1131,8 +1137,8 @@ class _ConfigBackedContentStudioProductionProvider:
             url_or_provider_task_id=result.text or file_path or result.deployment_id,
             content_hash=_content_studio_hash("|".join((result.text or "", file_path, prompt))),
             technical_params={
-                "width": int(project.packs.platform.settings["width"]),
-                "height": int(project.packs.platform.settings["height"]),
+                "width": _content_studio_int_setting(project, "width"),
+                "height": _content_studio_int_setting(project, "height"),
                 "mime": result.mime_type or "image/png",
                 "file_path": file_path,
                 "filename": result.filename or "",
@@ -1182,7 +1188,7 @@ class _ConfigBackedContentStudioProductionProvider:
                     "voice",
                 )
         audio_path = self._output_dir / project.project_id / "voice-demo-signal.wav"
-        _write_demo_signal_wav(audio_path, seconds=max(1, int(project.packs.platform.settings["target_seconds"])))
+        _write_demo_signal_wav(audio_path, seconds=max(1, _content_studio_int_setting(project, "target_seconds")))
         voice = VoiceTrack(
             audio_artifact_id=str(audio_path),
             timestamp_level="sentence",
@@ -1204,9 +1210,9 @@ class _ConfigBackedContentStudioProductionProvider:
             return _content_studio_status(project, ProjectStatus.TIMELINE_READY, "timeline")
         if project.voice_track is None or project.asset_manifest is None or project.script is None:
             return _content_studio_blocked(project, "timeline_inputs_missing", "voice, assets, and script are required before timeline")
-        width = int(project.packs.platform.settings["width"])
-        height = int(project.packs.platform.settings["height"])
-        duration_ms = int(project.packs.platform.settings["target_seconds"]) * 1000
+        width = _content_studio_int_setting(project, "width")
+        height = _content_studio_int_setting(project, "height")
+        duration_ms = _content_studio_int_setting(project, "target_seconds") * 1000
         timeline = Timeline(
             width=width,
             height=height,
@@ -1321,7 +1327,7 @@ class _ConfigBackedContentStudioProductionProvider:
                 timeout_seconds=90,
             )
         )
-        return completion.response.text
+        return completion.response.text or ""
 
     async def _default_capacity(self, deployments: tuple[Deployment, ...]) -> CapacityPool:
         credentials = CredentialRegistry(
@@ -1340,12 +1346,24 @@ def _content_studio_stage_index(stage: ProjectStatus) -> int:
 
 
 def _content_studio_status(project: ContentProject, status: ProjectStatus, stage_key: str) -> ContentProject:
-    return replace(
+    already_completed = stage_key in project.completed_stage_keys
+    updated = replace(
         project,
         status=status,
         error_code=None,
         error_message=None,
         completed_stage_keys=project.completed_stage_keys | {stage_key},
+    )
+    if already_completed:
+        return updated
+    return append_content_project_event(
+        updated,
+        kind="stage_completed",
+        stage=stage_key,
+        status=status.value,
+        title=f"Content Studio {stage_key}",
+        summary=f"{stage_key} 阶段已完成",
+        payload={"stage": stage_key, "status": status.value},
     )
 
 
@@ -1354,11 +1372,19 @@ def _content_studio_blocked(
     error_code: str,
     error_message: str,
 ) -> ContentProject:
-    return replace(
-        project,
-        status=ProjectStatus.FAILED_BLOCKED,
-        error_code=error_code,
-        error_message=error_message[:1000],
+    return append_content_project_event(
+        replace(
+            project,
+            status=ProjectStatus.FAILED_BLOCKED,
+            error_code=error_code,
+            error_message=error_message[:1000],
+        ),
+        kind="stage_failed",
+        stage="blocked",
+        status="failed",
+        title="阶段失败",
+        summary=f"{error_code}: {error_message[:1000]}",
+        payload={"error_code": error_code, "error_message": error_message[:1000]},
     )
 
 
@@ -1373,8 +1399,7 @@ def _content_studio_record_attempt(
         status="completed",
         result_hash=_content_studio_hash(repr(result)),
     )
-    existing = tuple(item for item in project.provider_attempts if item.idempotency_key != attempt.idempotency_key)
-    return replace(project, provider_attempts=existing + (attempt,))
+    return record_content_project_provider_attempt(project, attempt)
 
 
 def _content_studio_source_urls(project: ContentProject) -> tuple[str, ...]:
@@ -1383,9 +1408,23 @@ def _content_studio_source_urls(project: ContentProject) -> tuple[str, ...]:
         urls.extend(
             (
                 "https://openai.com/news/",
+                "https://platform.openai.com/docs/models",
                 "https://github.com/openai/openai-python/releases",
                 "https://huggingface.co/blog",
                 "https://arxiv.org/list/cs.AI/recent",
+                "https://www.anthropic.com/news",
+                "https://ai.google.dev/",
+                "https://deepmind.google/discover/blog/",
+                "https://azure.microsoft.com/en-us/blog/topics/ai-machine-learning/",
+                "https://github.blog/changelog/",
+                "https://blogs.nvidia.com/blog/category/deep-learning/",
+                "https://stability.ai/news",
+                "https://runwayml.com/research",
+                "https://www.minimax.io/news",
+                "https://qwenlm.github.io/blog/",
+                "https://www.alibabacloud.com/blog/ai",
+                "https://cloud.tencent.com/developer/article",
+                "https://research.baidu.com/Blog",
             )
         )
     return tuple(dict.fromkeys(urls))
@@ -1401,6 +1440,116 @@ def _content_studio_allowed_hosts(project: ContentProject) -> tuple[str, ...]:
 def _host_allowed(host: str, allowed_hosts: tuple[str, ...]) -> bool:
     normalized = host.casefold()
     return any(normalized == item or normalized.endswith(f".{item}") for item in allowed_hosts)
+
+
+def _content_studio_source_priority(project: ContentProject) -> tuple[str, ...]:
+    raw = project.packs.domain.settings.get("source_priority", ())
+    if isinstance(raw, list | tuple):
+        values = tuple(str(item).strip() for item in raw if str(item).strip())
+        if values:
+            return values
+    return (
+        "official_docs",
+        "official_blog",
+        "release_notes",
+        "github_release",
+        "paper",
+        "official_demo",
+        "secondary_media",
+    )
+
+
+def _content_studio_research_bundle(
+    project: ContentProject,
+    questions: tuple[ResearchQuestion, ...],
+    evidence: tuple[Evidence, ...],
+) -> ResearchBundle:
+    source_priority = _content_studio_source_priority(project)
+    return ResearchBundle(
+        questions=questions,
+        evidence=evidence,
+        source_priority=source_priority,
+        retrieval_plan=tuple(
+            f"{index}. Fetch and verify {source_type.replace('_', ' ')} sources before lower-priority material"
+            for index, source_type in enumerate(source_priority, start=1)
+        ),
+        source_coverage=_content_studio_source_coverage(source_priority, evidence),
+        source_candidates=_content_studio_source_candidates(project, evidence),
+    )
+
+
+def _content_studio_source_candidates(
+    project: ContentProject,
+    evidence: tuple[Evidence, ...],
+) -> tuple[ResearchSourceCandidate, ...]:
+    candidates: list[ResearchSourceCandidate] = []
+    for index, url in enumerate(_content_studio_source_urls(project), start=1):
+        candidates.append(
+            ResearchSourceCandidate(
+                source_type=_source_type_for_url(project, url),
+                source_url=url,
+                priority=index,
+                rationale="configured source URL",
+            )
+        )
+    for evidence_item in evidence:
+        candidates.append(
+            ResearchSourceCandidate(
+                source_type=evidence_item.source_type,
+                source_url=evidence_item.source_url,
+                priority=0,
+                rationale=f"retrieved evidence {evidence_item.evidence_id}",
+            )
+        )
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ResearchSourceCandidate] = []
+    for candidate in candidates:
+        key = (candidate.source_type, candidate.source_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return tuple(deduped)
+
+
+def _content_studio_source_coverage(
+    source_priority: tuple[str, ...],
+    evidence: tuple[Evidence, ...],
+) -> tuple[ResearchSourceCoverage, ...]:
+    evidence_by_type: dict[str, list[str]] = {}
+    for item in evidence:
+        evidence_by_type.setdefault(item.source_type, []).append(item.evidence_id)
+    return tuple(
+        ResearchSourceCoverage(
+            source_type=source_type,
+            required=source_type != "secondary_media",
+            evidence_ids=tuple(evidence_by_type.get(source_type, ())),
+            status="covered" if evidence_by_type.get(source_type) else "missing",
+            note="source category has retrieved evidence"
+            if evidence_by_type.get(source_type)
+            else "source category was configured but produced no accepted evidence",
+        )
+        for source_type in source_priority
+    )
+
+
+def _source_type_for_url(project: ContentProject, url: str) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    if (host == "github.com" or host.endswith(".github.com")) and "/releases" in path:
+        return "github_release"
+    if host == "arxiv.org" or host.endswith(".arxiv.org"):
+        return "paper"
+    if "/release" in path or "/changelog" in path or "/updates" in path:
+        return "release_notes"
+    if "/blog" in path or "/news" in path or "/research" in path:
+        return "official_blog"
+    if "/demo" in path or "/examples" in path or "/spaces/" in path:
+        return "official_demo"
+    if "/docs" in path or "/documentation" in path or "/guide" in path:
+        return "official_docs"
+    return _source_type_for_host(project, host)
 
 
 def _source_type_for_host(project: ContentProject, host: str) -> str:
@@ -1454,6 +1603,13 @@ def _html_to_text(html: str) -> str:
 
 def _content_studio_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _content_studio_int_setting(project: ContentProject, field: str) -> int:
+    value = project.packs.platform.settings[field]
+    if not isinstance(value, int):
+        raise TypeError(f"platform setting {field} must be an integer")
+    return value
 
 
 def _content_studio_script_prompt(project: ContentProject) -> str:
@@ -1715,10 +1871,24 @@ def _qc_report_from_media(project: ContentProject, media_qc: object) -> QCReport
     technical_passed = bool(getattr(media_qc, "technical_passed", False))
     if not technical_passed:
         blockers.append("media technical QC failed")
+    for check in _media_qc_checks(media_qc):
+        checked.append(f"video reviewer: {check.name} {check.status} - {check.details[:300]}")
+        if check.name in {"video_reviewer_frame_sampling", "subtitle_text_review", "subtitle_visual_contrast"}:
+            if check.status == "failed":
+                blockers.append(f"video reviewer QC failed: {check.name}")
+            elif check.status == "warning":
+                majors.append(f"video reviewer warning: {check.name}")
     needs_review = bool(getattr(media_qc, "needs_review", False))
     if needs_review:
         minors.append("media adapter reported review-needed warnings")
     return QCReport(blockers=tuple(blockers), majors=tuple(majors), minors=tuple(minors), checked_items=tuple(checked))
+
+
+def _media_qc_checks(media_qc: object) -> tuple[MediaQCCheck, ...]:
+    raw = getattr(media_qc, "checks", ())
+    if isinstance(raw, tuple | list):
+        return tuple(item for item in raw if isinstance(item, MediaQCCheck))
+    return ()
 
 
 def _sha256_file(path: Path) -> str:
@@ -1943,7 +2113,7 @@ def _asset_visual_review_request(
         required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
         response_schema = StructuredResponseSchema(
             name="AssetVisualReview",
-            schema=_ASSET_VISUAL_REVIEW_SCHEMA,
+            schema=cast(Mapping[str, JsonValue], _ASSET_VISUAL_REVIEW_SCHEMA),
         )
     return ModelRequest(
         logical_model=deployment.logical_model,

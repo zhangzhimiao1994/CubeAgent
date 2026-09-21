@@ -3464,6 +3464,87 @@ button.agent-cluster-status:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.content-studio-history {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.content-studio-history-item {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.5rem;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.75rem;
+}
+
+.content-studio-history-item > div {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.content-studio-history-item strong,
+.content-studio-history-item small,
+.content-studio-history-item p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.content-studio-history-item small,
+.content-studio-history-refs {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 750;
+}
+
+.content-studio-history-index {
+  align-items: center;
+  background: rgba(62, 205, 255, 0.14);
+  border: 1px solid rgba(123, 225, 255, 0.22);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  font-weight: 900;
+  height: 1.45rem;
+  justify-content: center;
+  min-width: 1.45rem;
+  padding: 0 0.35rem;
+}
+
+.content-studio-source-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.content-studio-source-list {
+  display: grid;
+  gap: 0.5rem;
+  list-style: none;
+  padding-left: 0;
+}
+
+.content-studio-source-list li {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.5rem;
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.65rem 0.75rem;
+}
+
+.content-studio-source-list span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .content-studio-grid article p {
   color: var(--muted);
   overflow-wrap: anywhere;

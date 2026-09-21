@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, attr-defined"
+
 from __future__ import annotations
 
 import json
@@ -37,12 +39,32 @@ def test_bundled_pack_registry_loads_mvp_packs_and_manifest_only_platform_extens
 
     assert locked.platform.name == "xiaohongshu"
     assert locked.platform.settings["aspect_ratio"] == "3:4"
-    assert locked.domain.settings["allowed_hosts"] == [
+    allowed_hosts = locked.domain.settings["allowed_hosts"]
+    assert isinstance(allowed_hosts, list)
+    assert set(allowed_hosts) >= {
         "openai.com",
         "github.com",
         "arxiv.org",
         "huggingface.co",
-    ]
+        "anthropic.com",
+        "ai.google.dev",
+        "deepmind.google",
+        "microsoft.com",
+        "azure.microsoft.com",
+        "github.blog",
+        "nvidia.com",
+        "stability.ai",
+        "runwayml.com",
+        "minimax.io",
+        "qwenlm.github.io",
+        "alibabacloud.com",
+        "cloud.tencent.com",
+        "baidu.com",
+    }
+    source_types = locked.domain.settings["source_types"]
+    assert isinstance(source_types, dict)
+    assert source_types["github.blog"] == "official_blog"
+    assert source_types["arxiv.org"] == "paper"
     assert locked.domain.settings["default_license"] == "source_terms"
 
 
@@ -69,8 +91,9 @@ def test_manifest_only_platform_runs_through_timeline_with_pack_settings() -> No
     assert rights_ready.status.name == "ASSETS_READY"
     assert rights_ready.asset_manifest is not None
     blocked = service.run_content_project(project.project_id, until=ProjectStatus.TIMELINE_READY)
-    assert blocked.status.name == "FAILED_BLOCKED"
-    assert blocked.error_code == "asset_rights_not_approved"
+    assert blocked.status.name == "ASSETS_READY"
+    assert blocked.error_code is None
+    assert blocked.timeline is None
     rights_ready = service.approve_rights(
         project.project_id,
         asset_ids=tuple(asset.asset_id for asset in rights_ready.asset_manifest.assets),

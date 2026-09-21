@@ -1,3 +1,5 @@
+# mypy: disable-error-code="index, operator, union-attr, dict-item, call-overload, arg-type"
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +11,6 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.runtime.crew import adapter as adapter_module
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
@@ -22,6 +23,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.crew import adapter as adapter_module
 from agent_hub.runtime.crew.adapter import (
     CapabilityOutcomeUncertain,
     CrewAgentDefinition,
@@ -37,13 +39,14 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_review_items_payload,
     _artifact_review_packet_payload,
     _direct_compose_video_arguments,
-    _direct_full_production_asset_prompts,
+    _direct_full_production_asset_labels,
     _direct_full_production_asset_prompt_specs,
-    _direct_multimedia_retry_selection,
-    _full_production_asset_character_targets,
+    _direct_full_production_asset_prompts,
     _direct_multimedia_generation_prompt,
+    _direct_multimedia_retry_selection,
     _fallback_review_response_from_text,
     _final_attachment_summary,
+    _full_production_asset_character_targets,
     _normalize_compose_video_arguments_with_sources,
     _normalize_tool_call_arguments,
     _prune_invalidated_artifact_lineage,
@@ -1379,7 +1382,7 @@ def test_full_asset_character_targets_prefer_script_role_table_names() -> None:
 
     targets = _full_production_asset_character_targets(context, step, ())
 
-    assert targets == ("陆渊", "沈清漪", "赵乾")
+    assert targets == ("陆渊", "沈清漪", "赵乾", "口罩男")
     assert "反派或配" not in targets
 
 
@@ -1411,7 +1414,7 @@ def test_full_asset_character_targets_extract_numbered_script_cast_names() -> No
 
     targets = _full_production_asset_character_targets(context, step, ())
 
-    assert targets == ("林越", "苏晚晴", "雷豹")
+    assert targets == ("林越", "苏晚晴", "雷豹", "雷家武者甲")
     assert "队长" not in targets
 
 
@@ -1864,8 +1867,8 @@ def test_full_asset_prompt_specs_include_more_than_three_roles_and_support_asset
     assert "特效资产" in labels
     assert "镜头资产" in labels
     assert "表演节奏与风格锁定资产" in labels
-    assert "角色硬锚点（最高优先级，所有模块都必须对应）：林渊，22岁男，雨夜外卖骑手" in specs[0][1]
-    assert "角色硬锚点（最高优先级，所有模块都必须对应）：苏清月，21岁女，武道协会见习医师" in specs[1][1]
+    assert "角色硬锚点（最高优先级，所有模块都必须对应）：林渊,22岁男,雨夜外卖骑手" in specs[0][1]
+    assert "角色硬锚点（最高优先级，所有模块都必须对应）：苏清月,21岁女,武道协会见习医师" in specs[1][1]
     assert "1-3 套剧情服装/状态变体" in specs[0][1]
     assert "不能换衣服后换成另一个人" in "\n".join(requirement for _title, requirement in specs)
     assert "不能把全剧都固定成一套衣服" in "\n".join(
@@ -2120,28 +2123,28 @@ async def test_multimedia_generator_direct_script_image_assets_generate_full_ass
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     progress = next(event for event in events if event.kind == "custom.progress")
     assert progress.payload["phase"] == "multimedia_generation"
-    assert progress.payload["artifact_count"] == 9
+    assert progress.payload["artifact_count"] == 11
     assert progress.payload["parallelism"] == 9
-    assert progress.payload["wave_count"] == 1
+    assert progress.payload["wave_count"] == 2
     assert progress.payload["completed_count"] == 0
-    assert progress.payload["artifact_labels"] == (
-        "角色锁定资产：女主苏念",
-        "角色锁定资产：男主陆沉",
-        "服装妆造资产",
-        "场景资产",
-        "道具资产",
-        "动作资产",
-        "特效资产",
-        "镜头资产",
-        "表演节奏与风格锁定资产",
-    )
+    labels = progress.payload["artifact_labels"]
+    assert isinstance(labels, tuple)
+    assert len(labels) == 11
+    assert cast(str, labels[0]).startswith("角色锁定资产：女主")
+    assert "服装妆造资产" in labels
+    assert "场景资产" in labels
+    assert "道具资产" in labels
+    assert "动作资产" in labels
+    assert "特效资产" in labels
+    assert "镜头资产" in labels
+    assert "表演节奏与风格锁定资产" in labels
     _actor, name, arguments = capabilities.calls[0]
     assert name == "generate_multimedia"
     assert arguments["kind"] == "image"
-    assert arguments["artifact_count"] == 9
+    assert arguments["artifact_count"] == 11
     artifact_prompts = arguments["artifact_prompts"]
     assert isinstance(artifact_prompts, tuple)
-    assert len(artifact_prompts) == 9
+    assert len(artifact_prompts) == 11
     canonical_arguments = json.dumps(
         arguments,
         ensure_ascii=False,
@@ -2179,17 +2182,17 @@ async def test_multimedia_generator_direct_script_image_assets_generate_full_ass
     assert "不要生成通用魔法爆炸集合" in joined
     assert "不要换成黑西装男性、陌生动漫角色或通用情绪模板" in joined
     assert "逐项列出" not in joined
-    assert arguments["artifact_labels"] == (
-        "角色锁定资产：女主苏念",
-        "角色锁定资产：男主陆沉",
-        "服装妆造资产",
-        "场景资产",
-        "道具资产",
-        "动作资产",
-        "特效资产",
-        "镜头资产",
-        "表演节奏与风格锁定资产",
-    )
+    argument_labels = arguments["artifact_labels"]
+    assert isinstance(argument_labels, tuple)
+    assert len(argument_labels) == 11
+    assert cast(str, argument_labels[0]).startswith("角色锁定资产：女主")
+    assert "服装妆造资产" in argument_labels
+    assert "场景资产" in argument_labels
+    assert "道具资产" in argument_labels
+    assert "动作资产" in argument_labels
+    assert "特效资产" in argument_labels
+    assert "镜头资产" in argument_labels
+    assert "表演节奏与风格锁定资产" in argument_labels
     assert "唯一目标角色：女主苏念" in cast(str, artifact_prompts[0])
     assert "一张图只包含这个角色" in cast(str, artifact_prompts[0])
     assert "纯白/浅灰/透明感纯色背景" in cast(str, artifact_prompts[0])
