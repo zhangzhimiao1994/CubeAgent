@@ -663,8 +663,8 @@ async def _call_summary_service(
     return await method(**_supported_kwargs(method, kwargs))
 
 
-def _supported_kwargs(
-    method: Callable[..., Awaitable[ContentProject]],
+def _supported_kwargs[ReturnT](
+    method: Callable[..., Awaitable[ReturnT]],
     kwargs: dict[str, object],
 ) -> dict[str, object]:
     signature = inspect.signature(method)
