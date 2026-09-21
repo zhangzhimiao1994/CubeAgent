@@ -130,7 +130,11 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     reason = normalize_failure_reason(str(error))
     if not is_safe_failure_reason(reason):
         error_type = type(error).__name__
-        if reason and not SENSITIVE_FAILURE_REASON.search(reason) and is_safe_failure_reason(error_type):
+        if (
+            reason
+            and (not SENSITIVE_FAILURE_REASON.search(reason) or fallback != "runtime_failed")
+            and is_safe_failure_reason(error_type)
+        ):
             return f"{fallback} ({error_type})"
         return fallback
     return reason[:MAX_FAILURE_REASON_LENGTH]

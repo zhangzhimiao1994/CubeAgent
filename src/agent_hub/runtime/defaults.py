@@ -1228,6 +1228,7 @@ def _dispatch_step_summary(step: DispatchStep) -> Mapping[str, JsonValue]:
     }
     if step.requires_user_review:
         payload["requires_user_review"] = True
+        payload["task"] = step.task
     return payload
 
 
@@ -1298,8 +1299,10 @@ def _role_allowed_tools(
 
 
 def _is_media_pipeline_script_stage_context(context: TaskContext) -> bool:
-    return isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping) or (
-        _is_deferred_media_script_plan_context(context)
+    return (
+        isinstance(context.routing_decision.get("media_pipeline_plan"), Mapping)
+        or _request_requires_asset_locked_pipeline_review(context.request)
+        or _is_deferred_media_script_plan_context(context)
     )
 
 

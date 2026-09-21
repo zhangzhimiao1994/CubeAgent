@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -963,8 +964,6 @@ def _explicit_context_artifact_sources(
         return ()
     sanitized: list[Artifact] = []
     for artifact in context.artifacts:
-        if artifact.type in {"model_response", "tool_result", "review_feedback"}:
-            continue
         files = _usable_file_artifacts_payload((artifact,))
         if files and file_allowed:
             sanitized.append(
@@ -976,6 +975,8 @@ def _explicit_context_artifact_sources(
                     source_ids=artifact.source_ids,
                 )
             )
+            continue
+        if artifact.type in {"model_response", "tool_result", "review_feedback"}:
             continue
         text_value = _first_artifact_text_value(artifact.content)
         if type(text_value) is not str or not text_value.strip() or not text_allowed:
@@ -1819,6 +1820,31 @@ def _direct_capability_names_for_step(step: DispatchStep) -> frozenset[str]:
     )
 
 
+def _select_default_multimedia_model(
+    selector: object,
+    *,
+    tenant_id: UUID,
+    kind: str,
+) -> object:
+    if not callable(selector):
+        return None
+    parameters: Mapping[str, inspect.Parameter]
+    try:
+        parameters = inspect.signature(selector).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "tenant_id" in parameters:
+        return selector(tenant_id=tenant_id, kind=kind)
+    if parameters:
+        return selector(kind=kind)
+    try:
+        return selector(tenant_id=tenant_id, kind=kind)
+    except TypeError as error:
+        if "unexpected keyword argument 'tenant_id'" not in str(error):
+            raise
+        return selector(kind=kind)
+
+
 def _direct_capability_timeout_reason(
     capability_name: str,
     arguments: Mapping[str, JsonValue],
@@ -1842,6 +1868,7 @@ def _direct_capability_failure_payload(
     payload: dict[str, JsonValue] = dict(runtime_failure_diagnostic_from_reason(failure_reason))
     payload["capability_name"] = capability_name
     if capability_name == "generate_multimedia":
+        payload["artifact_count"] = _json_int(arguments.get("artifact_count"), default=1)
         for key in ("kind", "logical_model", "artifact_count"):
             value = arguments.get(key)
             if isinstance(value, (str, int)):
@@ -6222,14 +6249,11 @@ class CrewDispatchRuntime:
             if kind is None:
                 return None
             selector = getattr(self._capabilities, "default_logical_model_for_multimedia", None)
-            selected: object = None
-            if callable(selector):
-                try:
-                    selected = selector(tenant_id=context.tenant_id, kind=kind)
-                except TypeError as error:
-                    if "unexpected keyword argument 'tenant_id'" not in str(error):
-                        raise
-                    selected = selector(kind=kind)
+            selected = _select_default_multimedia_model(
+                selector,
+                tenant_id=context.tenant_id,
+                kind=kind,
+            )
             if hasattr(selected, "__await__"):
                 selected = await cast(Coroutine[Any, Any, object], selected)
             selected_model = selected if isinstance(selected, str) and selected.strip() else None
@@ -6492,7 +6516,15 @@ class CrewDispatchRuntime:
             running_tool["status"] = "running"
             await tool_boundary(tool_key, running_tool, None)
             try:
-                timeout_seconds = self._remaining_timeout(run_state, step_deadline)
+                try:
+                    timeout_seconds = max(
+                        self._remaining_timeout(run_state, step_deadline),
+                        0.05,
+                    )
+                except RuntimeExecutionError as error:
+                    if str(error) != "dispatch deadline exhausted":
+                        raise
+                    raise TimeoutError from None
                 async with asyncio.timeout(timeout_seconds):
                     execute_task = asyncio.create_task(
                         self._capabilities.execute(

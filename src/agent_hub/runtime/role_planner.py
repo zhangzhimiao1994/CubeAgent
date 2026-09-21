@@ -251,6 +251,17 @@ class RolePlanner:
                 profiles=request.profiles,
                 roles=roles,
             )
+        if request.mode is not TaskMode.DISCUSS and _is_character_sheet_only_request(
+            request.task
+        ):
+            media_specs = tuple(spec for spec in catalog_specs if spec[0] == "multimedia_generator")
+            roles = tuple(_assignment(spec, request) for spec in media_specs)
+            return RolePlan(
+                mode=request.mode,
+                profile=request.profile,
+                profiles=request.profiles,
+                roles=roles,
+            )
         if request.mode is not TaskMode.DISCUSS and _is_script_first_asset_image_request(
             request.task
         ):
@@ -2144,6 +2155,43 @@ def _is_asset_locked_video_pipeline_request(task: str) -> bool:
         and not _is_script_first_media_generation_request(task)
     )
     return not existing_composition_only
+
+
+def _is_character_sheet_only_request(task: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", task).casefold()
+    if not any(term in normalized for term in ("只生成", "仅生成", "只要", "仅要", "only")):
+        return False
+    if not any(
+        term in normalized
+        for term in (
+            "character model sheet",
+            "model sheet",
+            "角色参考设定表",
+            "角色设定表",
+            "角色服装设定板",
+            "服装设定板",
+            "定妆参考图",
+            "角色定妆图",
+        )
+    ):
+        return False
+    return any(
+        term in normalized
+        for term in (
+            "不要生成视频",
+            "不用生成视频",
+            "不生成视频",
+            "不要剪辑",
+            "不用剪辑",
+            "不要成片",
+            "不用成片",
+            "no video",
+            "do not generate video",
+            "don't generate video",
+            "no edit",
+            "no final video",
+        )
+    )
 
 
 def _is_script_first_asset_image_request(task: str) -> bool:
