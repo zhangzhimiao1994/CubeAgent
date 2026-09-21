@@ -187,6 +187,14 @@ describe("ContentStudioPage", () => {
     runResponses = [];
     approveRightsResponse = null;
     project456Response = null;
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn((blob: Blob) => `blob:content-studio-${blob.size}`),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -234,6 +242,30 @@ describe("ContentStudioPage", () => {
         if (path === "/api/v1/content-studio/projects/project-456" && method === "GET") {
           if (project456Response) return jsonResponse(await project456Response);
           return jsonResponse(visibleOtherProject);
+        }
+        if (
+          path === "/api/v1/content-studio/projects/project-123/media/preview/download" &&
+          method === "GET"
+        ) {
+          return new Response(new Blob(["preview-video"], { type: "video/mp4" }), {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Disposition": 'attachment; filename="project-123-preview.mp4"',
+            },
+          });
+        }
+        if (
+          path === "/api/v1/content-studio/projects/project-123/media/final/download" &&
+          method === "GET"
+        ) {
+          return new Response(new Blob(["final-video"], { type: "video/mp4" }), {
+            status: 200,
+            headers: {
+              "Content-Type": "video/mp4",
+              "Content-Disposition": 'attachment; filename="project-123-final.mp4"',
+            },
+          });
         }
         if (path === "/api/v1/content-studio/projects/project-123/run" && method === "POST") {
           if (runResponses.length) return jsonResponse(await runResponses.shift());
@@ -336,6 +368,24 @@ describe("ContentStudioPage", () => {
     expect(screen.getByText("前三秒说明发生了什么。")).not.toBeNull();
     expect(screen.getByText("/generated/content-studio/project-123-preview.mp4")).not.toBeNull();
     expect(screen.getAllByText("/generated/content-studio/project-123-final.mp4").length).toBeGreaterThan(0);
+  });
+
+  it("shows rendered preview and final videos as playable project media", async () => {
+    render(<TestApp initialPath="/content-studio?project=project-123" />);
+
+    expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
+    const previewVideo = await screen.findByLabelText("预览视频");
+    expect(previewVideo.getAttribute("src")?.startsWith("blob:content-studio-")).toBe(true);
+    expect(screen.getByRole("link", { name: "打开预览视频" }).getAttribute("href")).toBe(previewVideo.getAttribute("src"));
+    const finalVideos = screen.getAllByLabelText("终片视频");
+    expect(finalVideos[0].getAttribute("src")?.startsWith("blob:content-studio-")).toBe(true);
+    expect(screen.getAllByRole("link", { name: "打开终片视频" })[0].getAttribute("href")).toBe(finalVideos[0].getAttribute("src"));
+    expect(
+      requests.some((request) => request.path === "/api/v1/content-studio/projects/project-123/media/preview/download"),
+    ).toBe(true);
+    expect(
+      requests.some((request) => request.path === "/api/v1/content-studio/projects/project-123/media/final/download"),
+    ).toBe(true);
   });
 
   it("locks later workflow stages until their prerequisites are complete", async () => {

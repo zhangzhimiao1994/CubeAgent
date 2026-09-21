@@ -3,10 +3,12 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
+from pathlib import Path
 from types import TracebackType
 from typing import Annotated, Protocol, cast
 
 from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from agent_hub.api.dependencies import require_permission
@@ -283,6 +285,25 @@ async def get_content_project(
 ) -> dict[str, object]:
     project = await _scoped_project(service, principal, project_id)
     return _project_payload(project)
+
+
+@router.get(
+    "/projects/{project_id}/media/{media_kind}/download",
+    response_model=None,
+    responses=error_responses(403, 404, 422),
+)
+async def download_content_project_media(
+    project_id: str,
+    media_kind: str,
+    service: Annotated[ContentStudioServiceProtocol, Depends(_content_studio_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> FileResponse:
+    project = await _scoped_project(service, principal, project_id)
+    path = _project_media_path(project, media_kind)
+    if path is None or not path.is_file():
+        raise PublicAPIError(404, "content_project_media_not_found", "content project media was not found")
+    filename = f"{project.project_id}-{media_kind.strip().casefold()}.mp4"
+    return FileResponse(path, media_type="video/mp4", filename=filename)
 
 
 @router.post(
@@ -634,6 +655,24 @@ def _project_payload(project: ContentProject) -> dict[str, object]:
     raw = content_project_to_payload(project)["project"]
     assert isinstance(raw, dict)
     return raw
+
+
+def _project_media_path(project: ContentProject, media_kind: str) -> Path | None:
+    normalized = media_kind.strip().casefold()
+    if project.timeline is None:
+        return None
+    if normalized == "preview":
+        value = project.timeline.preview_artifact_id
+    elif normalized == "final":
+        value = project.timeline.final_artifact_id
+    else:
+        raise PublicAPIError(404, "content_project_media_not_found", "content project media was not found")
+    if not value:
+        return None
+    path = Path(value)
+    if path.suffix.casefold() != ".mp4":
+        return None
+    return path
 
 
 def _summary_payload(summary: ContentProjectSummary) -> dict[str, object]:

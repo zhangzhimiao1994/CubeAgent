@@ -618,7 +618,7 @@ export function ContentStudioPage() {
             </div>
             <div className="resource-list content-studio-grid">
               <StudioPanel title="Voice" value={visibleProject?.voice_track} />
-              <TimelinePanel value={visibleProject?.timeline} />
+              <TimelinePanel projectId={activeProjectId} value={visibleProject?.timeline} />
             </div>
           </StageSection>
 
@@ -644,7 +644,7 @@ export function ContentStudioPage() {
             </div>
             <div className="resource-list content-studio-grid">
               <QcPanel value={visibleProject?.qc_report} />
-              <TimelinePanel value={visibleProject?.timeline} finalOnly />
+              <TimelinePanel projectId={activeProjectId} value={visibleProject?.timeline} finalOnly />
             </div>
             <section aria-label="项目历史">
               <h3>项目历史与产物记录</h3>
@@ -970,7 +970,7 @@ function AssetsPanel({ assets, value }: { assets: AssetSummary[]; value: unknown
   );
 }
 
-function TimelinePanel({ finalOnly = false, value }: { finalOnly?: boolean; value: unknown }) {
+function TimelinePanel({ finalOnly = false, projectId, value }: { finalOnly?: boolean; projectId: string; value: unknown }) {
   const row = recordValue(value);
   const preview = stringValue(row?.preview_artifact_id);
   const final = stringValue(row?.final_artifact_id);
@@ -979,8 +979,24 @@ function TimelinePanel({ finalOnly = false, value }: { finalOnly?: boolean; valu
       <p className="eyebrow">{value ? "ready" : "pending"}</p>
       <h3>{finalOnly ? "Final Render" : "Timeline"}</h3>
       <p>{value ? `${numberValue(row?.width) ?? 0}×${numberValue(row?.height) ?? 0} · ${numberValue(row?.duration_ms) ?? 0}ms` : "等待时间线"}</p>
-      {!finalOnly && preview ? <p className="content-studio-media-path">{preview}</p> : null}
-      {final ? <p className="content-studio-media-path">{final}</p> : null}
+      {!finalOnly && preview ? (
+        <ProjectMediaPlayer
+          artifactId={preview}
+          kind="preview"
+          label="预览视频"
+          linkLabel="打开预览视频"
+          projectId={projectId}
+        />
+      ) : null}
+      {finalOnly && final ? (
+        <ProjectMediaPlayer
+          artifactId={final}
+          kind="final"
+          label="终片视频"
+          linkLabel="打开终片视频"
+          projectId={projectId}
+        />
+      ) : null}
       {value ? (
         <details>
           <summary>查看结构化详情</summary>
@@ -989,6 +1005,76 @@ function TimelinePanel({ finalOnly = false, value }: { finalOnly?: boolean; valu
       ) : null}
     </article>
   );
+}
+
+function ProjectMediaPlayer({
+  artifactId,
+  kind,
+  label,
+  linkLabel,
+  projectId,
+}: {
+  artifactId: string;
+  kind: "preview" | "final";
+  label: string;
+  linkLabel: string;
+  projectId: string;
+}) {
+  const media = useContentStudioMedia(projectId, kind, Boolean(artifactId));
+  return (
+    <div className="content-studio-media-card">
+      <p className="content-studio-media-path">{artifactId}</p>
+      {media.url ? (
+        <>
+          <video aria-label={label} className="content-studio-media-video" controls preload="metadata" src={media.url} />
+          <a className="secondary-action content-studio-media-link" href={media.url} download={media.filename ?? undefined} target="_blank" rel="noreferrer">
+            {linkLabel}
+          </a>
+        </>
+      ) : (
+        <p className="content-studio-helper">{media.error ?? "正在加载视频..."}</p>
+      )}
+    </div>
+  );
+}
+
+function useContentStudioMedia(projectId: string, kind: "preview" | "final", enabled: boolean) {
+  const [state, setState] = useState<{ error: string | null; filename: string | null; url: string | null }>({
+    error: null,
+    filename: null,
+    url: null,
+  });
+
+  useEffect(() => {
+    if (!projectId || !enabled) {
+      setState({ error: null, filename: null, url: null });
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    setState({ error: null, filename: null, url: null });
+    api
+      .downloadContentStudioMedia(projectId, kind)
+      .then(({ blob, filename }) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl);
+          return;
+        }
+        setState({ error: null, filename, url: objectUrl });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setState({ error: formatApiError(error, "视频加载失败"), filename: null, url: null });
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [enabled, kind, projectId]);
+
+  return state;
 }
 
 function QcPanel({ value }: { value: unknown }) {

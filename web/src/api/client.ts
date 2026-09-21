@@ -1782,6 +1782,14 @@ export const api = {
       ContentStudioProjectSchema,
     );
   },
+  downloadContentStudioMedia(
+    id: string,
+    kind: "preview" | "final",
+  ): Promise<{ blob: Blob; filename: string | null }> {
+    return requestDownload(
+      `/api/v1/content-studio/projects/${encodeURIComponent(id)}/media/${encodeURIComponent(kind)}/download`,
+    );
+  },
   approveContentStudioFinal(id: string, revision: number): Promise<ContentStudioProject> {
     return request(
       `/api/v1/content-studio/projects/${encodeURIComponent(id)}/approve-final`,

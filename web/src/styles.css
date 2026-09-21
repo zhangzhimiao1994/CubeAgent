@@ -3679,6 +3679,26 @@ button.agent-cluster-status:focus-visible {
   padding: 0.6rem;
 }
 
+.content-studio-media-card {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.content-studio-media-video {
+  aspect-ratio: 9 / 16;
+  background: rgba(2, 8, 18, 0.72);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 0.65rem;
+  max-height: 520px;
+  object-fit: contain;
+  width: min(100%, 320px);
+}
+
+.content-studio-media-link {
+  justify-self: start;
+}
+
 .content-studio-grid article p {
   color: var(--muted);
   overflow-wrap: anywhere;

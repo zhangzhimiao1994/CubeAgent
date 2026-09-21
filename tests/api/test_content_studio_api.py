@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -36,8 +37,8 @@ class StubAuthService:
         self.principal = principal
 
 
-def test_content_studio_project_api_create_run_and_revise_script() -> None:
-    service = PrincipalScopedContentStudioService()
+def test_content_studio_project_api_create_run_and_revise_script(tmp_path: Path) -> None:
+    service = PrincipalScopedContentStudioService(media_dir=tmp_path)
     auth = StubAuthService()
     client = TestClient(
         create_app(
@@ -139,6 +140,14 @@ def test_content_studio_project_api_create_run_and_revise_script() -> None:
     assert preview.status_code == 200
     assert preview.json()["status"] == "PREVIEW_RENDERED"
     assert preview.json()["timeline"]["preview_artifact_id"]
+
+    preview_download = client.get(
+        f"/api/v1/content-studio/projects/{project_id}/media/preview/download",
+        headers=headers,
+    )
+    assert preview_download.status_code == 200
+    assert preview_download.headers["content-type"].startswith("video/mp4")
+    assert preview_download.content
 
     final = client.post(
         f"/api/v1/content-studio/projects/{project_id}/approve-final",
@@ -503,11 +512,12 @@ def test_content_studio_api_returns_provider_blocked_when_generation_provider_is
 
 
 class PrincipalScopedContentStudioService:
-    def __init__(self) -> None:
+    def __init__(self, media_dir: Path | None = None) -> None:
         self._registry = PackRegistry.mvp()
         self._projects: dict[str, ContentProject] = {}
         self._scopes: dict[str, tuple[str, str]] = {}
         self._revisions: dict[str, int] = {}
+        self._media_dir = media_dir
 
     async def create_content_project(
         self,
@@ -739,11 +749,21 @@ class PrincipalScopedContentStudioService:
             for asset in project.asset_manifest.assets
         ):
             raise ValueError("asset rights must be approved before preview")
-        return self._mutate(
+        rendered = self._mutate(
             project_id,
             tenant_id,
             owner_user_id,
             lambda service: service.render_preview(project_id),
+        )
+        if self._media_dir is None or rendered.timeline is None:
+            return rendered
+        media_path = self._media_dir / f"{project_id}-preview.mp4"
+        media_path.write_bytes(b"fake preview mp4")
+        return self._save(
+            replace(
+                rendered,
+                timeline=replace(rendered.timeline, preview_artifact_id=str(media_path)),
+            )
         )
 
     async def approve_final(
@@ -764,11 +784,21 @@ class PrincipalScopedContentStudioService:
         if project.qc_report is not None and project.qc_report.blockers:
             raise ValueError("clean QC review is required before final approval")
         self._assert_revision(project_id, revision)
-        return self._mutate(
+        approved = self._mutate(
             project_id,
             tenant_id,
             owner_user_id,
             lambda service: service.approve_final(project_id),
+        )
+        if self._media_dir is None or approved.timeline is None:
+            return approved
+        media_path = self._media_dir / f"{project_id}-final.mp4"
+        media_path.write_bytes(b"fake final mp4")
+        return self._save(
+            replace(
+                approved,
+                timeline=replace(approved.timeline, final_artifact_id=str(media_path)),
+            )
         )
 
     async def retry_stage(
