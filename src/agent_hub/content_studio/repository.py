@@ -165,7 +165,6 @@ class PersistentContentProjectStore:
                     .where(AdminResourceRow.kind == _CONTENT_STUDIO_KIND)
                     .where(AdminResourceRow.resource_id.like(f"{_CONTENT_STUDIO_PROJECT_PREFIX}%"))
                     .order_by(AdminResourceRow.updated_at.desc(), AdminResourceRow.created_at.desc())
-                    .limit(limit)
                 )
             ).scalars().all()
         summaries: list[ContentProjectSummary] = []
@@ -179,6 +178,8 @@ class PersistentContentProjectStore:
                 continue
             updated_at = row.updated_at.isoformat() if row.updated_at else None
             summaries.append(content_project_summary_from_payload(payload, updated_at=updated_at))
+            if len(summaries) >= limit:
+                break
         return tuple(summaries)
 
     def _scope(self) -> tuple[UUID, UUID]:

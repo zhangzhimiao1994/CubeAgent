@@ -241,6 +241,20 @@ export function ContentStudioPage() {
     approveFinal.isPending ||
     retryContentStage.isPending ||
     updateClaim.isPending;
+  const canReviseScript = Boolean(activeProjectId && visibleProject?.script && revision.trim() && !stageLocked.script && !anyActionPending);
+  const canApproveScript = Boolean(activeProjectId && visibleProject?.script && !visibleProject?.script_approved && !stageLocked.script && !anyActionPending);
+  const canReviseStoryboard = Boolean(activeProjectId && visibleProject?.storyboard && storyboardRevision.trim() && !stageLocked.assets && !anyActionPending);
+  const canRegenerateAsset = Boolean(activeProjectId && visibleProject?.asset_manifest && assetId.trim() && !stageLocked.assets && !anyActionPending);
+  const canRetryContentStage = Boolean(activeProjectId && !stageLocked.assets && !anyActionPending);
+  const canApproveRights = Boolean(
+    activeProjectId &&
+      visibleProject?.asset_manifest &&
+      !visibleProject?.rights_approved &&
+      selectedAssetIds.length > 0 &&
+      rightsNote.trim() &&
+      !stageLocked.assets &&
+      !anyActionPending,
+  );
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -431,7 +445,7 @@ export function ContentStudioPage() {
             <button
               type="button"
               className="secondary-action"
-              disabled={!canUpdateClaim || anyActionPending}
+              disabled={!canUpdateClaim || stageLocked.research || anyActionPending}
               onClick={() =>
                 updateClaim.mutate({
                   id: requireProjectId(activeProjectId),
@@ -468,15 +482,15 @@ export function ContentStudioPage() {
             }}>
               <label htmlFor="content-revision">
                 脚本修改
-                <input id="content-revision" value={revision} onChange={(event) => setRevision(event.target.value)} />
+                <input id="content-revision" value={revision} disabled={stageLocked.script} onChange={(event) => setRevision(event.target.value)} />
               </label>
-              <button type="submit" disabled={!activeProjectId || reviseScript.isPending}>
+              <button type="submit" disabled={!canReviseScript}>
                 {reviseScript.isPending ? "修改中..." : "提交脚本修改"}
               </button>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!activeProjectId || !visibleProject?.script || Boolean(visibleProject?.script_approved) || anyActionPending}
+                disabled={!canApproveScript}
                 onClick={() =>
                   approveScript.mutate({
                     id: requireProjectId(activeProjectId),
@@ -508,19 +522,19 @@ export function ContentStudioPage() {
             <div className="form-grid content-studio-inline-form">
               <label htmlFor="storyboard-revision">
                 分镜修改
-                <input id="storyboard-revision" value={storyboardRevision} onChange={(event) => setStoryboardRevision(event.target.value)} />
+                <input id="storyboard-revision" value={storyboardRevision} disabled={stageLocked.assets} onChange={(event) => setStoryboardRevision(event.target.value)} />
               </label>
               <label htmlFor="asset-id">
                 素材 ID
-                <input id="asset-id" value={assetId} onChange={(event) => setAssetId(event.target.value)} />
+                <input id="asset-id" value={assetId} disabled={stageLocked.assets} onChange={(event) => setAssetId(event.target.value)} />
               </label>
               <label htmlFor="asset-revision">
                 素材重生成要求
-                <input id="asset-revision" value={assetRevision} onChange={(event) => setAssetRevision(event.target.value)} />
+                <input id="asset-revision" value={assetRevision} disabled={stageLocked.assets} onChange={(event) => setAssetRevision(event.target.value)} />
               </label>
               <label htmlFor="retry-stage">
                 重试阶段
-                <select id="retry-stage" value={retryStage} onChange={(event) => setRetryStage(event.target.value as Stage)}>
+                <select id="retry-stage" value={retryStage} disabled={stageLocked.assets} onChange={(event) => setRetryStage(event.target.value as Stage)}>
                   {STAGES.map((stage) => (
                     <option key={stage} value={stage}>
                       {stage}
@@ -530,13 +544,13 @@ export function ContentStudioPage() {
               </label>
             </div>
             <div className="toolbar">
-              <button type="button" className="secondary-action" disabled={!activeProjectId || anyActionPending} onClick={() => reviseStoryboard.mutate({ id: requireProjectId(activeProjectId), instruction: storyboardRevision })}>
+              <button type="button" className="secondary-action" disabled={!canReviseStoryboard} onClick={() => reviseStoryboard.mutate({ id: requireProjectId(activeProjectId), instruction: storyboardRevision })}>
                 {reviseStoryboard.isPending ? "分镜提交中..." : "提交分镜修改"}
               </button>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!activeProjectId || !assetId.trim() || anyActionPending}
+                disabled={!canRegenerateAsset}
                 onClick={() =>
                   regenerateAsset.mutate({
                     id: requireProjectId(activeProjectId),
@@ -547,7 +561,7 @@ export function ContentStudioPage() {
               >
                 {regenerateAsset.isPending ? "素材重生成中..." : "重生成单个素材"}
               </button>
-              <button type="button" className="secondary-action" disabled={!activeProjectId || anyActionPending} onClick={() => retryContentStage.mutate({ id: requireProjectId(activeProjectId), stage: retryStage })}>
+              <button type="button" className="secondary-action" disabled={!canRetryContentStage} onClick={() => retryContentStage.mutate({ id: requireProjectId(activeProjectId), stage: retryStage })}>
                 {retryContentStage.isPending ? "阶段重试中..." : "重试所选阶段"}
               </button>
             </div>
@@ -558,7 +572,7 @@ export function ContentStudioPage() {
                 {assets.length ? (
                   assets.map((asset) => (
                     <label key={asset.asset_id} className="content-studio-asset-row">
-                      <input type="checkbox" checked={selectedAssetIds.includes(asset.asset_id)} onChange={() => toggleAsset(asset.asset_id)} />
+                      <input type="checkbox" checked={selectedAssetIds.includes(asset.asset_id)} disabled={stageLocked.assets} onChange={() => toggleAsset(asset.asset_id)} />
                       <span>
                         <strong>{asset.title}</strong>
                         <small>
@@ -573,12 +587,12 @@ export function ContentStudioPage() {
               </div>
               <label htmlFor="rights-note">
                 版权批准备注
-                <input id="rights-note" value={rightsNote} onChange={(event) => setRightsNote(event.target.value)} />
+                <input id="rights-note" value={rightsNote} disabled={stageLocked.assets} onChange={(event) => setRightsNote(event.target.value)} />
               </label>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={!activeProjectId || Boolean(visibleProject?.rights_approved) || selectedAssetIds.length === 0 || !rightsNote.trim() || anyActionPending}
+                disabled={!canApproveRights}
                 onClick={() =>
                   approveRights.mutate({
                     id: requireProjectId(activeProjectId),
@@ -1242,10 +1256,8 @@ function collectProjectHistory(project: ContentStudioProject | undefined): Histo
   for (const item of items) {
     keyed.set(item.id, item);
   }
-  if (!keyed.size) {
-    for (const item of collectCurrentArtifactHistory(project)) {
-      keyed.set(item.id, item);
-    }
+  for (const item of collectCurrentArtifactHistory(project)) {
+    keyed.set(item.id, item);
   }
   return Array.from(keyed.values()).sort((left, right) => left.sequence - right.sequence);
 }

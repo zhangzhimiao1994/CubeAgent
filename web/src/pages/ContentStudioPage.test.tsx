@@ -73,6 +73,20 @@ const contentProject: TestProject = {
       },
     ],
   },
+  fact_check_report: {
+    claims: [{ claim_id: "CL001", status: "supported", evidence_ids: ["EV001"] }],
+    summary: "事实核验通过。",
+  },
+  content_plan: {
+    structure: "Hook -> 发生了什么 -> Demo -> 总结",
+  },
+  storyboard: {
+    shots: [{ shot_id: "SHOT001", shot_type: "official_demo", duration_ms: 3000, overlay: "官方 Demo 录屏" }],
+  },
+  voice_track: {
+    audio_artifact_id: "voice.mp3",
+    duration_ms: 60000,
+  },
   qc_report: {
     blockers: [],
     summary: "演示预览可播放，但未进入正式生产。",
@@ -271,9 +285,13 @@ describe("ContentStudioPage", () => {
     expect(screen.getByText("版权待批准")).not.toBeNull();
     expect(screen.getByText("终片待批准")).not.toBeNull();
     expect(screen.getAllByText("女主定妆资产").length).toBeGreaterThan(0);
-    expect(screen.getByText("Research 调研")).not.toBeNull();
+    expect(screen.getAllByText("Research 调研").length).toBeGreaterThan(0);
     expect(screen.getByText("tts_timeout: qwen-tts 首次调用超时")).not.toBeNull();
-    expect(screen.getByText("关联产物：voice.mp3")).not.toBeNull();
+    expect(screen.getAllByText("关联产物：voice.mp3").length).toBeGreaterThan(0);
+    expect(screen.getByText("Script 脚本")).not.toBeNull();
+    expect(screen.getByText("Assets 素材")).not.toBeNull();
+    expect(screen.getByText("Timeline 时间线")).not.toBeNull();
+    expect(screen.getByText("QC 质检")).not.toBeNull();
     expect(screen.getAllByText("查看结构化详情").length).toBeGreaterThan(0);
   });
 
@@ -328,12 +346,23 @@ describe("ContentStudioPage", () => {
     expect((screen.getByRole("button", { name: "3. 生成 Storyboard / Assets" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "4. 生成 Voice / Timeline / Preview" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "5. 运行 Video QC" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "提交脚本修改" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "批准脚本" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "提交分镜修改" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "重生成单个素材" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "重试所选阶段" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "批准所选版权" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("approves rights only for selected assets and shows a busy state", async () => {
     const user = userEvent.setup();
     const rights = deferred<TestProject>();
     approveRightsResponse = rights.promise;
+    visibleProject = {
+      ...contentProject,
+      script_approved: true,
+      status: "ASSETS_READY",
+    };
     render(<TestApp initialPath="/content-studio?project=project-123" />);
 
     expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
@@ -370,7 +399,7 @@ describe("ContentStudioPage", () => {
 
     expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "5. 运行 Video QC" }));
-    await waitFor(() => expect(screen.getByText("QC 通过，可进入终片批准。")).not.toBeNull());
+    await waitFor(() => expect(screen.getAllByText("QC 通过，可进入终片批准。").length).toBeGreaterThan(0));
     visibleProject = {
       ...contentProject,
       revision: 1,
@@ -381,7 +410,7 @@ describe("ContentStudioPage", () => {
 
     await waitFor(() => expect(screen.queryByRole("heading", { name: "较旧的研究结果" })).toBeNull());
     expect(screen.getByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();
-    expect(screen.getByText("QC 通过，可进入终片批准。")).not.toBeNull();
+    expect(screen.getAllByText("QC 通过，可进入终片批准。").length).toBeGreaterThan(0);
   });
 
   it("does not let a late result from the previous project replace the active project", async () => {
