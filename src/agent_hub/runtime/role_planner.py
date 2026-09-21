@@ -2124,6 +2124,33 @@ def _is_asset_locked_video_pipeline_request(task: str) -> bool:
         return False
     if _has_generation_negation(normalized):
         return False
+    if any(term in normalized for term in ("提示词", "prompt")) and not any(
+        term in normalized for term in ("剧本", "脚本", "短剧", "全量资产", "资产图")
+    ):
+        return False
+    has_script_or_drama_context = (
+        any(term in normalized for term in _DEFERRED_MEDIA_PIPELINE_SCRIPT_TERMS)
+        or "短剧" in normalized
+        or _has_concrete_script_context(task)
+    )
+    has_asset_lock_context = any(
+        term in normalized
+        for term in (
+            "全量资产",
+            "专业资产",
+            "全量专业资产",
+            "资产拆解",
+            "资产图",
+            "素材图",
+            "制作资产",
+            "锁定资产",
+            "角色参考设定表",
+            "角色设定表",
+            "character model sheet",
+        )
+    )
+    if not (has_script_or_drama_context and has_asset_lock_context):
+        return False
     has_video_intent = _has_unnegated_terms(
         normalized,
         (

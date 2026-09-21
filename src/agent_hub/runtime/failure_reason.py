@@ -132,7 +132,7 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
         error_type = type(error).__name__
         if (
             reason
-            and (not SENSITIVE_FAILURE_REASON.search(reason) or fallback != "runtime_failed")
+            and fallback == "capability execution failed"
             and is_safe_failure_reason(error_type)
         ):
             return f"{fallback} ({error_type})"

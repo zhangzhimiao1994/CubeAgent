@@ -1311,9 +1311,12 @@ class RunRepository:
     ) -> None:
         assert event.checkpoint is not None
         checkpoint = event.checkpoint
-        raw_registry = checkpoint.state.get("artifact_registry")
-        if not isinstance(raw_registry, Mapping):
-            raise TypeError("runtime checkpoint artifact registry is invalid")
+        if "artifact_registry" in checkpoint.state:
+            raw_registry = checkpoint.state["artifact_registry"]
+            if not isinstance(raw_registry, Mapping):
+                raise TypeError("runtime checkpoint artifact registry is invalid")
+        else:
+            raw_registry = {}
         registry_ids: list[UUID] = []
         for artifact_id in raw_registry:
             if type(artifact_id) is not str:
