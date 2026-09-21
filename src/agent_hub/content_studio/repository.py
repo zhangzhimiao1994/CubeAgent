@@ -12,7 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.content_studio import (
     ContentProject,
     ContentProjectConflict,
+    ContentProjectSummary,
     content_project_from_payload,
+    content_project_summary_from_payload,
     content_project_to_payload,
 )
 from agent_hub.db.models import AdminResourceRow
@@ -145,6 +147,39 @@ class PersistentContentProjectStore:
             "owner_user_id": payload["owner_user_id"],
             "revision": content_project_revision(payload),
         }
+
+    async def list_recent(
+        self,
+        *,
+        tenant_id: str = "",
+        owner_user_id: str = "",
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]:
+        scoped_tenant_id, scoped_owner_user_id = self._scope()
+        limit = max(1, min(limit, 100))
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == scoped_tenant_id)
+                    .where(AdminResourceRow.kind == _CONTENT_STUDIO_KIND)
+                    .where(AdminResourceRow.resource_id.like(f"{_CONTENT_STUDIO_PROJECT_PREFIX}%"))
+                    .order_by(AdminResourceRow.updated_at.desc(), AdminResourceRow.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+        summaries: list[ContentProjectSummary] = []
+        for row in rows:
+            payload = dict(row.payload)
+            if not project_belongs_to_scope(
+                payload,
+                tenant_id=scoped_tenant_id,
+                owner_user_id=scoped_owner_user_id,
+            ):
+                continue
+            updated_at = row.updated_at.isoformat() if row.updated_at else None
+            summaries.append(content_project_summary_from_payload(payload, updated_at=updated_at))
+        return tuple(summaries)
 
     def _scope(self) -> tuple[UUID, UUID]:
         tenant_id = _scope_tenant_id.get() or self._tenant_id

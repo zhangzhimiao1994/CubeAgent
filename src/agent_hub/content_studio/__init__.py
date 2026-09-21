@@ -430,6 +430,17 @@ class ContentProject:
     revision: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ContentProjectSummary:
+    project_id: str
+    title: str
+    topic: str
+    status: str
+    revision: int
+    execution_mode: str
+    updated_at: str | None = None
+
+
 class ContentProjectConflict(ValueError):
     """A newer project snapshot exists; reload before applying this change."""
 
@@ -450,6 +461,14 @@ class AsyncContentProjectStore(Protocol):
     async def save(self, project: ContentProject) -> ContentProject: ...
 
     async def get(self, project_id: str) -> ContentProject: ...
+
+    async def list_recent(
+        self,
+        *,
+        tenant_id: str = "",
+        owner_user_id: str = "",
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]: ...
 
 
 class AsyncContentStudioProductionProvider(Protocol):
@@ -476,6 +495,24 @@ class AsyncInMemoryContentProjectStore:
 
     async def get(self, project_id: str) -> ContentProject:
         return content_project_from_payload(self._projects[project_id])
+
+    async def list_recent(
+        self,
+        *,
+        tenant_id: str = "",
+        owner_user_id: str = "",
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]:
+        summaries: list[ContentProjectSummary] = []
+        for payload in self._projects.values():
+            project = content_project_from_payload(payload)
+            if tenant_id and project.tenant_id != tenant_id:
+                continue
+            if owner_user_id and project.owner_user_id != owner_user_id:
+                continue
+            summaries.append(content_project_summary(project))
+        summaries.sort(key=lambda item: item.revision, reverse=True)
+        return tuple(summaries[:limit])
 
 
 class ContentStudioService:
@@ -1542,6 +1579,19 @@ class AsyncContentStudioService:
     async def get_content_project(self, project_id: str) -> ContentProject:
         return await self._store.get(project_id)
 
+    async def list_content_projects(
+        self,
+        *,
+        tenant_id: str = "",
+        owner_user_id: str = "",
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]:
+        return await self._store.list_recent(
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            limit=limit,
+        )
+
     def provider_call_count(self, stage: str) -> int:
         return self._provider_calls[stage]
 
@@ -2360,6 +2410,30 @@ def content_project_to_payload(project: ContentProject) -> dict[str, object]:
     }
 
 
+def content_project_summary(
+    project: ContentProject,
+    *,
+    updated_at: str | None = None,
+) -> ContentProjectSummary:
+    return ContentProjectSummary(
+        project_id=project.project_id,
+        title=project.title,
+        topic=project.topic,
+        status=project.status.value,
+        revision=project.revision,
+        execution_mode=project.execution_mode,
+        updated_at=updated_at,
+    )
+
+
+def content_project_summary_from_payload(
+    payload: Mapping[str, object],
+    *,
+    updated_at: str | None = None,
+) -> ContentProjectSummary:
+    return content_project_summary(content_project_from_payload(payload), updated_at=updated_at)
+
+
 def content_project_from_payload(payload: Mapping[str, object]) -> ContentProject:
     if payload.get("schema_version") != "content_studio.project.v1":
         raise ValueError("unsupported content project payload schema")
@@ -2444,6 +2518,7 @@ __all__ = [
     "ContentPlan",
     "ContentProject",
     "ContentProjectConflict",
+    "ContentProjectSummary",
     "ContentStudioService",
     "Evidence",
     "EvidenceGraph",
@@ -2468,6 +2543,8 @@ __all__ = [
     "VoiceTrack",
     "append_content_project_event",
     "content_project_from_payload",
+    "content_project_summary",
+    "content_project_summary_from_payload",
     "content_project_to_payload",
     "record_content_project_provider_attempt",
 ]

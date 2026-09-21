@@ -16,6 +16,7 @@ from agent_hub.content_studio import (
     AsyncContentStudioService,
     ClaimStatus,
     ContentProject,
+    ContentProjectSummary,
     ProjectStatus,
     content_project_to_payload,
 )
@@ -45,6 +46,14 @@ class ContentStudioServiceProtocol(Protocol):
     ) -> ContentProject: ...
 
     async def get_content_project(self, project_id: str) -> ContentProject: ...
+
+    async def list_content_projects(
+        self,
+        *,
+        tenant_id: str = "",
+        owner_user_id: str = "",
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]: ...
 
     async def run_content_project(
         self,
@@ -238,6 +247,28 @@ async def create_content_project(
             str(error) or "content studio provider is not configured",
         ) from None
     return _project_payload(project)
+
+
+@router.get(
+    "/projects",
+    response_model=None,
+    responses=error_responses(403, 422),
+)
+async def list_content_projects(
+    service: Annotated[ContentStudioServiceProtocol, Depends(_content_studio_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+    limit: int = 50,
+) -> dict[str, object]:
+    if limit < 1 or limit > 100:
+        raise PublicAPIError(422, "validation_error", "limit must be between 1 and 100")
+    with _service_scope(service, principal):
+        summaries = await _call_summary_service(
+            service.list_content_projects,
+            tenant_id=str(principal.tenant_id),
+            owner_user_id=str(principal.user_id),
+            limit=limit,
+        )
+    return {"projects": [_summary_payload(summary) for summary in summaries]}
 
 
 @router.get(
@@ -605,12 +636,31 @@ def _project_payload(project: ContentProject) -> dict[str, object]:
     return raw
 
 
+def _summary_payload(summary: ContentProjectSummary) -> dict[str, object]:
+    return {
+        "project_id": summary.project_id,
+        "title": summary.title,
+        "topic": summary.topic,
+        "status": summary.status,
+        "revision": summary.revision,
+        "execution_mode": summary.execution_mode,
+        "updated_at": summary.updated_at,
+    }
+
+
 async def _call_service(
     method: Callable[..., Awaitable[ContentProject]],
     *args: object,
     **kwargs: object,
 ) -> ContentProject:
     return await method(*args, **_supported_kwargs(method, kwargs))
+
+
+async def _call_summary_service(
+    method: Callable[..., Awaitable[tuple[ContentProjectSummary, ...]]],
+    **kwargs: object,
+) -> tuple[ContentProjectSummary, ...]:
+    return await method(**_supported_kwargs(method, kwargs))
 
 
 def _supported_kwargs(

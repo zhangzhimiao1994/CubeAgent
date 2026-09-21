@@ -13,11 +13,13 @@ from agent_hub.content_studio import (
     AsyncInMemoryContentProjectStore,
     ClaimStatus,
     ContentProject,
+    ContentProjectSummary,
     ContentStudioService,
     InMemoryContentProjectStore,
     PackRegistry,
     ProjectStatus,
     VoiceTrack,
+    content_project_summary,
 )
 
 
@@ -282,6 +284,38 @@ def test_content_studio_api_scopes_projects_to_principal_user_and_tenant() -> No
     assert cross_tenant.status_code == 404
 
 
+def test_content_studio_api_lists_only_current_users_projects() -> None:
+    service = PrincipalScopedContentStudioService()
+    auth = StubAuthService()
+    owner = auth.principal
+    same_tenant_other_user = AuthenticatedPrincipal(uuid4(), owner.tenant_id, Role.ADMIN)
+    client = TestClient(create_app(auth_service=auth, content_studio_service=service))
+    headers = {"Authorization": "Bearer valid-token"}
+
+    owned = client.post(
+        "/api/v1/content-studio/projects",
+        headers=headers,
+        json={"title": "Owned project", "topic": "Show my history"},
+    )
+    assert owned.status_code == 201
+
+    auth.become(same_tenant_other_user)
+    other = client.post(
+        "/api/v1/content-studio/projects",
+        headers=headers,
+        json={"title": "Other project", "topic": "Should stay hidden"},
+    )
+    assert other.status_code == 201
+
+    auth.become(owner)
+    listed = client.get("/api/v1/content-studio/projects", headers=headers)
+
+    assert listed.status_code == 200
+    assert [item["project_id"] for item in listed.json()["projects"]] == [owned.json()["project_id"]]
+    assert listed.json()["projects"][0]["title"] == "Owned project"
+    assert listed.json()["projects"][0]["status"] == "DRAFT"
+
+
 def test_content_studio_api_rejects_stale_revision_for_approval() -> None:
     service = PrincipalScopedContentStudioService()
     auth = StubAuthService()
@@ -521,6 +555,21 @@ class PrincipalScopedContentStudioService:
     ) -> ContentProject:
         self._assert_scope(project_id, tenant_id, owner_user_id)
         return self._projects[project_id]
+
+    async def list_content_projects(
+        self,
+        *,
+        tenant_id: object,
+        owner_user_id: object,
+        limit: int = 50,
+    ) -> tuple[ContentProjectSummary, ...]:
+        summaries = [
+            content_project_summary(project)
+            for project_id, project in self._projects.items()
+            if self._scopes.get(project_id) == (str(tenant_id), str(owner_user_id))
+        ]
+        summaries.sort(key=lambda summary: summary.revision, reverse=True)
+        return tuple(summaries[:limit])
 
     async def run_content_project(
         self,

@@ -40,7 +40,13 @@ const contentProject: TestProject = {
   execution_mode: "demo",
   script: {
     title: "AIGC 正在变成软件入口",
+    hooks: ["别再只把 AIGC 当聊天框。", "一分钟看懂 AI Agent 怎么落地。", "普通团队怎么用 AIGC 少踩坑。"],
     segments: [{ id: "seg-1", text: "前三秒说明发生了什么。" }],
+    subtitle_lines: ["前三秒说明发生了什么。"],
+  },
+  research_bundle: {
+    questions: [{ question_id: "RQ001", text: "AIGC 最近发生了什么？" }],
+    evidence: [{ evidence_id: "EV001", publisher: "Official", source_url: "https://official.example/release" }],
   },
   asset_manifest: {
     assets: [
@@ -70,6 +76,10 @@ const contentProject: TestProject = {
   qc_report: {
     blockers: [],
     summary: "演示预览可播放，但未进入正式生产。",
+  },
+  timeline: {
+    preview_artifact_id: "/generated/content-studio/project-123-preview.mp4",
+    final_artifact_id: "/generated/content-studio/project-123-final.mp4",
   },
   project_events: [
     {
@@ -122,6 +132,22 @@ const otherProject: TestProject = {
   revision: 1,
   title: "另一个 Content 项目",
   topic: "做一条教程视频",
+  status: "DRAFT",
+  script_approved: false,
+  rights_approved: false,
+  final_approved: false,
+  script: undefined,
+  research_bundle: undefined,
+  evidence_graph: undefined,
+  fact_check_report: undefined,
+  content_plan: undefined,
+  storyboard: undefined,
+  asset_manifest: undefined,
+  voice_track: undefined,
+  timeline: undefined,
+  qc_report: undefined,
+  project_events: [],
+  provider_attempts: [],
 };
 
 function deferred<T>() {
@@ -162,6 +188,30 @@ describe("ContentStudioPage", () => {
             username: "owner",
             role: "super_admin",
             permissions: ["*"],
+          });
+        }
+        if (path === "/api/v1/content-studio/projects" && method === "GET") {
+          return jsonResponse({
+            projects: [
+              {
+                project_id: visibleProject.project_id,
+                title: visibleProject.title,
+                topic: visibleProject.topic,
+                status: visibleProject.status,
+                revision: visibleProject.revision,
+                execution_mode: visibleProject.execution_mode,
+                updated_at: "2026-09-22T02:00:00Z",
+              },
+              {
+                project_id: visibleOtherProject.project_id,
+                title: visibleOtherProject.title,
+                topic: visibleOtherProject.topic,
+                status: visibleOtherProject.status,
+                revision: visibleOtherProject.revision,
+                execution_mode: visibleOtherProject.execution_mode,
+                updated_at: "2026-09-22T01:00:00Z",
+              },
+            ],
           });
         }
         if (path === "/api/v1/content-studio/projects/project-123" && method === "GET") {
@@ -205,6 +255,7 @@ describe("ContentStudioPage", () => {
 
   afterEach(() => {
     window.sessionStorage.clear();
+    window.localStorage.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -219,11 +270,64 @@ describe("ContentStudioPage", () => {
     expect(screen.getByText("脚本待批准")).not.toBeNull();
     expect(screen.getByText("版权待批准")).not.toBeNull();
     expect(screen.getByText("终片待批准")).not.toBeNull();
-    expect(screen.getByText("女主定妆资产")).not.toBeNull();
+    expect(screen.getAllByText("女主定妆资产").length).toBeGreaterThan(0);
     expect(screen.getByText("Research 调研")).not.toBeNull();
     expect(screen.getByText("tts_timeout: qwen-tts 首次调用超时")).not.toBeNull();
     expect(screen.getByText("关联产物：voice.mp3")).not.toBeNull();
     expect(screen.getAllByText("查看结构化详情").length).toBeGreaterThan(0);
+  });
+
+  it("shows a floating project history rail and keeps project flows reopenable", async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem(
+      "content_studio_recent_projects",
+      JSON.stringify([
+        {
+          project_id: "project-456",
+          title: "另一个 Content 项目",
+          status: "ASSETS_READY",
+          updated_at: "2026-09-22T01:00:00Z",
+        },
+      ]),
+    );
+
+    render(<TestApp initialPath="/content-studio?project=project-123" />);
+
+    expect(await screen.findByRole("complementary", { name: "Content Studio 项目历史" })).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /AIGC 科普项目/ })).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /另一个 Content 项目/ })).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /另一个 Content 项目/ }));
+
+    expect(await screen.findByRole("heading", { name: "另一个 Content 项目" })).not.toBeNull();
+    expect(requests.some((request) => request.path === "/api/v1/content-studio/projects/project-456")).toBe(true);
+  });
+
+  it("renders the studio as ordered stage sections with visible outputs instead of hidden JSON only", async () => {
+    render(<TestApp initialPath="/content-studio?project=project-123" />);
+
+    expect(await screen.findByRole("region", { name: "1 创建项目" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "2 Research / Fact Check" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "3 Plan / Script" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "4 Storyboard / Assets" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "5 Voice / Timeline / Preview" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "6 Video QC / Final" })).not.toBeNull();
+
+    expect(await screen.findByText("AIGC 最近发生了什么？")).not.toBeNull();
+    expect(await screen.findByText("别再只把 AIGC 当聊天框。")).not.toBeNull();
+    expect(screen.getByText("前三秒说明发生了什么。")).not.toBeNull();
+    expect(screen.getByText("/generated/content-studio/project-123-preview.mp4")).not.toBeNull();
+    expect(screen.getAllByText("/generated/content-studio/project-123-final.mp4").length).toBeGreaterThan(0);
+  });
+
+  it("locks later workflow stages until their prerequisites are complete", async () => {
+    render(<TestApp initialPath="/content-studio?project=project-456" />);
+
+    expect(await screen.findByRole("heading", { name: "另一个 Content 项目" })).not.toBeNull();
+    expect((screen.getByRole("button", { name: "2. 生成 Plan / Script" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "3. 生成 Storyboard / Assets" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "4. 生成 Voice / Timeline / Preview" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "5. 运行 Video QC" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("approves rights only for selected assets and shows a busy state", async () => {
@@ -256,6 +360,12 @@ describe("ContentStudioPage", () => {
 
   it("keeps the newest revision visible when refresh returns an older snapshot", async () => {
     const user = userEvent.setup();
+    visibleProject = {
+      ...contentProject,
+      script_approved: true,
+      rights_approved: true,
+      status: "ASSETS_READY",
+    };
     render(<TestApp initialPath="/content-studio?project=project-123" />);
 
     expect(await screen.findByRole("heading", { name: "AIGC 科普项目" })).not.toBeNull();

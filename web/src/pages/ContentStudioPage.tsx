@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
-import { api, formatApiError, type ContentStudioProject } from "../api/client";
+import { api, formatApiError, type ContentStudioProject, type ContentStudioProjectSummary } from "../api/client";
 
 const STAGES = [
   "RESEARCH_READY",
@@ -50,6 +50,8 @@ type HistoryItem = {
 };
 
 const contentStudioProjectKey = (projectId: string) => ["content-studio-project", projectId] as const;
+const contentStudioProjectsKey = ["content-studio-projects"] as const;
+const RECENT_PROJECTS_STORAGE_KEY = "content_studio_recent_projects";
 
 export function ContentStudioPage() {
   const location = useLocation();
@@ -72,6 +74,7 @@ export function ContentStudioPage() {
   const [claimEvidenceIdsText, setClaimEvidenceIdsText] = useState("");
   const [rightsNote, setRightsNote] = useState("仅批准已核验且授权明确的素材。");
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
+  const [recentProjects, setRecentProjects] = useState<ContentStudioProjectSummary[]>(() => loadRecentProjects());
 
   useEffect(() => {
     setProjectId(queryProjectId);
@@ -84,6 +87,8 @@ export function ContentStudioPage() {
     queryClient.setQueryData<ContentStudioProject | undefined>(contentStudioProjectKey(project.project_id), (current) =>
       shouldApplyProjectRevision(current, project) ? project : current,
     );
+    setRecentProjects((current) => rememberRecentProject(current, projectSummaryFromProject(project)));
+    void queryClient.invalidateQueries({ queryKey: contentStudioProjectsKey });
   }
 
   function openProject(project: ContentStudioProject) {
@@ -115,9 +120,20 @@ export function ContentStudioPage() {
         ? newData
         : oldData,
   });
+  const projectsQuery = useQuery({
+    queryKey: contentStudioProjectsKey,
+    queryFn: () => api.contentStudioProjects(),
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
   const visibleProject = projectQuery.data?.project_id === projectId ? projectQuery.data : undefined;
   const activeProjectId = visibleProject?.project_id ?? "";
   const canApproveFinal = projectCanApproveFinal(visibleProject);
+
+  useEffect(() => {
+    if (!visibleProject) return;
+    setRecentProjects((current) => rememberRecentProject(current, projectSummaryFromProject(visibleProject)));
+  }, [visibleProject]);
 
   const createProject = useMutation({
     mutationFn: () =>
@@ -204,11 +220,16 @@ export function ContentStudioPage() {
 
   const assets = useMemo(() => projectAssets(visibleProject), [visibleProject]);
   const evidenceItems = useMemo(() => collectProjectEvidence(visibleProject), [visibleProject]);
+  const projectSummaries = useMemo(
+    () => mergeProjectSummaries(projectsQuery.data ?? [], recentProjects, visibleProject),
+    [projectsQuery.data, recentProjects, visibleProject],
+  );
   const claimEvidenceIds = useMemo(() => parseEvidenceIdText(claimEvidenceIdsText), [claimEvidenceIdsText]);
   const claimNeedsEvidence = claimStatus === "supported" || claimStatus === "partially_supported";
   const canUpdateClaim = Boolean(activeProjectId && claimId.trim() && (!claimNeedsEvidence || claimEvidenceIds.length > 0));
   const statusSummary = useMemo(() => projectStatusSummary(visibleProject), [visibleProject]);
   const historyItems = useMemo(() => collectProjectHistory(visibleProject), [visibleProject]);
+  const stageLocked = useMemo(() => projectStageLocks(visibleProject), [visibleProject]);
   const anyActionPending =
     runProject.isPending ||
     reviseScript.isPending ||
@@ -246,393 +267,409 @@ export function ContentStudioPage() {
       <p className="eyebrow">Production Studios</p>
       <h2>Content Studio</h2>
 
-      <form className="form-grid schedule-form" aria-label="创建 Content Studio 项目" onSubmit={submit}>
-        <label htmlFor="content-title">
-          标题
-          <input id="content-title" value={title} onChange={(event) => setTitle(event.target.value)} />
-        </label>
-        <label htmlFor="content-topic">
-          主题
-          <textarea id="content-topic" rows={4} value={topic} onChange={(event) => setTopic(event.target.value)} />
-        </label>
-        <label htmlFor="content-sources">
-          官方来源
-          <textarea
-            id="content-sources"
-            rows={3}
-            value={sourceUrls}
-            placeholder="示例：https://openai.com/index/product-release"
-            onChange={(event) => setSourceUrls(event.target.value)}
-          />
-        </label>
-        <div className="toolbar">
-          <button type="submit" disabled={createProject.isPending}>
-            {createProject.isPending ? "创建中..." : "创建项目"}
-          </button>
-          {PHASE_ACTIONS.map((phase) => (
+      <div className="content-studio-workspace">
+        <main className="content-studio-main">
+          {createProject.isError ? <p role="alert">{formatApiError(createProject.error, "项目创建失败")}</p> : null}
+          {projectQuery.isError ? <p role="alert">{formatApiError(projectQuery.error, "项目加载失败")}</p> : null}
+          {runProject.isError ? <p role="alert">{formatApiError(runProject.error, "项目运行失败")}</p> : null}
+          {reviseScript.isError ? <p role="alert">{formatApiError(reviseScript.error, "脚本修改失败")}</p> : null}
+          {approveScript.isError ? <p role="alert">{formatApiError(approveScript.error, "脚本批准失败")}</p> : null}
+          {approveRights.isError ? <p role="alert">{formatApiError(approveRights.error, "版权批准失败")}</p> : null}
+          {reviseStoryboard.isError ? <p role="alert">{formatApiError(reviseStoryboard.error, "分镜修改失败")}</p> : null}
+          {regenerateAsset.isError ? <p role="alert">{formatApiError(regenerateAsset.error, "素材重生成失败")}</p> : null}
+          {renderPreview.isError ? <p role="alert">{formatApiError(renderPreview.error, "预览渲染失败")}</p> : null}
+          {approveFinal.isError ? <p role="alert">{formatApiError(approveFinal.error, "终片批准失败")}</p> : null}
+          {retryContentStage.isError ? <p role="alert">{formatApiError(retryContentStage.error, "阶段重试失败")}</p> : null}
+          {updateClaim.isError ? <p role="alert">{formatApiError(updateClaim.error, "事实状态更新失败")}</p> : null}
+
+          <StageSection number={1} title="创建项目" status={visibleProject?.status ?? "DRAFT"}>
+            <form className="form-grid schedule-form" aria-label="创建 Content Studio 项目" onSubmit={submit}>
+              <label htmlFor="content-title">
+                标题
+                <input id="content-title" value={title} onChange={(event) => setTitle(event.target.value)} />
+              </label>
+              <label htmlFor="content-topic">
+                主题
+                <textarea id="content-topic" rows={4} value={topic} onChange={(event) => setTopic(event.target.value)} />
+              </label>
+              <label htmlFor="content-sources">
+                官方来源
+                <textarea
+                  id="content-sources"
+                  rows={3}
+                  value={sourceUrls}
+                  placeholder="示例：https://openai.com/index/product-release"
+                  onChange={(event) => setSourceUrls(event.target.value)}
+                />
+              </label>
+              <div className="toolbar">
+                <button type="submit" disabled={createProject.isPending}>
+                  {createProject.isPending ? "创建中..." : "创建项目"}
+                </button>
+              </div>
+            </form>
+
+            <form
+              className="form-grid schedule-form"
+              aria-label="打开 Content Studio 项目"
+              onSubmit={(event) => {
+                event.preventDefault();
+                openProjectId(openProjectInput.trim());
+              }}
+            >
+              <label htmlFor="content-open-project">
+                项目 ID
+                <input
+                  id="content-open-project"
+                  value={openProjectInput}
+                  placeholder="project_..."
+                  onChange={(event) => setOpenProjectInput(event.target.value)}
+                />
+              </label>
+              <button type="submit" className="secondary-action" disabled={!openProjectInput.trim()}>
+                打开项目
+              </button>
+            </form>
+
+            <section className="content-studio-overview" aria-label="项目概览">
+              <h3>{visibleProject?.title ?? "尚未创建项目"}</h3>
+              <div className="toolbar">
+                <span className={visibleProject?.execution_mode === "production" ? "status-pill status-pill-success" : "status-pill"}>
+                  {visibleProject?.execution_mode === "production" ? "正式生产" : "演示模式"}
+                </span>
+                {visibleProject?.execution_mode !== "production" ? (
+                  <span className="content-studio-demo-note">当前输出仅用于演示验证，不能标记为正式交付。</span>
+                ) : null}
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={!projectId || projectQuery.isFetching}
+                  onClick={() => projectQuery.refetch()}
+                >
+                  {projectQuery.isFetching ? "刷新中..." : "刷新项目状态"}
+                </button>
+              </div>
+              <dl>
+                <dt>Project ID</dt>
+                <dd>{visibleProject?.project_id ?? "无"}</dd>
+                <dt>状态</dt>
+                <dd>{visibleProject?.status ?? "DRAFT"}</dd>
+                <dt>当前完成度</dt>
+                <dd>{statusSummary}</dd>
+              </dl>
+              <div className="content-studio-approval-strip" aria-label="审批状态">
+                <ApprovalPill approved={Boolean(visibleProject?.script_approved)} approvedText="脚本已批准" pendingText="脚本待批准" />
+                <ApprovalPill approved={Boolean(visibleProject?.rights_approved)} approvedText="版权已批准" pendingText="版权待批准" />
+                <ApprovalPill approved={Boolean(visibleProject?.final_approved)} approvedText="终片已批准" pendingText="终片待批准" />
+              </div>
+            </section>
+          </StageSection>
+
+          <StageSection number={2} title="Research / Fact Check" status={visibleProject?.fact_check_report ? "已完成" : "待运行"} locked={stageLocked.research}>
+            <div className="toolbar">
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={stageLocked.research || anyActionPending}
+                title={PHASE_ACTIONS[0].description}
+                onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: PHASE_ACTIONS[0].until })}
+              >
+                {PHASE_ACTIONS[0].label}
+              </button>
+            </div>
+            <div className="resource-list content-studio-grid">
+              <ResearchPanel value={visibleProject?.research_bundle} />
+              <EvidencePanel value={visibleProject?.evidence_graph} />
+              <StudioPanel title="Fact Check" value={visibleProject?.fact_check_report} />
+            </div>
+            <div className="form-grid content-studio-inline-form">
+              <label htmlFor="claim-id">
+                Claim ID
+                <input id="claim-id" value={claimId} onChange={(event) => setClaimId(event.target.value)} />
+              </label>
+              <label htmlFor="claim-status">
+                Claim 状态
+                <select id="claim-status" value={claimStatus} onChange={(event) => setClaimStatus(event.target.value)}>
+                  <option value="supported">supported</option>
+                  <option value="partially_supported">partially_supported</option>
+                  <option value="conflicting">conflicting</option>
+                  <option value="outdated">outdated</option>
+                  <option value="unsupported">unsupported</option>
+                  <option value="opinion">opinion</option>
+                </select>
+              </label>
+              <label htmlFor="claim-note">
+                Claim 说明
+                <input id="claim-note" value={claimNote} onChange={(event) => setClaimNote(event.target.value)} />
+              </label>
+              <label htmlFor="claim-evidence-ids">
+                Evidence IDs
+                <input id="claim-evidence-ids" value={claimEvidenceIdsText} placeholder="EV001, EV002" onChange={(event) => setClaimEvidenceIdsText(event.target.value)} />
+              </label>
+            </div>
+            <div className="content-studio-evidence-list" role="list" aria-label="事实证据列表">
+              {evidenceItems.length ? (
+                evidenceItems.map((evidence) => (
+                  <label key={evidence.evidence_id} className="content-studio-asset-row">
+                    <input type="checkbox" checked={claimEvidenceIds.includes(evidence.evidence_id)} onChange={() => toggleEvidence(evidence.evidence_id)} />
+                    <span>
+                      <strong>{evidence.evidence_id}</strong>
+                      <small>
+                        {evidence.title}
+                        {evidence.source_url ? ` · ${evidence.source_url}` : ""}
+                      </small>
+                    </span>
+                  </label>
+                ))
+              ) : (
+                <p>暂无可选择证据。supported / partially_supported 必须填写 Evidence IDs。</p>
+              )}
+            </div>
+            {claimNeedsEvidence && claimEvidenceIds.length === 0 ? (
+              <p className="content-studio-helper">supported / partially_supported 必须绑定 Evidence IDs，不能只用说明备注通过核验。</p>
+            ) : null}
             <button
-              key={phase.until}
               type="button"
               className="secondary-action"
-              disabled={!activeProjectId || anyActionPending}
-              title={phase.description}
-              onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: phase.until })}
+              disabled={!canUpdateClaim || anyActionPending}
+              onClick={() =>
+                updateClaim.mutate({
+                  id: requireProjectId(activeProjectId),
+                  selectedClaimId: claimId.trim(),
+                  evidenceIds: claimEvidenceIds,
+                })
+              }
             >
-              {phase.label}
+              {updateClaim.isPending ? "事实更新中..." : "更新事实状态"}
             </button>
-          ))}
-        </div>
-      </form>
+          </StageSection>
 
-      <form
-        className="form-grid schedule-form"
-        aria-label="打开 Content Studio 项目"
-        onSubmit={(event) => {
-          event.preventDefault();
-          openProjectId(openProjectInput.trim());
-        }}
-      >
-        <label htmlFor="content-open-project">
-          项目 ID
-          <input
-            id="content-open-project"
-            value={openProjectInput}
-            placeholder="project_..."
-            onChange={(event) => setOpenProjectInput(event.target.value)}
-          />
-        </label>
-        <button type="submit" className="secondary-action" disabled={!openProjectInput.trim()}>
-          打开项目
-        </button>
-      </form>
-
-      {createProject.isError ? <p role="alert">{formatApiError(createProject.error, "项目创建失败")}</p> : null}
-      {projectQuery.isError ? <p role="alert">{formatApiError(projectQuery.error, "项目加载失败")}</p> : null}
-      {runProject.isError ? <p role="alert">{formatApiError(runProject.error, "项目运行失败")}</p> : null}
-      {reviseScript.isError ? <p role="alert">{formatApiError(reviseScript.error, "脚本修改失败")}</p> : null}
-      {approveScript.isError ? <p role="alert">{formatApiError(approveScript.error, "脚本批准失败")}</p> : null}
-      {approveRights.isError ? <p role="alert">{formatApiError(approveRights.error, "版权批准失败")}</p> : null}
-      {reviseStoryboard.isError ? <p role="alert">{formatApiError(reviseStoryboard.error, "分镜修改失败")}</p> : null}
-      {regenerateAsset.isError ? <p role="alert">{formatApiError(regenerateAsset.error, "素材重生成失败")}</p> : null}
-      {renderPreview.isError ? <p role="alert">{formatApiError(renderPreview.error, "预览渲染失败")}</p> : null}
-      {approveFinal.isError ? <p role="alert">{formatApiError(approveFinal.error, "终片批准失败")}</p> : null}
-      {retryContentStage.isError ? <p role="alert">{formatApiError(retryContentStage.error, "阶段重试失败")}</p> : null}
-      {updateClaim.isError ? <p role="alert">{formatApiError(updateClaim.error, "事实状态更新失败")}</p> : null}
-
-      <section className="section-band content-studio-overview" aria-label="项目概览">
-        <p className="eyebrow">Project</p>
-        <h3>{visibleProject?.title ?? "尚未创建项目"}</h3>
-        <div className="toolbar">
-          <span className={visibleProject?.execution_mode === "production" ? "status-pill status-pill-success" : "status-pill"}>
-            {visibleProject?.execution_mode === "production" ? "正式生产" : "演示模式"}
-          </span>
-          {visibleProject?.execution_mode !== "production" ? (
-            <span className="content-studio-demo-note">当前输出仅用于演示验证，不能标记为正式交付。</span>
-          ) : null}
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!projectId || projectQuery.isFetching}
-            onClick={() => projectQuery.refetch()}
-          >
-            {projectQuery.isFetching ? "刷新中..." : "刷新项目状态"}
-          </button>
-        </div>
-        <dl>
-          <dt>Project ID</dt>
-          <dd>{visibleProject?.project_id ?? "无"}</dd>
-          <dt>状态</dt>
-          <dd>{visibleProject?.status ?? "DRAFT"}</dd>
-          <dt>当前完成度</dt>
-          <dd>{statusSummary}</dd>
-        </dl>
-        <div className="content-studio-approval-strip" aria-label="审批状态">
-          <ApprovalPill approved={Boolean(visibleProject?.script_approved)} approvedText="脚本已批准" pendingText="脚本待批准" />
-          <ApprovalPill approved={Boolean(visibleProject?.rights_approved)} approvedText="版权已批准" pendingText="版权待批准" />
-          <ApprovalPill approved={Boolean(visibleProject?.final_approved)} approvedText="终片已批准" pendingText="终片待批准" />
-        </div>
-      </section>
-
-      <section className="section-band" aria-label="项目历史">
-        <p className="eyebrow">History</p>
-        <h3>项目历史与产物记录</h3>
-        <p className="content-studio-helper">按发生顺序保留调研、事实链、脚本、素材、配音、渲染、QC、失败和重试记录。</p>
-        <div className="content-studio-history" role="list">
-          {historyItems.length ? (
-            historyItems.map((item) => (
-              <article key={item.id} className="content-studio-history-item" role="listitem">
-                <div>
-                  <span className="content-studio-history-index">{item.sequence}</span>
-                  <strong>{item.title}</strong>
-                  <small>
-                    {item.stage} · {item.status}
-                  </small>
-                </div>
-                <p>{item.summary}</p>
-                {item.artifactRefs.length ? (
-                  <p className="content-studio-history-refs">关联产物：{item.artifactRefs.join("、")}</p>
-                ) : null}
-                {item.payload ? (
-                  <details>
-                    <summary>查看历史详情</summary>
-                    <pre className="json-preview">{JSON.stringify(item.payload, null, 2)}</pre>
-                  </details>
-                ) : null}
-              </article>
-            ))
-          ) : (
-            <p>暂无历史记录。</p>
-          )}
-        </div>
-      </section>
-
-      <form className="form-grid schedule-form" aria-label="修改脚本" onSubmit={(event) => {
-        event.preventDefault();
-        if (activeProjectId && revision.trim()) {
-          reviseScript.mutate({ id: requireProjectId(activeProjectId), instruction: revision });
-        }
-      }}>
-        <label htmlFor="content-revision">
-          脚本修改
-          <input id="content-revision" value={revision} onChange={(event) => setRevision(event.target.value)} />
-        </label>
-        <button type="submit" disabled={!activeProjectId || reviseScript.isPending}>
-          {reviseScript.isPending ? "修改中..." : "提交脚本修改"}
-        </button>
-        <button
-          type="button"
-          className="secondary-action"
-          disabled={!activeProjectId || !visibleProject?.script || Boolean(visibleProject?.script_approved) || anyActionPending}
-          onClick={() =>
-            approveScript.mutate({
-              id: requireProjectId(activeProjectId),
-              revision: visibleProject?.revision ?? 0,
-            })
-          }
-        >
-          {approveScript.isPending ? "脚本批准中..." : "批准脚本"}
-        </button>
-      </form>
-
-      <section className="section-band" aria-label="版权批准">
-        <p className="eyebrow">Rights Review</p>
-        <h3>按素材批准版权</h3>
-        <p className="content-studio-helper">只勾选已经核验来源和授权状态的素材。这里不会自动整包通过。</p>
-        <div className="content-studio-asset-list" role="list" aria-label="素材版权列表">
-          {assets.length ? (
-            assets.map((asset) => (
-              <label key={asset.asset_id} className="content-studio-asset-row">
-                <input
-                  type="checkbox"
-                  checked={selectedAssetIds.includes(asset.asset_id)}
-                  onChange={() => toggleAsset(asset.asset_id)}
-                />
-                <span>
-                  <strong>{asset.title}</strong>
-                  <small>
-                    {asset.asset_id} · {asset.kind} · 权利状态 {asset.rights_status}
-                  </small>
-                </span>
+          <StageSection number={3} title="Plan / Script" status={visibleProject?.script ? "脚本可审" : "待运行"} locked={stageLocked.script}>
+            <div className="toolbar">
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={stageLocked.script || anyActionPending}
+                title={PHASE_ACTIONS[1].description}
+                onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: PHASE_ACTIONS[1].until })}
+              >
+                {PHASE_ACTIONS[1].label}
+              </button>
+            </div>
+            <div className="resource-list content-studio-grid">
+              <StudioPanel title="Plan" value={visibleProject?.content_plan} />
+              <ScriptPanel value={visibleProject?.script} />
+            </div>
+            <form className="form-grid schedule-form" aria-label="修改脚本" onSubmit={(event) => {
+              event.preventDefault();
+              if (activeProjectId && revision.trim()) {
+                reviseScript.mutate({ id: requireProjectId(activeProjectId), instruction: revision });
+              }
+            }}>
+              <label htmlFor="content-revision">
+                脚本修改
+                <input id="content-revision" value={revision} onChange={(event) => setRevision(event.target.value)} />
               </label>
-            ))
-          ) : (
-            <p>暂无可审批素材。</p>
-          )}
-        </div>
-        <label htmlFor="rights-note">
-          版权批准备注
-          <input id="rights-note" value={rightsNote} onChange={(event) => setRightsNote(event.target.value)} />
-        </label>
-        <button
-          type="button"
-          className="secondary-action"
-          disabled={
-            !activeProjectId ||
-            Boolean(visibleProject?.rights_approved) ||
-            selectedAssetIds.length === 0 ||
-            !rightsNote.trim() ||
-            anyActionPending
-          }
-          onClick={() =>
-            approveRights.mutate({
-              id: requireProjectId(activeProjectId),
-              assetIds: selectedAssetIds,
-              note: rightsNote.trim(),
-              revision: visibleProject?.revision ?? 0,
-            })
-          }
-        >
-          {approveRights.isPending ? "版权批准中..." : "批准所选版权"}
-        </button>
-      </section>
+              <button type="submit" disabled={!activeProjectId || reviseScript.isPending}>
+                {reviseScript.isPending ? "修改中..." : "提交脚本修改"}
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={!activeProjectId || !visibleProject?.script || Boolean(visibleProject?.script_approved) || anyActionPending}
+                onClick={() =>
+                  approveScript.mutate({
+                    id: requireProjectId(activeProjectId),
+                    revision: visibleProject?.revision ?? 0,
+                  })
+                }
+              >
+                {approveScript.isPending ? "脚本批准中..." : "批准脚本"}
+              </button>
+            </form>
+          </StageSection>
 
-      <section className="section-band" aria-label="项目操作">
-        <p className="eyebrow">Operations</p>
-        <h3>局部修改与恢复</h3>
-        <div className="form-grid">
-          <label htmlFor="storyboard-revision">
-            分镜修改
-            <input
-              id="storyboard-revision"
-              value={storyboardRevision}
-              onChange={(event) => setStoryboardRevision(event.target.value)}
-            />
-          </label>
-          <label htmlFor="asset-id">
-            素材 ID
-            <input id="asset-id" value={assetId} onChange={(event) => setAssetId(event.target.value)} />
-          </label>
-          <label htmlFor="asset-revision">
-            素材重生成要求
-            <input id="asset-revision" value={assetRevision} onChange={(event) => setAssetRevision(event.target.value)} />
-          </label>
-          <label htmlFor="retry-stage">
-            重试阶段
-            <select id="retry-stage" value={retryStage} onChange={(event) => setRetryStage(event.target.value as Stage)}>
-              {STAGES.map((stage) => (
-                <option key={stage} value={stage}>
-                  {stage}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label htmlFor="claim-id">
-            Claim ID
-            <input id="claim-id" value={claimId} onChange={(event) => setClaimId(event.target.value)} />
-          </label>
-          <label htmlFor="claim-status">
-            Claim 状态
-            <select id="claim-status" value={claimStatus} onChange={(event) => setClaimStatus(event.target.value)}>
-              <option value="supported">supported</option>
-              <option value="partially_supported">partially_supported</option>
-              <option value="conflicting">conflicting</option>
-              <option value="outdated">outdated</option>
-              <option value="unsupported">unsupported</option>
-              <option value="opinion">opinion</option>
-            </select>
-          </label>
-          <label htmlFor="claim-note">
-            Claim 说明
-            <input id="claim-note" value={claimNote} onChange={(event) => setClaimNote(event.target.value)} />
-          </label>
-          <label htmlFor="claim-evidence-ids">
-            Evidence IDs
-            <input
-              id="claim-evidence-ids"
-              value={claimEvidenceIdsText}
-              placeholder="EV001, EV002"
-              onChange={(event) => setClaimEvidenceIdsText(event.target.value)}
-            />
-          </label>
-        </div>
-        <div className="content-studio-evidence-list" role="list" aria-label="事实证据列表">
-          {evidenceItems.length ? (
-            evidenceItems.map((evidence) => (
-              <label key={evidence.evidence_id} className="content-studio-asset-row">
-                <input
-                  type="checkbox"
-                  checked={claimEvidenceIds.includes(evidence.evidence_id)}
-                  onChange={() => toggleEvidence(evidence.evidence_id)}
-                />
-                <span>
-                  <strong>{evidence.evidence_id}</strong>
-                  <small>
-                    {evidence.title}
-                    {evidence.source_url ? ` · ${evidence.source_url}` : ""}
-                  </small>
-                </span>
+          <StageSection number={4} title="Storyboard / Assets" status={visibleProject?.asset_manifest ? "素材可审" : "待运行"} locked={stageLocked.assets}>
+            <div className="toolbar">
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={stageLocked.assets || anyActionPending}
+                title={PHASE_ACTIONS[2].description}
+                onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: PHASE_ACTIONS[2].until })}
+              >
+                {PHASE_ACTIONS[2].label}
+              </button>
+            </div>
+            <div className="resource-list content-studio-grid">
+              <StoryboardPanel value={visibleProject?.storyboard} />
+              <AssetsPanel value={visibleProject?.asset_manifest} assets={assets} />
+            </div>
+            <div className="form-grid content-studio-inline-form">
+              <label htmlFor="storyboard-revision">
+                分镜修改
+                <input id="storyboard-revision" value={storyboardRevision} onChange={(event) => setStoryboardRevision(event.target.value)} />
               </label>
-            ))
-          ) : (
-            <p>暂无可选择证据。supported / partially_supported 必须填写 Evidence IDs。</p>
-          )}
-        </div>
-        {claimNeedsEvidence && claimEvidenceIds.length === 0 ? (
-          <p className="content-studio-helper">supported / partially_supported 必须绑定 Evidence IDs，不能只用说明备注通过核验。</p>
-        ) : null}
-        <div className="toolbar">
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!activeProjectId || anyActionPending}
-            onClick={() => reviseStoryboard.mutate({ id: requireProjectId(activeProjectId), instruction: storyboardRevision })}
-          >
-            {reviseStoryboard.isPending ? "分镜提交中..." : "提交分镜修改"}
-          </button>
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!activeProjectId || !assetId.trim() || anyActionPending}
-            onClick={() =>
-              regenerateAsset.mutate({
-                id: requireProjectId(activeProjectId),
-                selectedAssetId: assetId.trim(),
-                instruction: assetRevision,
-              })
-            }
-          >
-            {regenerateAsset.isPending ? "素材重生成中..." : "重生成单个素材"}
-          </button>
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!activeProjectId || anyActionPending}
-            onClick={() => retryContentStage.mutate({ id: requireProjectId(activeProjectId), stage: retryStage })}
-          >
-            {retryContentStage.isPending ? "阶段重试中..." : "重试所选阶段"}
-          </button>
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!canUpdateClaim || anyActionPending}
-            onClick={() =>
-              updateClaim.mutate({
-                id: requireProjectId(activeProjectId),
-                selectedClaimId: claimId.trim(),
-                evidenceIds: claimEvidenceIds,
-              })
-            }
-          >
-            {updateClaim.isPending ? "事实更新中..." : "更新事实状态"}
-          </button>
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!activeProjectId || anyActionPending}
-            onClick={() => renderPreview.mutate(requireProjectId(activeProjectId))}
-          >
-            {renderPreview.isPending ? "预览渲染中..." : "渲染预览"}
-          </button>
-          <button
-            type="button"
-            className="secondary-action"
-            disabled={!activeProjectId || !canApproveFinal || Boolean(visibleProject?.final_approved) || anyActionPending}
-            onClick={() =>
-              approveFinal.mutate({
-                id: requireProjectId(activeProjectId),
-                revision: visibleProject?.revision ?? 0,
-              })
-            }
-          >
-            {approveFinal.isPending ? "终片批准中..." : "批准终片"}
-          </button>
-          <span className="content-studio-helper">
-            终片批准需要脚本批准、版权批准、已有预览和无 BLOCKER 的 QC 报告。
-          </span>
-        </div>
-      </section>
+              <label htmlFor="asset-id">
+                素材 ID
+                <input id="asset-id" value={assetId} onChange={(event) => setAssetId(event.target.value)} />
+              </label>
+              <label htmlFor="asset-revision">
+                素材重生成要求
+                <input id="asset-revision" value={assetRevision} onChange={(event) => setAssetRevision(event.target.value)} />
+              </label>
+              <label htmlFor="retry-stage">
+                重试阶段
+                <select id="retry-stage" value={retryStage} onChange={(event) => setRetryStage(event.target.value as Stage)}>
+                  {STAGES.map((stage) => (
+                    <option key={stage} value={stage}>
+                      {stage}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="toolbar">
+              <button type="button" className="secondary-action" disabled={!activeProjectId || anyActionPending} onClick={() => reviseStoryboard.mutate({ id: requireProjectId(activeProjectId), instruction: storyboardRevision })}>
+                {reviseStoryboard.isPending ? "分镜提交中..." : "提交分镜修改"}
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={!activeProjectId || !assetId.trim() || anyActionPending}
+                onClick={() =>
+                  regenerateAsset.mutate({
+                    id: requireProjectId(activeProjectId),
+                    selectedAssetId: assetId.trim(),
+                    instruction: assetRevision,
+                  })
+                }
+              >
+                {regenerateAsset.isPending ? "素材重生成中..." : "重生成单个素材"}
+              </button>
+              <button type="button" className="secondary-action" disabled={!activeProjectId || anyActionPending} onClick={() => retryContentStage.mutate({ id: requireProjectId(activeProjectId), stage: retryStage })}>
+                {retryContentStage.isPending ? "阶段重试中..." : "重试所选阶段"}
+              </button>
+            </div>
+            <section aria-label="版权批准">
+              <h3>按素材批准版权</h3>
+              <p className="content-studio-helper">只勾选已经核验来源和授权状态的素材。这里不会自动整包通过。</p>
+              <div className="content-studio-asset-list" role="list" aria-label="素材版权列表">
+                {assets.length ? (
+                  assets.map((asset) => (
+                    <label key={asset.asset_id} className="content-studio-asset-row">
+                      <input type="checkbox" checked={selectedAssetIds.includes(asset.asset_id)} onChange={() => toggleAsset(asset.asset_id)} />
+                      <span>
+                        <strong>{asset.title}</strong>
+                        <small>
+                          {asset.asset_id} · {asset.kind} · 权利状态 {asset.rights_status}
+                        </small>
+                      </span>
+                    </label>
+                  ))
+                ) : (
+                  <p>暂无可审批素材。</p>
+                )}
+              </div>
+              <label htmlFor="rights-note">
+                版权批准备注
+                <input id="rights-note" value={rightsNote} onChange={(event) => setRightsNote(event.target.value)} />
+              </label>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={!activeProjectId || Boolean(visibleProject?.rights_approved) || selectedAssetIds.length === 0 || !rightsNote.trim() || anyActionPending}
+                onClick={() =>
+                  approveRights.mutate({
+                    id: requireProjectId(activeProjectId),
+                    assetIds: selectedAssetIds,
+                    note: rightsNote.trim(),
+                    revision: visibleProject?.revision ?? 0,
+                  })
+                }
+              >
+                {approveRights.isPending ? "版权批准中..." : "批准所选版权"}
+              </button>
+            </section>
+          </StageSection>
 
-      <div className="resource-list content-studio-grid" aria-label="Content Studio 状态分区">
-        <ResearchPanel value={visibleProject?.research_bundle} />
-        <StudioPanel title="Evidence" value={visibleProject?.evidence_graph} />
-        <StudioPanel title="Fact Check" value={visibleProject?.fact_check_report} />
-        <StudioPanel title="Plan" value={visibleProject?.content_plan} />
-        <StudioPanel title="Script" value={visibleProject?.script} />
-        <StudioPanel title="Storyboard" value={visibleProject?.storyboard} />
-        <StudioPanel title="Assets" value={visibleProject?.asset_manifest} summary={assets.length ? `${assets.length} 个素材待管理` : undefined} />
-        <StudioPanel title="Voice" value={visibleProject?.voice_track} />
-        <StudioPanel title="Timeline" value={visibleProject?.timeline} />
-        <StudioPanel title="QC" value={visibleProject?.qc_report} />
+          <StageSection number={5} title="Voice / Timeline / Preview" status={projectHasPreview(visibleProject) ? "已有预览" : "待运行"} locked={stageLocked.preview}>
+            <div className="toolbar">
+              <button type="button" className="secondary-action" disabled={stageLocked.preview || anyActionPending} title={PHASE_ACTIONS[3].description} onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: PHASE_ACTIONS[3].until })}>
+                {PHASE_ACTIONS[3].label}
+              </button>
+              <button type="button" className="secondary-action" disabled={stageLocked.preview || anyActionPending} onClick={() => renderPreview.mutate(requireProjectId(activeProjectId))}>
+                {renderPreview.isPending ? "预览渲染中..." : "渲染预览"}
+              </button>
+            </div>
+            <div className="resource-list content-studio-grid">
+              <StudioPanel title="Voice" value={visibleProject?.voice_track} />
+              <TimelinePanel value={visibleProject?.timeline} />
+            </div>
+          </StageSection>
+
+          <StageSection number={6} title="Video QC / Final" status={visibleProject?.qc_report ? "待终审" : "待质检"} locked={stageLocked.qc}>
+            <div className="toolbar">
+              <button type="button" className="secondary-action" disabled={stageLocked.qc || anyActionPending} title={PHASE_ACTIONS[4].description} onClick={() => runProject.mutate({ id: requireProjectId(activeProjectId), until: PHASE_ACTIONS[4].until })}>
+                {PHASE_ACTIONS[4].label}
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={!activeProjectId || !canApproveFinal || Boolean(visibleProject?.final_approved) || anyActionPending}
+                onClick={() =>
+                  approveFinal.mutate({
+                    id: requireProjectId(activeProjectId),
+                    revision: visibleProject?.revision ?? 0,
+                  })
+                }
+              >
+                {approveFinal.isPending ? "终片批准中..." : "批准终片"}
+              </button>
+              <span className="content-studio-helper">终片批准需要脚本批准、版权批准、已有预览和无 BLOCKER 的 QC 报告。</span>
+            </div>
+            <div className="resource-list content-studio-grid">
+              <QcPanel value={visibleProject?.qc_report} />
+              <TimelinePanel value={visibleProject?.timeline} finalOnly />
+            </div>
+            <section aria-label="项目历史">
+              <h3>项目历史与产物记录</h3>
+              <p className="content-studio-helper">按发生顺序保留调研、事实链、脚本、素材、配音、渲染、QC、失败和重试记录。</p>
+              <div className="content-studio-history" role="list">
+                {historyItems.length ? (
+                  historyItems.map((item) => (
+                    <article key={item.id} className="content-studio-history-item" role="listitem">
+                      <div>
+                        <span className="content-studio-history-index">{item.sequence}</span>
+                        <strong>{item.title}</strong>
+                        <small>
+                          {item.stage} · {item.status}
+                        </small>
+                      </div>
+                      <p>{item.summary}</p>
+                      {item.artifactRefs.length ? <p className="content-studio-history-refs">关联产物：{item.artifactRefs.join("、")}</p> : null}
+                      {item.payload ? (
+                        <details>
+                          <summary>查看历史详情</summary>
+                          <pre className="json-preview">{JSON.stringify(item.payload, null, 2)}</pre>
+                        </details>
+                      ) : null}
+                    </article>
+                  ))
+                ) : (
+                  <p>暂无历史记录。</p>
+                )}
+              </div>
+            </section>
+          </StageSection>
+        </main>
+
+        <ProjectHistoryRail
+          projects={projectSummaries}
+          activeProjectId={activeProjectId || projectId}
+          loading={projectsQuery.isLoading}
+          onOpen={(nextProjectId) => openProjectId(nextProjectId)}
+        />
       </div>
     </section>
   );
@@ -654,15 +691,100 @@ function ApprovalPill({
   );
 }
 
+function StageSection({
+  children,
+  locked = false,
+  number,
+  status,
+  title,
+}: {
+  children: ReactNode;
+  locked?: boolean;
+  number: number;
+  status: string;
+  title: string;
+}) {
+  return (
+    <section
+      className={locked ? "section-band content-studio-stage content-studio-stage-locked" : "section-band content-studio-stage"}
+      aria-label={`${number} ${title}`}
+    >
+      <div className="content-studio-stage-header">
+        <div>
+          <p className="eyebrow">Stage {number}</p>
+          <h3>{title}</h3>
+        </div>
+        <span className={locked ? "status-pill status-pill-muted" : "status-pill status-pill-success"}>
+          {locked ? "未解锁" : status}
+        </span>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function ProjectHistoryRail({
+  activeProjectId,
+  loading,
+  onOpen,
+  projects,
+}: {
+  activeProjectId: string;
+  loading: boolean;
+  onOpen: (projectId: string) => void;
+  projects: ContentStudioProjectSummary[];
+}) {
+  return (
+    <aside className="content-studio-history-rail" aria-label="Content Studio 项目历史">
+      <div className="content-studio-history-rail-header">
+        <p className="eyebrow">History</p>
+        <h3>历史项目</h3>
+      </div>
+      {loading ? <p className="content-studio-helper">正在加载项目历史...</p> : null}
+      <div className="content-studio-project-list" role="list">
+        {projects.length ? (
+          projects.map((project) => (
+            <button
+              key={project.project_id}
+              type="button"
+              className={
+                project.project_id === activeProjectId
+                  ? "content-studio-project-item content-studio-project-item-active"
+                  : "content-studio-project-item"
+              }
+              onClick={() => onOpen(project.project_id)}
+            >
+              <strong>{project.title}</strong>
+              <span>{project.status}</span>
+              <small>{project.project_id}</small>
+            </button>
+          ))
+        ) : (
+          <p className="content-studio-helper">暂无历史项目。</p>
+        )}
+      </div>
+    </aside>
+  );
+}
+
 function ResearchPanel({ value }: { value: unknown }) {
   const coverage = arrayValue(recordValue(value)?.source_coverage);
   const candidates = arrayValue(recordValue(value)?.source_candidates);
   const evidence = arrayValue(recordValue(value)?.evidence);
+  const questions = arrayValue(recordValue(value)?.questions);
   return (
     <article>
       <p className="eyebrow">{value ? "ready" : "pending"}</p>
       <h3>Research</h3>
       <p>{value ? `${evidence.length} 条证据 · ${coverage.length} 类来源覆盖 · ${candidates.length} 个候选源` : "等待调研"}</p>
+      {questions.length ? (
+        <ul className="content-studio-output-list">
+          {questions.map((item, index) => {
+            const row = recordValue(item);
+            return <li key={`${stringValue(row?.question_id) ?? "question"}-${index}`}>{stringValue(row?.text) ?? stringValue(row?.question) ?? valueSummary(row)}</li>;
+          })}
+        </ul>
+      ) : null}
       {coverage.length ? (
         <div className="content-studio-source-coverage" aria-label="Research 来源覆盖">
           {coverage.map((item, index) => {
@@ -693,6 +815,187 @@ function ResearchPanel({ value }: { value: unknown }) {
             })}
           </ul>
         </details>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function EvidencePanel({ value }: { value: unknown }) {
+  const row = recordValue(value);
+  const evidence = arrayValue(row?.evidence ?? row?.evidences ?? row?.sources);
+  const claims = arrayValue(row?.claims);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>Evidence</h3>
+      <p>{value ? `${claims.length} 条 Claim · ${evidence.length} 条 Evidence` : "等待证据图"}</p>
+      {claims.length ? (
+        <ul className="content-studio-output-list">
+          {claims.slice(0, 6).map((item, index) => {
+            const claim = recordValue(item);
+            return (
+              <li key={`${stringValue(claim?.claim_id) ?? "claim"}-${index}`}>
+                <strong>{stringValue(claim?.claim_id) ?? `CL${index + 1}`}</strong>
+                <span>{stringValue(claim?.text) ?? valueSummary(claim)}</span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function ScriptPanel({ value }: { value: unknown }) {
+  const row = recordValue(value);
+  const hooks = stringArray(row?.hooks);
+  const segments = arrayValue(row?.segments);
+  const subtitles = stringArray(row?.subtitle_lines);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>Script</h3>
+      <p>{value ? `${hooks.length} 个 Hook · ${segments.length} 段脚本 · ${subtitles.length} 条字幕` : "等待脚本"}</p>
+      {hooks.length ? (
+        <section className="content-studio-output-block">
+          <strong>Hooks</strong>
+          <ul className="content-studio-output-list">
+            {hooks.map((hook, index) => (
+              <li key={`${hook}-${index}`}>{hook}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {segments.length ? (
+        <section className="content-studio-output-block">
+          <strong>脚本段落</strong>
+          <ul className="content-studio-output-list">
+            {segments.map((item, index) => {
+              const segment = recordValue(item);
+              return <li key={`${stringValue(segment?.segment_id) ?? "segment"}-${index}`}>{stringValue(segment?.text) ?? valueSummary(segment)}</li>;
+            })}
+          </ul>
+        </section>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function StoryboardPanel({ value }: { value: unknown }) {
+  const row = recordValue(value);
+  const shots = arrayValue(row?.shots);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>Storyboard</h3>
+      <p>{value ? `${shots.length} 个镜头` : "等待分镜"}</p>
+      {shots.length ? (
+        <ul className="content-studio-output-list">
+          {shots.map((item, index) => {
+            const shot = recordValue(item);
+            return (
+              <li key={`${stringValue(shot?.shot_id) ?? "shot"}-${index}`}>
+                <strong>{stringValue(shot?.shot_id) ?? `Shot ${index + 1}`}</strong>
+                <span>{stringValue(shot?.shot_type) ?? "shot"} · {numberValue(shot?.duration_ms) ?? 0}ms · {stringValue(shot?.overlay) ?? "无叠加"}</span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function AssetsPanel({ assets, value }: { assets: AssetSummary[]; value: unknown }) {
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>Assets</h3>
+      <p>{assets.length ? `${assets.length} 个素材待管理` : "等待素材"}</p>
+      {assets.length ? (
+        <ul className="content-studio-output-list">
+          {assets.map((asset) => (
+            <li key={asset.asset_id}>
+              <strong>{asset.title}</strong>
+              <span>{asset.asset_id} · {asset.kind} · {asset.rights_status}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function TimelinePanel({ finalOnly = false, value }: { finalOnly?: boolean; value: unknown }) {
+  const row = recordValue(value);
+  const preview = stringValue(row?.preview_artifact_id);
+  const final = stringValue(row?.final_artifact_id);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>{finalOnly ? "Final Render" : "Timeline"}</h3>
+      <p>{value ? `${numberValue(row?.width) ?? 0}×${numberValue(row?.height) ?? 0} · ${numberValue(row?.duration_ms) ?? 0}ms` : "等待时间线"}</p>
+      {!finalOnly && preview ? <p className="content-studio-media-path">{preview}</p> : null}
+      {final ? <p className="content-studio-media-path">{final}</p> : null}
+      {value ? (
+        <details>
+          <summary>查看结构化详情</summary>
+          <pre className="json-preview">{JSON.stringify(value, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function QcPanel({ value }: { value: unknown }) {
+  const row = recordValue(value);
+  const blockers = stringArray(row?.blockers);
+  const majors = stringArray(row?.majors);
+  const minors = stringArray(row?.minors);
+  const checkedItems = stringArray(row?.checked_items);
+  const summary = stringValue(row?.summary);
+  return (
+    <article>
+      <p className="eyebrow">{value ? "ready" : "pending"}</p>
+      <h3>QC</h3>
+      <p>{value ? `${blockers.length} BLOCKER · ${majors.length} MAJOR · ${minors.length} MINOR` : "等待 Video QC"}</p>
+      {summary ? <p>{summary}</p> : null}
+      {checkedItems.length ? (
+        <ul className="content-studio-output-list">
+          {checkedItems.map((item) => (
+            <li key={item}>{item}</li>
+          ))}
+        </ul>
       ) : null}
       {value ? (
         <details>
@@ -738,6 +1041,96 @@ function projectStatusSummary(project: ContentStudioProject | undefined): string
   return `${ready}/10 个阶段已有产物`;
 }
 
+function projectStageLocks(project: ContentStudioProject | undefined): {
+  research: boolean;
+  script: boolean;
+  assets: boolean;
+  preview: boolean;
+  qc: boolean;
+} {
+  return {
+    research: !project,
+    script: !project?.fact_check_report,
+    assets: !project?.script_approved,
+    preview: !project?.rights_approved,
+    qc: !project || !projectHasPreview(project),
+  };
+}
+
+function loadRecentProjects(): ContentStudioProjectSummary[] {
+  try {
+    const raw = window.localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): ContentStudioProjectSummary[] => {
+      if (!isRecord(item)) return [];
+      const projectId = stringValue(item.project_id);
+      const title = stringValue(item.title);
+      const status = stringValue(item.status);
+      if (!projectId || !title || !status) return [];
+      return [
+        {
+          project_id: projectId,
+          title,
+          topic: stringValue(item.topic) ?? "",
+          status,
+          revision: numberValue(item.revision) ?? 0,
+          execution_mode: stringValue(item.execution_mode) === "production" ? "production" : "demo",
+          updated_at: stringValue(item.updated_at),
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function rememberRecentProject(
+  current: ContentStudioProjectSummary[],
+  incoming: ContentStudioProjectSummary,
+): ContentStudioProjectSummary[] {
+  const next = mergeProjectSummaries([incoming], current).slice(0, 20);
+  try {
+    window.localStorage.setItem(RECENT_PROJECTS_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Browsers can reject local storage in private contexts; server history remains authoritative.
+  }
+  return next;
+}
+
+function mergeProjectSummaries(
+  primary: ContentStudioProjectSummary[],
+  fallback: ContentStudioProjectSummary[],
+  current?: ContentStudioProject,
+): ContentStudioProjectSummary[] {
+  const merged = new Map<string, ContentStudioProjectSummary>();
+  for (const item of [...fallback, ...primary]) {
+    merged.set(item.project_id, item);
+  }
+  if (current) merged.set(current.project_id, projectSummaryFromProject(current));
+  return Array.from(merged.values()).sort((left, right) => {
+    const leftTime = Date.parse(left.updated_at ?? "");
+    const rightTime = Date.parse(right.updated_at ?? "");
+    if (Number.isFinite(leftTime) || Number.isFinite(rightTime)) {
+      return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+    }
+    return right.revision - left.revision;
+  });
+}
+
+function projectSummaryFromProject(project: ContentStudioProject): ContentStudioProjectSummary {
+  return {
+    project_id: project.project_id,
+    title: project.title,
+    topic: project.topic,
+    status: project.status,
+    revision: project.revision,
+    execution_mode: project.execution_mode,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 function shouldApplyProjectRevision(
   current: ContentStudioProject | undefined,
   incoming: ContentStudioProject,
@@ -752,19 +1145,23 @@ function projectCanApproveFinal(project: ContentStudioProject | undefined): bool
   return Boolean(
     project.script_approved &&
       project.rights_approved &&
+      project.status === "QC_REVIEW" &&
       projectHasPreview(project) &&
       qcReportHasNoBlockers(project.qc_report),
   );
 }
 
-function projectHasPreview(project: ContentStudioProject): boolean {
+function projectHasPreview(project: ContentStudioProject | undefined): boolean {
+  if (!project) return false;
   const record = project as Record<string, unknown>;
+  const timeline = recordValue(project.timeline);
   return Boolean(
     record.preview_render ??
       record.preview ??
       record.preview_video ??
       record.preview_artifact ??
-      record.preview_rendered,
+      record.preview_rendered ??
+      timeline?.preview_artifact_id,
   );
 }
 

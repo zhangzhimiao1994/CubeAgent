@@ -809,6 +809,24 @@ const MultimediaGenerationSchema = z.object({
 
 export type MultimediaGeneration = z.infer<typeof MultimediaGenerationSchema>;
 
+const ContentStudioProjectSummarySchema = z
+  .object({
+    project_id: z.string(),
+    title: z.string(),
+    topic: z.string().default(""),
+    status: z.string(),
+    revision: z.number().int().nonnegative().default(0),
+    execution_mode: z.enum(["demo", "production"]).default("demo"),
+    updated_at: z.string().nullable().optional(),
+  })
+  .passthrough();
+
+const ContentStudioProjectListSchema = z.object({
+  projects: z.array(ContentStudioProjectSummarySchema),
+});
+
+export type ContentStudioProjectSummary = z.infer<typeof ContentStudioProjectSummarySchema>;
+
 const ContentStudioProjectSchema = z
   .object({
     project_id: z.string(),
@@ -1681,6 +1699,13 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
       MultimediaGenerationSchema,
     );
+  },
+  contentStudioProjects(): Promise<ContentStudioProjectSummary[]> {
+    return request(
+      "/api/v1/content-studio/projects",
+      { method: "GET" },
+      ContentStudioProjectListSchema,
+    ).then((result) => result.projects);
   },
   createContentStudioProject(payload: {
     title: string;
