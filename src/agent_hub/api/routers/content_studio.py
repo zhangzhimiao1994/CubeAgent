@@ -243,7 +243,7 @@ async def create_content_project(
 @router.get(
     "/projects/{project_id}",
     response_model=None,
-    responses=error_responses(403, 404),
+    responses=error_responses(403, 404, 422),
 )
 async def get_content_project(
     project_id: str,
@@ -310,7 +310,11 @@ async def revise_script(
     return _project_payload(project)
 
 
-@router.post("/projects/{project_id}/approve-script", response_model=None)
+@router.post(
+    "/projects/{project_id}/approve-script",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 422),
+)
 async def approve_script(
     project_id: str,
     body: RevisionRequest,
@@ -333,7 +337,11 @@ async def approve_script(
     return _project_payload(result)
 
 
-@router.post("/projects/{project_id}/revise-storyboard", response_model=None)
+@router.post(
+    "/projects/{project_id}/revise-storyboard",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 413, 422),
+)
 async def revise_storyboard(
     project_id: str,
     body: InstructionRequest,
@@ -353,7 +361,11 @@ async def revise_storyboard(
     return _project_payload(project)
 
 
-@router.post("/projects/{project_id}/regenerate-asset", response_model=None)
+@router.post(
+    "/projects/{project_id}/regenerate-asset",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 413, 422),
+)
 async def regenerate_asset(
     project_id: str,
     body: RegenerateAssetRequest,
@@ -374,7 +386,11 @@ async def regenerate_asset(
     return _project_payload(project)
 
 
-@router.post("/projects/{project_id}/render-preview", response_model=None)
+@router.post(
+    "/projects/{project_id}/render-preview",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 422),
+)
 async def render_preview(
     project_id: str,
     service: Annotated[ContentStudioServiceProtocol, Depends(_content_studio_service)],
@@ -402,7 +418,11 @@ async def render_preview(
     return _project_payload(project)
 
 
-@router.post("/projects/{project_id}/approve-rights", response_model=None)
+@router.post(
+    "/projects/{project_id}/approve-rights",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 422),
+)
 async def approve_rights(
     project_id: str,
     body: ApproveRightsRequest,
@@ -427,7 +447,11 @@ async def approve_rights(
     return _project_payload(result)
 
 
-@router.post("/projects/{project_id}/regenerate-voice", response_model=None)
+@router.post(
+    "/projects/{project_id}/regenerate-voice",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 413, 422),
+)
 async def regenerate_voice(
     project_id: str,
     body: RegenerateVoiceRequest,
@@ -451,7 +475,11 @@ async def regenerate_voice(
     return _project_payload(result)
 
 
-@router.post("/projects/{project_id}/approve-final", response_model=None)
+@router.post(
+    "/projects/{project_id}/approve-final",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 422),
+)
 async def approve_final(
     project_id: str,
     body: RevisionRequest,
@@ -484,7 +512,11 @@ async def approve_final(
     return _project_payload(result)
 
 
-@router.post("/projects/{project_id}/retry-stage", response_model=None)
+@router.post(
+    "/projects/{project_id}/retry-stage",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 422),
+)
 async def retry_stage(
     project_id: str,
     body: RetryStageRequest,
@@ -504,7 +536,11 @@ async def retry_stage(
     return _project_payload(project)
 
 
-@router.post("/projects/{project_id}/claims/{claim_id}", response_model=None)
+@router.post(
+    "/projects/{project_id}/claims/{claim_id}",
+    response_model=None,
+    responses=error_responses(403, 404, 409, 413, 422),
+)
 async def replace_claim_status(
     project_id: str,
     claim_id: str,

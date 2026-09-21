@@ -2983,6 +2983,8 @@ def _looks_like_interactive_support_request(message: str) -> bool:
 def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
     """Route explicit file/media generation requests before conversation-mode reuse."""
     discussion_override = _current_discussion_override_mode(message)
+    if "完整流程" in message.casefold():
+        return None
     if _media_pipeline_plan_for_request(message) is not None:
         return TaskMode.HYBRID if discussion_override is not None else TaskMode.DISPATCH
 
@@ -3006,6 +3008,8 @@ def _current_artifact_delivery_mode(message: str) -> TaskMode | None:
 
 def _current_discussion_override_mode(message: str) -> TaskMode | None:
     normalized = message.casefold()
+    if "完整流程" in normalized:
+        return None
     if any(marker in normalized for marker in _DISCUSSION_OVERRIDE_NEGATIONS):
         return None
     if not any(marker in normalized for marker in _DISCUSSION_OVERRIDE_MARKERS):
@@ -3340,6 +3344,8 @@ def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
     text = message.casefold()
     if not any(term in text for term in _MEDIA_PIPELINE_DOWNSTREAM_TERMS):
         return None
+    if _is_character_sheet_only_request(text):
+        return None
     if _is_provided_script_media_pipeline_request(text):
         return _media_pipeline_plan(
             source="provided_script",
@@ -3368,6 +3374,42 @@ def _media_pipeline_plan_for_request(message: str) -> dict[str, object] | None:
             ),
         )
     return None
+
+
+def _is_character_sheet_only_request(text: str) -> bool:
+    if not any(term in text for term in ("只生成", "仅生成", "只要", "仅要", "only")):
+        return False
+    if not any(
+        term in text
+        for term in (
+            "character model sheet",
+            "model sheet",
+            "角色参考设定表",
+            "角色设定表",
+            "角色服装设定板",
+            "服装设定板",
+            "定妆参考图",
+            "角色定妆图",
+        )
+    ):
+        return False
+    return any(
+        term in text
+        for term in (
+            "不要生成视频",
+            "不用生成视频",
+            "不生成视频",
+            "不要剪辑",
+            "不用剪辑",
+            "不要成片",
+            "不用成片",
+            "no video",
+            "do not generate video",
+            "don't generate video",
+            "no edit",
+            "no final video",
+        )
+    )
 
 
 def _is_provided_script_media_pipeline_request(text: str) -> bool:

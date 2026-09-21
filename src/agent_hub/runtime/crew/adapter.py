@@ -963,6 +963,8 @@ def _explicit_context_artifact_sources(
         return ()
     sanitized: list[Artifact] = []
     for artifact in context.artifacts:
+        if artifact.type in {"model_response", "tool_result", "review_feedback"}:
+            continue
         files = _usable_file_artifacts_payload((artifact,))
         if files and file_allowed:
             sanitized.append(
@@ -6220,9 +6222,14 @@ class CrewDispatchRuntime:
             if kind is None:
                 return None
             selector = getattr(self._capabilities, "default_logical_model_for_multimedia", None)
-            selected: object = (
-                selector(tenant_id=context.tenant_id, kind=kind) if callable(selector) else None
-            )
+            selected: object = None
+            if callable(selector):
+                try:
+                    selected = selector(tenant_id=context.tenant_id, kind=kind)
+                except TypeError as error:
+                    if "unexpected keyword argument 'tenant_id'" not in str(error):
+                        raise
+                    selected = selector(kind=kind)
             if hasattr(selected, "__await__"):
                 selected = await cast(Coroutine[Any, Any, object], selected)
             selected_model = selected if isinstance(selected, str) and selected.strip() else None
