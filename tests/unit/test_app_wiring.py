@@ -1027,7 +1027,9 @@ def test_parse_asset_visual_review_payload_accepts_plain_text_rejection() -> Non
     )
 
     assert payload["passed"] is False
-    assert "不通过" in payload["summary"]
+    summary = payload["summary"]
+    assert isinstance(summary, str)
+    assert "不通过" in summary
     assert payload["confidence"] == 0.5
     assert payload["issues"] == ["问题：画面像电影剧照，缺少角色三视图，且出现具体背景。"]
 
