@@ -1862,13 +1862,66 @@ def _visual_asset_retry_prompt(
 ) -> str:
     label_text = label.strip() if label else "图片资产"
     reason = _visual_review_failure_reason(review)
+    guardrails = _visual_asset_retry_guardrails(label_text)
     return (
         f"{original_prompt}\n\n"
         f"视觉审核未通过，正在第 {next_attempt} 次重新生成同一项资产：{label_text}。\n"
         f"上一版问题：{reason}\n"
+        f"{guardrails}\n"
         "请修正上述问题后重新生成合格资产图；不要输出电影剧照、宣传海报、随机写真、"
-        "混合角色图片或与该资产类别无关的画面。"
+        "混合角色图片或与该资产类别无关的画面。图内只允许少量大号中文短标签；"
+        "如果无法稳定生成可读文字，优先使用无文字图标、色块、箭头和结构化留白。"
     )
+
+
+def _visual_asset_retry_guardrails(label: str) -> str:
+    normalized = label.casefold()
+    common = (
+        "返修硬约束：纯白/浅灰/透明感纯色背景；只表达当前资产类别；"
+        "禁止场景背景、海报构图、电影剧照、随机写真、测试水印、英文错字、伪字和密集小字。"
+    )
+    if "角色" in normalized or "character" in normalized or "定妆" in normalized:
+        return (
+            f"{common} 角色身份资产必须是单角色 Character Identity 参考表："
+            "正脸、左右45度、侧脸、半身、全身、少量表情必须是同一张脸；"
+            "服装/道具只能辅助身份，不能出现街景、室内、雨景、战斗场面或其他角色。"
+        )
+    if "服装" in normalized or "妆造" in normalized or "costume" in normalized:
+        return (
+            f"{common} 服装妆造只展示 Look/Costume：服装正反面、配饰、鞋履、材质、色卡；"
+            "优先无头模特、衣架、平铺或局部特写，不能重新设计角色脸。"
+        )
+    if "道具" in normalized or "prop" in normalized:
+        return (
+            f"{common} 道具资产只展示独立物件、材质特写、比例尺和状态变化；"
+            "证件不得使用随机真人头像，文字不可读时改用空白占位和清晰大标签。"
+        )
+    if "动作" in normalized or "pose" in normalized or "action" in normalized:
+        return (
+            f"{common} 动作资产用剪影/线稿/动作人偶表达关键帧、重心、方向箭头；"
+            "不要可辨识陌生人脸，不要把动作板画成战斗海报。"
+        )
+    if "特效" in normalized or "effect" in normalized or "vfx" in normalized:
+        return (
+            f"{common} 特效资产只展示可复用光效层、粒子方向、强弱等级、透明叠加和触发点；"
+            "不要人物剧照、街景或单张战斗画面。"
+        )
+    if "音频" in normalized or "字幕" in normalized or "subtitle" in normalized:
+        return (
+            f"{common} 音频字幕资产必须是 9:16 安全区、字幕断句、时间码、对白/旁白/BGM/SFX 轨道板；"
+            "不得混入服装 Look 术语、播放器皮肤或角色写真。"
+        )
+    if "连续性" in normalized or "质检" in normalized or "qc" in normalized:
+        return (
+            f"{common} 连续性与质检资产必须是检查清单/流程图：Identity、Look、道具、场景、镜头、字幕、特效继承关系；"
+            "不要用失败案例图片或复杂剧情剧照。"
+        )
+    if "表演" in normalized or "节奏" in normalized or "style" in normalized:
+        return (
+            f"{common} 表演节奏资产必须是导演节奏板：情绪曲线、节拍、停顿、表演强度、镜头节奏；"
+            "不要普通人像写真或海报。"
+        )
+    return common
 
 
 def _visual_review_payload(review: RuntimeAssetVisualReview) -> Mapping[str, JsonValue]:

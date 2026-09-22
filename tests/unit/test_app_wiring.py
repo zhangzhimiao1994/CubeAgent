@@ -1369,6 +1369,19 @@ def test_asset_visual_review_policy_ignores_negated_background_pollution() -> No
     assert issues == ()
 
 
+def test_asset_visual_review_policy_rejects_negative_summary_even_when_passed() -> None:
+    passed, summary, issues = _apply_asset_visual_review_policy(
+        label="道具资产",
+        passed=True,
+        summary="道具设定板仍不满足要求，核心问题未修正，标签错位且文字乱码。",
+        issues=(),
+    )
+
+    assert passed is False
+    assert "仍不满足" in summary
+    assert any("不得将该资产自动判为通过" in issue for issue in issues)
+
+
 def test_asset_visual_review_prompt_treats_script_characters_as_fictional() -> None:
     prompt = _asset_visual_review_prompt(
         label="角色锁定资产：秦岚",

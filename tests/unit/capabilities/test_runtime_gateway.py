@@ -1663,6 +1663,26 @@ async def test_runtime_gateway_multimedia_visual_review_failure_preserves_asset_
     assert [request["label"] for request in visual_reviewer.requests] == ["角色锁定资产"]
 
 
+def test_visual_asset_retry_prompt_adds_character_identity_guardrails() -> None:
+    prompt = runtime_module._visual_asset_retry_prompt(
+        "生成林渊角色锁定资产。",
+        label="角色锁定资产：林渊",
+        review=RuntimeAssetVisualReview(
+            passed=False,
+            summary="角色锁定资产视觉审核失败",
+            issues=("出现具体背景，表情不是同一张脸。",),
+            confidence=0.8,
+        ),
+        next_attempt=2,
+    )
+
+    assert "纯白/浅灰/透明感纯色背景" in prompt
+    assert "单角色 Character Identity 参考表" in prompt
+    assert "正脸、左右45度、侧脸、半身、全身" in prompt
+    assert "不能出现街景、室内、雨景、战斗场面或其他角色" in prompt
+    assert "优先使用无文字图标、色块、箭头和结构化留白" in prompt
+
+
 async def test_runtime_gateway_multimedia_labels_must_match_artifact_prompts(
     tmp_path: Path,
 ) -> None:

@@ -2224,9 +2224,17 @@ def _apply_asset_visual_review_policy(
     summary: str,
     issues: tuple[str, ...],
 ) -> tuple[bool, str, tuple[str, ...]]:
-    if not passed or _is_scene_asset_label(label):
+    if not passed:
         return passed, summary, issues
     combined = " ".join((label, summary, *issues))
+    if _mentions_asset_review_rejection(combined):
+        policy_issue = "视觉审核摘要包含明确不合格信号；不得将该资产自动判为通过。"
+        if policy_issue not in issues:
+            issues = (*issues, policy_issue)
+        summary = summary or policy_issue
+        return False, summary, issues
+    if _is_scene_asset_label(label):
+        return passed, summary, issues
     if _mentions_concrete_background_pollution(combined):
         policy_issue = (
             "非场景类资产出现具体背景、桌面、室内/街景环境或背景污染；"
@@ -2242,6 +2250,31 @@ def _apply_asset_visual_review_policy(
 def _is_scene_asset_label(label: str) -> bool:
     normalized = label.strip().casefold()
     return "场景" in normalized or "scene" in normalized
+
+
+def _mentions_asset_review_rejection(text: str) -> bool:
+    normalized = text.casefold()
+    rejection_markers = (
+        "仍不满足",
+        "不满足",
+        "不合格",
+        "不符合",
+        "未实质修正",
+        "未修正",
+        "核心问题未修正",
+        "核心问题",
+        "不能作为",
+        "无法作为",
+        "违反",
+        "标签错位",
+        "标签不匹配",
+        "文字乱码",
+        "标签乱码",
+        "大量乱码",
+        "伪字",
+        "不可读",
+    )
+    return any(marker.casefold() in normalized for marker in rejection_markers)
 
 
 def _mentions_concrete_background_pollution(text: str) -> bool:
