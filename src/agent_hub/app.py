@@ -2253,7 +2253,7 @@ def _is_scene_asset_label(label: str) -> bool:
 
 
 def _mentions_asset_review_rejection(text: str) -> bool:
-    normalized = text.casefold()
+    normalized = _strip_resolved_asset_review_clauses(text.casefold())
     rejection_markers = (
         "仍不满足",
         "不满足",
@@ -2271,10 +2271,31 @@ def _mentions_asset_review_rejection(text: str) -> bool:
         "文字乱码",
         "标签乱码",
         "大量乱码",
-        "伪字",
-        "不可读",
+        "存在乱码",
+        "存在伪字",
+        "不可读字段",
     )
     return any(marker.casefold() in normalized for marker in rejection_markers)
+
+
+def _strip_resolved_asset_review_clauses(text: str) -> str:
+    risk_terms = (
+        "乱码",
+        "伪字",
+        "错位",
+        "不匹配",
+        "不可读",
+        "不满足",
+        "不符合",
+        "不合格",
+        "背景污染",
+    )
+    term_pattern = "|".join(re.escape(term.casefold()) for term in risk_terms)
+    resolved_clause = re.compile(
+        rf"[^。；;.!?\n]*(?:{term_pattern})[^。；;.!?\n]*"
+        rf"(?:已修复|已解决|未发现|无|没有|不存在|不再)[^。；;.!?\n]*"
+    )
+    return resolved_clause.sub("", text)
 
 
 def _mentions_concrete_background_pollution(text: str) -> bool:

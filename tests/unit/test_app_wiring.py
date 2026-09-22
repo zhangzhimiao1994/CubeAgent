@@ -1393,6 +1393,19 @@ def test_asset_visual_review_policy_rejects_negative_summary_even_when_passed() 
     assert any("不得将该资产自动判为通过" in issue for issue in issues)
 
 
+def test_asset_visual_review_policy_keeps_passed_summary_when_prior_issues_are_fixed() -> None:
+    passed, summary, issues = _apply_asset_visual_review_policy(
+        label="音频字幕资产",
+        passed=True,
+        summary="前一版的乱码/伪字、角色头像与服装色彩漂移问题已修复，整体贴合资产类别。",
+        issues=(),
+    )
+
+    assert passed is True
+    assert "已修复" in summary
+    assert issues == ()
+
+
 def test_asset_visual_review_prompt_treats_script_characters_as_fictional() -> None:
     prompt = _asset_visual_review_prompt(
         label="角色锁定资产：秦岚",
