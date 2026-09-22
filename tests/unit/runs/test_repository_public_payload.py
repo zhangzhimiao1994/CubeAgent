@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.repository import (
     _checkpoint_required_artifact_ids,
     _event_with_failure_diagnostic,
     _public_artifact_payload,
     _public_event_payload,
 )
-from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
 
 

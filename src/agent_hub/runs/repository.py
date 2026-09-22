@@ -1317,9 +1317,7 @@ class RunRepository:
                 raise TypeError("runtime checkpoint artifact registry is invalid")
         else:
             raw_registry = {}
-        registry_ids: list[UUID] = []
-        for artifact_id in _checkpoint_required_artifact_ids(checkpoint):
-            registry_ids.append(artifact_id)
+        registry_ids = list(_checkpoint_required_artifact_ids(checkpoint))
         if registry_ids:
             stored_ids = set(
                 await session.scalars(
