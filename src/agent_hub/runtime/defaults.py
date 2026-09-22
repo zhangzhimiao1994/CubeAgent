@@ -986,7 +986,7 @@ def _roles_for_media_pipeline_plan(
 
 def _request_negates_video_delivery(request: str) -> bool:
     text = request.casefold()
-    return any(
+    explicit_video_negation = any(
         term in text
         for term in (
             "不要生成视频",
@@ -994,6 +994,16 @@ def _request_negates_video_delivery(request: str) -> bool:
             "不生成视频",
             "暂时不要生成视频",
             "暂不生成视频",
+            "不要生成分镜",
+            "不用生成分镜",
+            "不生成分镜",
+            "暂时不要生成分镜",
+            "暂不生成分镜",
+            "不要剪辑",
+            "不用剪辑",
+            "不剪辑",
+            "暂时不要剪辑",
+            "暂不剪辑",
             "不要剪辑成片",
             "不用剪辑成片",
             "不剪辑成片",
@@ -1005,6 +1015,15 @@ def _request_negates_video_delivery(request: str) -> bool:
             "do not compose",
             "do not edit into final",
         )
+    )
+    if explicit_video_negation:
+        return True
+    video_stage_terms = ("分镜", "视频", "剪辑", "成片", "storyboard", "video", "clip", "edit")
+    negated_actions = ("不要", "不用", "不需要", "无需", "不生成", "暂时不要", "暂不", "do not", "don't", "no ")
+    return any(
+        any(negation in clause for negation in negated_actions)
+        and any(term in clause for term in video_stage_terms)
+        for clause in re.split(r"[,，。；;\n]|\bbut\b|\bhowever\b|但是|不过|但", text)
     )
 
 

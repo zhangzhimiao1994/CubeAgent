@@ -2503,6 +2503,54 @@ def test_script_to_image_request_generates_full_asset_pack_without_video_steps()
     assert "video_compositor" not in steps
 
 
+def test_provided_script_asset_only_request_does_not_expand_media_pipeline_plan() -> None:
+    roles = (
+        RoleAssignment(
+            id="asset_generator",
+            role="Asset Generator",
+            purpose=RolePurpose.EXECUTE,
+            mission="Generate the full locked production asset image pack.",
+            must_answer=("What asset sheets were produced?",),
+            allowed_tools=("generate_multimedia",),
+            forbidden_actions=("Do not generate video clips.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="minimax",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "以下剧本已确认，请按新短剧流程只执行资产拆解与资产图生成，"
+                "暂时不要生成分镜、视频或剪辑。必须生成全量专业资产图并停在用户审核："
+                "角色锁定资产每个主要角色单独一张；服装妆造资产；场景资产；"
+                "道具资产；动作资产；特效资产；镜头资产；表演节奏与风格锁定资产；"
+                "音频字幕资产；连续性与质检资产。剧本《霓虹龙脉》：雨夜的江城，"
+                "22岁的外卖员林渊送单到旧城区巷口。只完成资产图并等待我审核。"
+            ),
+            routing_decision={
+                "media_pipeline_plan": {
+                    "plan_id": "media-plan-provided-script-assets",
+                    "status": "planned",
+                },
+            },
+            token_budget=1000,
+        ),
+        capability_gateway=FakeCapabilityAvailability({"generate_multimedia", "compose_video"}),
+    )
+
+    steps = {step.agent: step for step in plan.steps}
+
+    assert list(steps) == ["asset_generator"]
+    assert steps["asset_generator"].depends_on == ()
+    assert "全量专业资产图" in steps["asset_generator"].task
+
+
 def test_dispatch_plan_generates_character_media_after_script_step() -> None:
     roles = (
         RoleAssignment(
