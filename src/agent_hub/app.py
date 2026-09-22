@@ -1027,6 +1027,8 @@ class _ConfigBackedContentStudioProductionProvider:
         durations = (3000, 7000, 12000, 12000, 10000, 10000, max(6000, target_ms - 54000))
         start = 0
         shots: list[Shot] = []
+        overlays: tuple[str, ...]
+        transitions: tuple[str, ...]
         if project.packs.style.name == "code_flow_pipeline":
             shot_types = (
                 "code_typing_hook",

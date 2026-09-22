@@ -78,7 +78,9 @@ def test_bundled_pack_registry_loads_mvp_packs_and_manifest_only_platform_extens
         "code stream, pipeline HUD, evidence cards, timeline panels, animated UI layers"
     )
     assert code_flow.style.settings["local_motion_seconds"] == [0.5, 1.5]
-    assert "single static poster" in code_flow.style.settings["forbidden_visuals"]
+    forbidden_visuals = code_flow.style.settings["forbidden_visuals"]
+    assert isinstance(forbidden_visuals, list)
+    assert "single static poster" in forbidden_visuals
 
 
 def test_manifest_only_platform_runs_through_timeline_with_pack_settings() -> None:
