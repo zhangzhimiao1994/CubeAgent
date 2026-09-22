@@ -1540,6 +1540,7 @@ def _checkpoint_required_artifact_ids(checkpoint: RuntimeCheckpoint) -> tuple[UU
     if not isinstance(registry, Mapping):
         return ()
     raw_roots = checkpoint.state.get("artifact_registry_roots")
+    raw_required_ids: tuple[object, ...]
     if raw_roots is None:
         raw_required_ids = tuple(registry)
         invalid_message = "runtime checkpoint artifact registry is invalid"
