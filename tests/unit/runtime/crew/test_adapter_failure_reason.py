@@ -1178,6 +1178,9 @@ async def test_multimedia_generator_direct_character_sheet_splits_gender_lead_pr
         assert "重复近景头像" in prompt_text
         assert "与角色设定无关的食物" in prompt_text
         assert "禁止写实主图+二次元表情+线稿三视图" in prompt_text
+        assert "Character Identity + Look / Costume + Pose + Scene + Shot Prompt" in prompt_text
+        assert "图内尽量不要写文字" in prompt_text
+        assert "文字说明放在结构化产物元数据里" in prompt_text
 
 
 async def test_multimedia_generator_direct_character_design_splits_gender_lead_prompts() -> None:
@@ -1261,6 +1264,26 @@ async def test_multimedia_generator_rejects_incomplete_character_sheet_count() -
             _context(request="为男女主生成角色参考设定表，风格全是写实")
         ):
             pass
+
+
+def test_character_sheet_prompt_separates_identity_and_look_without_in_image_text() -> None:
+    prompt = _direct_multimedia_generation_prompt(
+        _context(request="为女主生成角色参考设定表，风格全是二次元，不要太细节也不要太简化"),
+        DispatchStep(
+            id="multimedia_generator_step",
+            agent="multimedia_generator",
+            task="User task: 生成女主角色定妆资产图",
+            tools=("generate_multimedia",),
+            final_synthesizer=True,
+        ),
+        (),
+    )
+
+    assert "Character Identity + Look / Costume + Pose + Scene + Shot Prompt" in prompt
+    assert "Character Identity 负责这个人是谁" in prompt
+    assert "Look / Costume 只负责当前穿什么" in prompt
+    assert "图内尽量不要写文字" in prompt
+    assert "文字说明放在结构化产物元数据里" in prompt
 
 
 async def test_multimedia_generator_direct_person_reference_splits_each_script_role() -> None:
