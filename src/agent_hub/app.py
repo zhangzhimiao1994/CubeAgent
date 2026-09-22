@@ -2369,7 +2369,10 @@ def _parse_asset_visual_review_payload(raw_response: str | None) -> Mapping[str,
     try:
         payload = json.loads(normalized)
     except json.JSONDecodeError:
-        payload = _extract_json_object(normalized)
+        try:
+            payload = _extract_json_object(normalized)
+        except ValueError:
+            payload = _parse_asset_visual_review_text_response(normalized)
     if not isinstance(payload, Mapping):
         raise TypeError("visual asset review response is invalid")
     cleaned = dict(payload)
@@ -2395,6 +2398,66 @@ def _parse_asset_visual_review_payload(raw_response: str | None) -> Mapping[str,
     if not isinstance(confidence, int | float) or isinstance(confidence, bool):
         raise TypeError("visual asset review response is invalid")
     return cleaned
+
+
+def _parse_asset_visual_review_text_response(raw_response: str) -> Mapping[str, object]:
+    text = " ".join(raw_response.split())
+    if not text:
+        raise ValueError("visual asset review response is invalid")
+    normalized = text.casefold()
+    failed = any(
+        marker.casefold() in normalized
+        for marker in (
+            "不通过",
+            "未通过",
+            "不合格",
+            "不满足",
+            "不符合",
+            "不能作为",
+            "无法作为",
+            "拒绝",
+            "失败",
+        )
+    )
+    passed = any(
+        marker.casefold() in normalized
+        for marker in (
+            "通过",
+            "合格",
+            "符合",
+            "可以作为",
+            "可作为",
+        )
+    )
+    if not failed and not passed:
+        raise ValueError("visual asset review response is invalid")
+    issue_lines = [
+        line.strip(" -:：")
+        for line in raw_response.splitlines()
+        if any(
+            marker in line
+            for marker in (
+                "问题",
+                "缺少",
+                "不满足",
+                "不符合",
+                "不合格",
+                "失败",
+                "拒绝",
+                "乱码",
+                "伪字",
+                "背景",
+            )
+        )
+    ]
+    if failed and not issue_lines:
+        issue_lines = [text[:1000]]
+    return {
+        "passed": not failed and passed,
+        "summary": text[:1000],
+        "issues": issue_lines[:12],
+        "confidence": 0.5,
+    }
 
 
 def _extract_json_object(raw_response: str) -> object:

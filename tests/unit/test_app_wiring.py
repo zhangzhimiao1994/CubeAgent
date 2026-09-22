@@ -1021,6 +1021,17 @@ def test_parse_asset_visual_review_payload_accepts_common_model_type_drift() -> 
     }
 
 
+def test_parse_asset_visual_review_payload_accepts_plain_text_rejection() -> None:
+    payload = _parse_asset_visual_review_payload(
+        "结论：不通过。\n问题：画面像电影剧照，缺少角色三视图，且出现具体背景。"
+    )
+
+    assert payload["passed"] is False
+    assert "不通过" in payload["summary"]
+    assert payload["confidence"] == 0.5
+    assert payload["issues"] == ["问题：画面像电影剧照，缺少角色三视图，且出现具体背景。"]
+
+
 def test_visual_review_provider_priority_prefers_deepseek_then_qwen_then_minimax() -> None:
     def deployment(logical_model: str, provider_model: str) -> Deployment:
         return Deployment(
