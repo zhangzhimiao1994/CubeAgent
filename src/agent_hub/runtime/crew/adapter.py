@@ -92,6 +92,7 @@ _TASK_CANCELLATION_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_DEADLINE_SECONDS = 5.0
 _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS = 0.01
+_ARTIFACT_CLEANUP_RETURN_MARGIN_SECONDS = 0.005
 _RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS = 1.0
 _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
     _TASK_CANCELLATION_GRACE_SECONDS
@@ -7740,7 +7741,7 @@ class CrewDispatchRuntime:
         pending = {task for task in tasks if not task.done()}
         for task in pending:
             task.cancel()
-        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        remaining = self._cleanup_wait_timeout(deadline, reserve_margin=False)
         if pending and remaining:
             _, pending = await asyncio.wait(
                 pending,
@@ -7748,7 +7749,7 @@ class CrewDispatchRuntime:
             )
         for task in pending:
             task.cancel()
-        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        remaining = self._cleanup_wait_timeout(deadline, reserve_margin=True)
         if pending and remaining:
             _, pending = await asyncio.wait(pending, timeout=remaining)
         for task in tasks:
@@ -7759,6 +7760,13 @@ class CrewDispatchRuntime:
             self._cleanup_tasks.add(task)
             task.add_done_callback(self._finish_cleanup_task)
         return ordered_pending
+
+    @staticmethod
+    def _cleanup_wait_timeout(deadline: float, *, reserve_margin: bool) -> float:
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if reserve_margin:
+            remaining = max(0.0, remaining - _ARTIFACT_CLEANUP_RETURN_MARGIN_SECONDS)
+        return remaining
 
     async def _abort_frozen_artifact_writes(
         self,
