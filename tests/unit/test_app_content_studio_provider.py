@@ -133,8 +133,13 @@ async def test_content_studio_blocks_tts_when_script_contains_task_prompt(tmp_pa
 
     assert voiced.status is ProjectStatus.FAILED_BLOCKED
     assert multimedia.prompts == []
-    events = voiced.events  # type: ignore[attr-defined]
-    assert any(event.kind == "blocked" and event.stage == "voice_generation_failed" for event in events)
+    events = voiced.project_events
+    assert any(
+        event.kind == "stage_failed"
+        and event.stage == "blocked"
+        and (event.payload or {}).get("error_code") == "voice_generation_failed"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
