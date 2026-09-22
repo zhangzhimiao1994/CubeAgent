@@ -3,11 +3,13 @@ from __future__ import annotations
 from uuid import uuid4
 
 from agent_hub.runs.repository import (
+    _checkpoint_required_artifact_ids,
     _event_with_failure_diagnostic,
     _public_artifact_payload,
     _public_event_payload,
 )
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
 
 
 def test_public_artifact_payload_filters_generated_file_storage_key_recursively() -> None:
@@ -91,3 +93,40 @@ def test_failed_event_keeps_existing_diagnostic_payload() -> None:
     enriched = _event_with_failure_diagnostic(event)
 
     assert enriched.payload == {"error_code": "custom.error", "summary": "custom"}
+
+
+def test_checkpoint_required_artifact_ids_prefers_registry_roots() -> None:
+    root_id = uuid4()
+    external_source_id = uuid4()
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="crew",
+        runtime_version="7",
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISPATCH,
+        state={
+            "artifact_registry": {
+                str(root_id): "root-sha",
+                str(external_source_id): "external-source-sha",
+            },
+            "artifact_registry_roots": (str(root_id),),
+        },
+    )
+
+    assert _checkpoint_required_artifact_ids(checkpoint) == (root_id,)
+
+
+def test_checkpoint_required_artifact_ids_keeps_legacy_registry_behavior_without_roots() -> None:
+    root_id = uuid4()
+    checkpoint = RuntimeCheckpoint(
+        id=uuid4(),
+        runtime_type="crew",
+        runtime_version="6",
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISPATCH,
+        state={"artifact_registry": {str(root_id): "root-sha"}},
+    )
+
+    assert _checkpoint_required_artifact_ids(checkpoint) == (root_id,)

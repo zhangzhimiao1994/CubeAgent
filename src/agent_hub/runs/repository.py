@@ -1318,13 +1318,8 @@ class RunRepository:
         else:
             raw_registry = {}
         registry_ids: list[UUID] = []
-        for artifact_id in raw_registry:
-            if type(artifact_id) is not str:
-                raise RuntimeError("runtime checkpoint artifact registry is invalid")
-            try:
-                registry_ids.append(UUID(artifact_id))
-            except ValueError:
-                raise RuntimeError("runtime checkpoint artifact registry is invalid") from None
+        for artifact_id in _checkpoint_required_artifact_ids(checkpoint):
+            registry_ids.append(artifact_id)
         if registry_ids:
             stored_ids = set(
                 await session.scalars(
@@ -1540,6 +1535,30 @@ def _artifact_review_items(value: object) -> list[dict[str, str]]:
                 cleaned[field_name] = field_value.strip()[:500]
         items.append(cleaned)
     return items
+
+
+def _checkpoint_required_artifact_ids(checkpoint: RuntimeCheckpoint) -> tuple[UUID, ...]:
+    registry = checkpoint.state.get("artifact_registry")
+    if not isinstance(registry, Mapping):
+        return ()
+    raw_roots = checkpoint.state.get("artifact_registry_roots")
+    if raw_roots is None:
+        raw_required_ids = tuple(registry)
+        invalid_message = "runtime checkpoint artifact registry is invalid"
+    elif isinstance(raw_roots, (tuple, list)):
+        raw_required_ids = tuple(raw_roots)
+        invalid_message = "runtime checkpoint artifact registry roots are invalid"
+    else:
+        raise RuntimeError("runtime checkpoint artifact registry roots are invalid")
+    required_ids: list[UUID] = []
+    for artifact_id in raw_required_ids:
+        if type(artifact_id) is not str:
+            raise RuntimeError(invalid_message)
+        try:
+            required_ids.append(UUID(artifact_id))
+        except ValueError:
+            raise RuntimeError(invalid_message) from None
+    return tuple(required_ids)
 
 
 def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:
