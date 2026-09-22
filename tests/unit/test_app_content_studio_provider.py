@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.app import (
+    _asset_prompt_for_shot,
     _ConfigBackedContentStudioProductionProvider,
     _content_studio_research_bundle,
     _qc_report_from_media,
@@ -27,6 +28,7 @@ from agent_hub.content_studio import (
     ResearchQuestion,
     ScriptDraft,
     ScriptSegment,
+    Shot,
     Timeline,
     VoiceTrack,
 )
@@ -269,6 +271,28 @@ def test_render_request_splits_still_assets_into_short_visual_beats(tmp_path: Pa
     )
 
 
+def test_code_flow_asset_prompt_asks_for_layered_motion_elements_not_poster() -> None:
+    project = _voice_ready_project(style="code_flow_pipeline")
+    shot = Shot(
+        shot_id="SHOT001",
+        start_ms=0,
+        duration_ms=3000,
+        shot_type="code_typing_hook",
+        narration_segment_ids=("SEG001",),
+        asset_request_ids=("ASREQ001",),
+        overlay="motion: cursor typing + code stream + evidence cards",
+        transition="match cut",
+        safe_area="douyin_9_16_subtitle_safe",
+    )
+
+    prompt = _asset_prompt_for_shot(project, shot)
+
+    assert "code stream" in prompt
+    assert "layered motion-ready elements" in prompt
+    assert "Do not create a static poster" in prompt
+    assert "single flattened illustration" in prompt
+
+
 def test_timeline_uses_real_tts_duration_when_audio_file_is_available(tmp_path: Path) -> None:
     audio = tmp_path / "voice.wav"
     _write_demo_signal_wav(audio, seconds=3)
@@ -337,6 +361,7 @@ def _voice_ready_project(
     *,
     topic: str = "AIGC voice smoke",
     narration: tuple[str, ...] = ("AIGC 正在从一次性问答，变成能接进工作流的工具。",),
+    style: str = "fast_minimal",
 ):
     service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
     project = service.create_content_project(
@@ -347,7 +372,7 @@ def _voice_ready_project(
         format="explainer",
         platform="douyin",
         channel="ai_frontier",
-        style="fast_minimal",
+        style=style,
         execution_mode="production",
     )
     asset = AssetRecord(

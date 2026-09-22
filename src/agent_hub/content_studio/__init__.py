@@ -192,7 +192,39 @@ class PackRegistry:
                         "visual_language": "screen capture, cards, charts, concise motion",
                         "transition": "quick cut",
                     },
-                )
+                ),
+                "code_flow_pipeline": PackManifest(
+                    pack_type="style",
+                    name="code_flow_pipeline",
+                    version="1.0.0",
+                    schema_version="1.0",
+                    compatible_core=">=0.1",
+                    settings={
+                        "subtitle_style": "large safe-area captions over moving interface layers",
+                        "visual_language": (
+                            "code stream, pipeline HUD, evidence cards, timeline panels, animated UI layers"
+                        ),
+                        "transition": "match cut, cursor wipe, panel slide, data-flow line",
+                        "local_motion_seconds": [0.5, 1.5],
+                        "meaningful_change_seconds": [3, 5],
+                        "forbidden_visuals": [
+                            "single static poster",
+                            "long still-image hold",
+                            "unreadable fake UI paragraphs",
+                            "flattened collage pretending to be video",
+                        ],
+                        "motion_primitives": [
+                            "cursor typing",
+                            "code line highlight",
+                            "terminal log scroll",
+                            "pipeline node pulse",
+                            "evidence card slide-in",
+                            "timeline playhead sweep",
+                            "QC frame scan",
+                            "claim badge lock",
+                        ],
+                    },
+                ),
             },
         )
 
@@ -1212,6 +1244,7 @@ class ContentStudioService:
                 f"{aspect_ratio} {width}x{height}",
                 "subtitles required",
                 "meaningful visual change every 3-5 seconds",
+                str(project.packs.style.settings.get("visual_language", "")),
             ),
         )
         return _with_status(replace(project, content_plan=plan), ProjectStatus.PLAN_READY, "plan")
@@ -1282,13 +1315,22 @@ class ContentStudioService:
         fourth_ms = max(1000, int(target_ms * 0.28))
         used_ms = first_ms + second_ms + third_ms + fourth_ms
         fifth_ms = max(1000, target_ms - used_ms)
-        shots = (
-            Shot("SHOT001", 0, first_ms, "big_text_hook", ("SEG001",), ("ASREQ001",), "title", "cut", "subtitle_safe"),
-            Shot("SHOT002", first_ms, second_ms, "official_demo", ("SEG001",), ("ASREQ002",), "source badge", "cut", "subtitle_safe"),
-            Shot("SHOT003", first_ms + second_ms, third_ms, "screen_recording", ("SEG002",), ("ASREQ003",), "step labels", "cut", "subtitle_safe"),
-            Shot("SHOT004", first_ms + second_ms + third_ms, fourth_ms, "comparison_chart", ("SEG002",), ("ASREQ004",), "chart labels", "cut", "subtitle_safe"),
-            Shot("SHOT005", first_ms + second_ms + third_ms + fourth_ms, fifth_ms, "summary_card", ("SEG003",), ("ASREQ005",), "cta", "cut", "subtitle_safe"),
-        )
+        if project.packs.style.name == "code_flow_pipeline":
+            shots = (
+                Shot("SHOT001", 0, first_ms, "code_typing_hook", ("SEG001",), ("ASREQ001",), "motion: cursor typing + code line highlight + title lockup", "cursor wipe", "subtitle_safe"),
+                Shot("SHOT002", first_ms, second_ms, "pipeline_hud_flow", ("SEG001",), ("ASREQ002",), "motion: pipeline nodes pulse from Research to QC", "data-flow line", "subtitle_safe"),
+                Shot("SHOT003", first_ms + second_ms, third_ms, "evidence_card_stream", ("SEG002",), ("ASREQ003",), "motion: evidence cards slide in with claim badges", "panel slide", "subtitle_safe"),
+                Shot("SHOT004", first_ms + second_ms + third_ms, fourth_ms, "timeline_editor_flow", ("SEG002",), ("ASREQ004",), "motion: playhead sweep + layer tracks update", "match cut", "subtitle_safe"),
+                Shot("SHOT005", first_ms + second_ms + third_ms + fourth_ms, fifth_ms, "qc_scan_summary", ("SEG003",), ("ASREQ005",), "motion: frame scan boxes + final summary badge", "quick cut", "subtitle_safe"),
+            )
+        else:
+            shots = (
+                Shot("SHOT001", 0, first_ms, "big_text_hook", ("SEG001",), ("ASREQ001",), "title", "cut", "subtitle_safe"),
+                Shot("SHOT002", first_ms, second_ms, "official_demo", ("SEG001",), ("ASREQ002",), "source badge", "cut", "subtitle_safe"),
+                Shot("SHOT003", first_ms + second_ms, third_ms, "screen_recording", ("SEG002",), ("ASREQ003",), "step labels", "cut", "subtitle_safe"),
+                Shot("SHOT004", first_ms + second_ms + third_ms, fourth_ms, "comparison_chart", ("SEG002",), ("ASREQ004",), "chart labels", "cut", "subtitle_safe"),
+                Shot("SHOT005", first_ms + second_ms + third_ms + fourth_ms, fifth_ms, "summary_card", ("SEG003",), ("ASREQ005",), "cta", "cut", "subtitle_safe"),
+            )
         return _with_status(
             replace(project, storyboard=Storyboard(shots=shots)),
             ProjectStatus.STORYBOARD_READY,

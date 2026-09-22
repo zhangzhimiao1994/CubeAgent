@@ -27,7 +27,7 @@ def test_bundled_pack_registry_loads_mvp_packs_and_manifest_only_platform_extens
     assert set(registry.format_packs) == {"explainer", "news", "tutorial"}
     assert {"douyin", "xiaohongshu"} <= set(registry.platform_packs)
     assert set(registry.channel_packs) == {"ai_frontier"}
-    assert set(registry.style_packs) == {"fast_minimal"}
+    assert {"fast_minimal", "code_flow_pipeline"} <= set(registry.style_packs)
 
     locked = registry.lock(
         domain="aigc",
@@ -66,6 +66,19 @@ def test_bundled_pack_registry_loads_mvp_packs_and_manifest_only_platform_extens
     assert source_types["github.blog"] == "official_blog"
     assert source_types["arxiv.org"] == "paper"
     assert locked.domain.settings["default_license"] == "source_terms"
+
+    code_flow = registry.lock(
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="code_flow_pipeline",
+    )
+    assert code_flow.style.settings["visual_language"] == (
+        "code stream, pipeline HUD, evidence cards, timeline panels, animated UI layers"
+    )
+    assert code_flow.style.settings["local_motion_seconds"] == [0.5, 1.5]
+    assert "single static poster" in code_flow.style.settings["forbidden_visuals"]
 
 
 def test_manifest_only_platform_runs_through_timeline_with_pack_settings() -> None:

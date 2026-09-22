@@ -127,6 +127,33 @@ def test_qc_fails_when_still_visual_cadence_is_too_slow(tmp_path: Path) -> None:
     assert preview.qc.technical_passed is False
 
 
+def test_qc_fails_when_long_video_is_only_static_image_stack(tmp_path: Path) -> None:
+    image, audio = _media_files(tmp_path)
+    adapter = ContentStudioMediaAdapter(
+        runner=FakeMediaRunner(duration="12.000000"),
+        ffmpeg_binary="ffmpeg",
+        ffprobe_binary="ffprobe",
+    )
+
+    preview = adapter.render_preview(
+        _request(
+            image=image,
+            audio=audio,
+            duration_ms=12_000,
+            visuals=tuple(
+                VisualClip(f"VIS{index:03d}", image, "image/png", (index - 1) * 3000, 3000)
+                for index in range(1, 5)
+            ),
+        ),
+        tmp_path / "out",
+    )
+
+    motion = preview.qc.check("motion_design")
+    assert motion.status == "failed"
+    assert "图片堆积" in motion.details
+    assert preview.qc.technical_passed is False
+
+
 def test_final_render_requires_matching_approval(tmp_path: Path) -> None:
     image, audio = _media_files(tmp_path)
     runner = FakeMediaRunner()

@@ -1,0 +1,31 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "style",
+  "name": "code_flow_pipeline",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "subtitle_style": "large safe-area captions over moving interface layers",
+    "visual_language": "code stream, pipeline HUD, evidence cards, timeline panels, animated UI layers",
+    "transition": "match cut, cursor wipe, panel slide, data-flow line",
+    "local_motion_seconds": [0.5, 1.5],
+    "meaningful_change_seconds": [3, 5],
+    "forbidden_visuals": [
+      "single static poster",
+      "long still-image hold",
+      "unreadable fake UI paragraphs",
+      "flattened collage pretending to be video"
+    ],
+    "motion_primitives": [
+      "cursor typing",
+      "code line highlight",
+      "terminal log scroll",
+      "pipeline node pulse",
+      "evidence card slide-in",
+      "timeline playhead sweep",
+      "QC frame scan",
+      "claim badge lock"
+    ]
+  }
+}

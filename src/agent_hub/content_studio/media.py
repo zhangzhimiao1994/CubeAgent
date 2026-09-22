@@ -1031,6 +1031,7 @@ class ContentStudioMediaAdapter:
             _subtitle_text_review_check(request.timeline.subtitles),
             _claim_coverage_check(request.timeline.claims, request.timeline.subtitles),
             _visual_change_cadence_check(request.timeline),
+            _motion_design_check(request.timeline),
             frame_check,
             self._black_frame_check(artifact.path, request.timeout_seconds),
             self._silence_check(artifact.path, request.timeout_seconds),
@@ -1405,6 +1406,18 @@ def _visual_change_cadence_check(timeline: MediaTimeline) -> MediaQCCheck:
             "静态图片视觉节奏超过 5 秒，会呈现图片拉长/PPT 感: " + ", ".join(slow_stills),
         )
     return MediaQCCheck("visual_change_cadence", "passed", "静态图片视觉节奏符合 3-5 秒变化要求。")
+
+
+def _motion_design_check(timeline: MediaTimeline) -> MediaQCCheck:
+    if timeline.duration_ms <= 10_000:
+        return MediaQCCheck("motion_design", "passed", "短视频片段未触发长段动效结构检查。")
+    if timeline.visuals and all(clip.mime_type.startswith("image/") for clip in timeline.visuals):
+        return MediaQCCheck(
+            "motion_design",
+            "failed",
+            "整条长视频仅由静态图片堆积组成；需要录屏、视频片段、动态图形层或可动信息流镜头。",
+        )
+    return MediaQCCheck("motion_design", "passed", "视觉轨包含非静态图片素材或动态图形来源。")
 
 
 __all__ = [

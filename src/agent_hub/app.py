@@ -964,6 +964,7 @@ class _ConfigBackedContentStudioProductionProvider:
                 "subtitles required",
                 "plain-language science explainer",
                 "meaningful visual change every 3-5 seconds",
+                str(project.packs.style.settings.get("visual_language", "")),
             ),
         )
         return _content_studio_status(replace(project, content_plan=plan), ProjectStatus.PLAN_READY, "plan")
@@ -1026,15 +1027,46 @@ class _ConfigBackedContentStudioProductionProvider:
         durations = (3000, 7000, 12000, 12000, 10000, 10000, max(6000, target_ms - 54000))
         start = 0
         shots: list[Shot] = []
-        shot_types = (
-            "big_text_hook",
-            "workflow_diagram",
-            "official_source_cards",
-            "screen_recording_style_demo",
-            "risk_checklist",
-            "comparison_chart",
-            "summary_card",
-        )
+        if project.packs.style.name == "code_flow_pipeline":
+            shot_types = (
+                "code_typing_hook",
+                "pipeline_hud_flow",
+                "evidence_card_stream",
+                "screen_recording_style_demo",
+                "timeline_editor_flow",
+                "qc_scan_summary",
+                "claim_badge_summary",
+            )
+            overlays = (
+                "motion: cursor typing + code stream + key phrase lockup",
+                "motion: pipeline nodes pulse from research to render",
+                "motion: evidence cards slide in with source badges",
+                "motion: terminal log scroll + demo cursor path",
+                "motion: timeline playhead sweep + track layers update",
+                "motion: QC frame scan boxes + issue badges",
+                "motion: claim badge lock + final summary card",
+            )
+            transitions = (
+                "cursor wipe",
+                "data-flow line",
+                "panel slide",
+                "match cut",
+                "timeline sweep",
+                "scan wipe",
+                "quick cut",
+            )
+        else:
+            shot_types = (
+                "big_text_hook",
+                "workflow_diagram",
+                "official_source_cards",
+                "screen_recording_style_demo",
+                "risk_checklist",
+                "comparison_chart",
+                "summary_card",
+            )
+            overlays = ("safe subtitles + source/step label",) * len(shot_types)
+            transitions = ("cut",) * len(shot_types)
         segment_ids = tuple(segment.segment_id for segment in project.script.segments)
         for index, duration in enumerate(durations, start=1):
             shots.append(
@@ -1045,8 +1077,8 @@ class _ConfigBackedContentStudioProductionProvider:
                     shot_type=shot_types[index - 1],
                     narration_segment_ids=segment_ids[max(0, min(len(segment_ids) - 1, index - 1)): max(1, min(len(segment_ids), index))],
                     asset_request_ids=(f"ASREQ{index:03d}",),
-                    overlay="safe subtitles + source/step label",
-                    transition="cut",
+                    overlay=overlays[index - 1],
+                    transition=transitions[index - 1],
                     safe_area="douyin_9_16_subtitle_safe",
                 )
             )
@@ -1715,6 +1747,24 @@ def _fallback_plain_script(project: ContentProject) -> ScriptDraft:
 
 def _asset_prompt_for_shot(project: ContentProject, shot: Shot) -> str:
     script_text = " ".join(project.script.subtitle_lines) if project.script else project.topic
+    style_language = str(project.packs.style.settings.get("visual_language", "")).strip()
+    if project.packs.style.name == "code_flow_pipeline":
+        motion_primitives = project.packs.style.settings.get("motion_primitives", ())
+        if isinstance(motion_primitives, (list, tuple)):
+            motion_text = ", ".join(str(item) for item in motion_primitives[:8])
+        else:
+            motion_text = str(motion_primitives)
+        return (
+            "Create vertical 9:16 motion-ready source art for a Douyin AIGC explainer video. "
+            "The result must be layered motion-ready elements, not a final poster: separate code stream, "
+            "pipeline HUD, evidence cards, timeline panels, subtitles-safe overlay zones, and clean UI chrome. "
+            "Do not create a static poster, single flattened illustration, long still-image hold, fake unreadable UI text, "
+            "or a collage pretending to be video. "
+            f"Visual language: {style_language}. Motion primitives to support: {motion_text}. "
+            f"Topic: {project.topic}. Shot: {shot.shot_id} {shot.shot_type}. "
+            f"Narration context: {script_text[:900]}. Overlay and motion direction: {shot.overlay}. "
+            "Resolution target 1080x1920, clean high-contrast code/information-flow look, safe area for captions."
+        )
     return (
         "Create a clean vertical 9:16 visual asset for a Douyin AIGC explainer video. "
         "Use minimal, readable Chinese UI-card style, no fake unreadable paragraphs, no celebrity faces, "

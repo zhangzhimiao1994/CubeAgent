@@ -560,6 +560,36 @@ def test_plan_storyboard_and_timeline_use_locked_platform_settings() -> None:
     assert timeline_ready.timeline.duration_ms == 45000
 
 
+def test_code_flow_pipeline_storyboard_requires_motion_language_not_static_image_stack() -> None:
+    service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
+    project = service.create_content_project(
+        title="Code flow video",
+        topic="Explain how AIGC agents keep identity consistent in AI video production",
+        source_urls=("https://example.com/docs",),
+        domain="aigc",
+        format="explainer",
+        platform="douyin",
+        channel="ai_frontier",
+        style="code_flow_pipeline",
+        execution_mode="demo",
+    )
+
+    service.run_content_project(project.project_id, until=ProjectStatus.SCRIPT_READY)
+    service.approve_script(project.project_id)
+    storyboard_ready = service.run_content_project(project.project_id, until=ProjectStatus.STORYBOARD_READY)
+
+    assert storyboard_ready.storyboard is not None
+    shot_types = {shot.shot_type for shot in storyboard_ready.storyboard.shots}
+    assert {
+        "code_typing_hook",
+        "pipeline_hud_flow",
+        "evidence_card_stream",
+        "timeline_editor_flow",
+    }.issubset(shot_types)
+    assert all("motion:" in shot.overlay for shot in storyboard_ready.storyboard.shots)
+    assert all("static poster" not in shot.overlay.casefold() for shot in storyboard_ready.storyboard.shots)
+
+
 def test_final_approval_requires_existing_clean_preview_and_final_render_is_separate() -> None:
     service = ContentStudioService(registry=PackRegistry.mvp(), store=InMemoryContentProjectStore())
     project = service.create_content_project(
