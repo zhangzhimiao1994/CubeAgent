@@ -91,6 +91,40 @@ class FakeGateway:
             raise
 
 
+class FlakyEmptyResponseGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            raise ModelGatewayError("model response text is empty")
+        return GatewayCompletion(
+            response=ModelResponse(text="Recovered answer.", usage=TokenUsage(10, 4, 14)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="qwen",
+            provider_model="qwen/qwen-plus",
+        )
+
+
+class EmptyThenFallbackGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if request.logical_model == "qwen":
+            raise ModelGatewayError("model response text is empty")
+        return GatewayCompletion(
+            response=ModelResponse(text="Fallback answer.", usage=TokenUsage(10, 4, 14)),
+            deployment_id="backup",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-chat",
+        )
+
+
 def context(**changes: object) -> TaskContext:
     values: dict[str, object] = {
         "run_id": RUN_ID,
@@ -857,6 +891,70 @@ async def test_gateway_configuration_failure_uses_safe_diagnostic() -> None:
 
     assert str(caught.value) == "model gateway failed: model configuration failed"
     assert "credential" not in str(caught.value)
+
+
+async def test_direct_retries_retryable_empty_gateway_response_once() -> None:
+    gateway = FlakyEmptyResponseGateway()
+    runtime = DirectRuntime(gateway, logical_model="qwen")
+
+    events = await collect(runtime, context(request="普通聊天问题"))
+
+    assert len(gateway.requests) == 2
+    second_messages = gateway.requests[1].messages
+    assert len(second_messages) == len(gateway.requests[0].messages) + 1
+    assert "previous model response was empty" in str(second_messages[-1].content).casefold()
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "main_agent"
+    assert retry.step_id == "direct_model_call"
+    assert retry.reason == "model gateway failed: model response text is empty"
+    assert retry.payload["strategy"] == "empty_response_retry"
+    artifact = next(event.artifact for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact is not None
+    assert artifact.content["text"] == "Recovered answer."
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_direct_fails_after_retryable_empty_gateway_response_repeats() -> None:
+    gateway = FakeGateway(ModelGatewayError("model response text is empty"))
+    runtime = DirectRuntime(gateway, logical_model="qwen")
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        await collect(runtime, context(request="普通聊天问题"))
+
+    assert str(caught.value) == "model gateway failed: model response text is empty"
+    assert len(gateway.requests) == 2
+    second_messages = gateway.requests[1].messages
+    assert len(second_messages) == len(gateway.requests[0].messages) + 1
+    assert "previous model response was empty" in str(second_messages[-1].content).casefold()
+    with pytest.raises(RuntimeExecutionError, match="boundary"):
+        await runtime.save_checkpoint()
+
+
+async def test_direct_degrades_to_fallback_model_after_empty_response_retry_is_exhausted() -> None:
+    gateway = EmptyThenFallbackGateway()
+    runtime = DirectRuntime(gateway, logical_model="qwen", fallback_logical_models=("backup",))
+
+    events = await collect(runtime, context(request="普通聊天问题"))
+
+    assert [request.logical_model for request in gateway.requests] == [
+        "qwen",
+        "qwen",
+        "backup",
+    ]
+    model_fallback = next(
+        event
+        for event in events
+        if event.kind is EventKind.STEP_RETRYING
+        and event.payload["strategy"] == "empty_response_model_fallback"
+    )
+    assert model_fallback.payload["from_logical_model"] == "qwen"
+    assert model_fallback.payload["to_logical_model"] == "backup"
+    artifact = next(event.artifact for event in events if event.kind is EventKind.ARTIFACT_CREATED)
+    assert artifact is not None
+    assert artifact.content["text"] == "Fallback answer."
+    assert artifact.provenance is not None
+    assert artifact.provenance.logical_model == "backup"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_invalid_model_text_is_redacted() -> None:

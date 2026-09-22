@@ -169,8 +169,34 @@ async def test_discussion_gateway_transport_failure_records_safe_diagnostic() ->
 
     events = await collect(AutoGenDiscussionRuntime(FailingGateway([]), plan()), context())
 
+    completed = next(event for event in events if event.kind == "discussion.completed")
+    assert "讨论阶段未能完成" in completed.payload["summary"]
+    assert completed.payload["reason"] == "model gateway failed: model transport failed (status=401)"
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
+    assert len(terminal_events(events)) == 1
+
+
+async def test_discussion_retries_empty_model_response_before_failing() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("", 1, Decimal("0.01")),
+            ("analyst", 1, Decimal("0.01")),
+            ("Facts are A.", 2, Decimal("0.01")),
+            ("critic", 1, Decimal("0.01")),
+            ("[COMPLETE] Facts are verified.", 2, Decimal("0.01")),
+        ]
+    )
+
+    events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+    assert "previous model response was empty" in str(gateway.requests[1].messages[-1].content).casefold()
+    assert [event.actor for event in events if event.kind is EventKind.MESSAGE_CREATED] == [
+        "analyst",
+        "critic",
+    ]
 
 
 async def test_participants_can_use_different_logical_models() -> None:
@@ -249,6 +275,26 @@ async def test_consensus_requires_distinct_participants() -> None:
     )
     events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
     assert events[-1].reason == "consensus"
+    assert len(terminal_events(events)) == 1
+
+
+async def test_negative_consensus_stops_with_stable_rejection_reason() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("analyst", 1, Decimal(0)),
+            ("[CONSENSUS] 不通过——产物被截断，拒绝放行，需要退回重新生成。", 1, Decimal(0)),
+            ("critic", 1, Decimal(0)),
+            ("[CONSENSUS] 不通过——剧本不完整，拒绝放行。", 1, Decimal(0)),
+        ]
+    )
+
+    events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+    assert completed.payload["reason"] == "negative_consensus"
+    assert completed.payload["consensus_verdict"] == "revise"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "negative_consensus"
     assert len(terminal_events(events)) == 1
 
 

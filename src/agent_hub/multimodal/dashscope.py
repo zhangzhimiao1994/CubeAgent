@@ -30,6 +30,7 @@ class DashScopeMultimediaGenerationClient:
         timeout_seconds: float = 60,
         poll_interval_seconds: float = 5,
         max_polls: int = 120,
+        image_max_polls: int = 72,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -37,10 +38,13 @@ class DashScopeMultimediaGenerationClient:
             raise ValueError("poll_interval_seconds must be nonnegative")
         if max_polls <= 0:
             raise ValueError("max_polls must be positive")
+        if image_max_polls <= 0:
+            raise ValueError("image_max_polls must be positive")
         self._transport = transport
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._max_polls = max_polls
+        self._image_max_polls = image_max_polls
 
     async def generate_text_to_image(
         self,
@@ -150,27 +154,32 @@ class DashScopeMultimediaGenerationClient:
         aspect_ratio: str,
         resolution: str,
     ) -> str:
-        response = await client.post(
-            _service_url(api_base, "image-generation/generation"),
-            headers=_headers(api_key),
-            json={
-                "model": model,
-                "input": {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [{"text": prompt}],
-                        }
-                    ]
+        try:
+            response = await client.post(
+                _service_url(api_base, "image-generation/generation"),
+                headers=_headers(api_key),
+                json={
+                    "model": model,
+                    "input": {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [{"text": prompt}],
+                            }
+                        ]
+                    },
+                    "parameters": {
+                        "n": 1,
+                        "aspect_ratio": aspect_ratio,
+                        "resolution": resolution,
+                        "watermark": False,
+                    },
                 },
-                "parameters": {
-                    "n": 1,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "watermark": False,
-                },
-            },
-        )
+            )
+        except httpx.TimeoutException as error:
+            raise _timeout_error("DashScope image submit timed out", error) from error
+        except httpx.TransportError as error:
+            raise _transport_error("DashScope image submit transport failed", error) from error
         payload = _json_object(response, "DashScope image submit failed")
         _raise_for_provider_failure(payload, "DashScope image submit failed")
         return _task_id(payload, "DashScope image submit response missing task_id")
@@ -186,21 +195,26 @@ class DashScopeMultimediaGenerationClient:
         duration: int,
         mode: str,
     ) -> str:
-        response = await client.post(
-            _service_url(api_base, "video-generation/video-synthesis"),
-            headers=_headers(api_key),
-            json={
-                "model": model,
-                "input": {"prompt": prompt},
-                "parameters": {
-                    "mode": mode,
-                    "aspect_ratio": "16:9",
-                    "duration": duration,
-                    "audio": False,
-                    "watermark": False,
+        try:
+            response = await client.post(
+                _service_url(api_base, "video-generation/video-synthesis"),
+                headers=_headers(api_key),
+                json={
+                    "model": model,
+                    "input": {"prompt": prompt},
+                    "parameters": {
+                        "mode": mode,
+                        "aspect_ratio": "16:9",
+                        "duration": duration,
+                        "audio": False,
+                        "watermark": False,
+                    },
                 },
-            },
-        )
+            )
+        except httpx.TimeoutException as error:
+            raise _timeout_error("DashScope video submit timed out", error) from error
+        except httpx.TransportError as error:
+            raise _transport_error("DashScope video submit transport failed", error) from error
         payload = _json_object(response, "DashScope video submit failed")
         _raise_for_provider_failure(payload, "DashScope video submit failed")
         return _task_id(payload, "DashScope video submit response missing task_id")
@@ -213,7 +227,13 @@ class DashScopeMultimediaGenerationClient:
         api_key: str,
         task_id: str,
     ) -> str:
-        payload = await self._poll(client, api_base=api_base, api_key=api_key, task_id=task_id)
+        payload = await self._poll(
+            client,
+            api_base=api_base,
+            api_key=api_key,
+            task_id=task_id,
+            max_polls=self._image_max_polls,
+        )
         output = _mapping(payload.get("output"), "DashScope image query response missing output")
         choices = output.get("choices")
         if not isinstance(choices, list):
@@ -252,9 +272,16 @@ class DashScopeMultimediaGenerationClient:
         api_base: str,
         api_key: str,
         task_id: str,
+        max_polls: int | None = None,
     ) -> dict[str, Any]:
-        for attempt in range(self._max_polls):
-            response = await client.get(_task_url(api_base, task_id), headers=_headers(api_key))
+        poll_limit = max_polls if max_polls is not None else self._max_polls
+        for attempt in range(poll_limit):
+            try:
+                response = await client.get(_task_url(api_base, task_id), headers=_headers(api_key))
+            except httpx.TimeoutException as error:
+                raise _timeout_error("DashScope task query timed out", error) from error
+            except httpx.TransportError as error:
+                raise _transport_error("DashScope task query transport failed", error) from error
             payload = _json_object(response, "DashScope task query failed")
             _raise_for_provider_failure(payload, "DashScope task query failed")
             output = _mapping(payload.get("output"), "DashScope task query response missing output")
@@ -270,7 +297,7 @@ class DashScopeMultimediaGenerationClient:
                     f"DashScope task failed: {safe_message}",
                     provider_code=safe_code,
                 )
-            if attempt < self._max_polls - 1 and self._poll_interval_seconds:
+            if attempt < poll_limit - 1 and self._poll_interval_seconds:
                 await asyncio.sleep(self._poll_interval_seconds)
         raise DashScopeGenerationError("DashScope task polling timed out")
 
@@ -284,7 +311,12 @@ class DashScopeMultimediaGenerationClient:
         default_suffix: str,
         default_mime_type: str,
     ) -> tuple[Path, str]:
-        response = await client.get(media_url)
+        try:
+            response = await client.get(media_url)
+        except httpx.TimeoutException as error:
+            raise _timeout_error("DashScope media download timed out", error) from error
+        except httpx.TransportError as error:
+            raise _transport_error("DashScope media download transport failed", error) from error
         if response.status_code >= 400:
             raise DashScopeGenerationError("DashScope media download failed")
         content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
@@ -361,6 +393,20 @@ def _json_object(response: httpx.Response, message: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise DashScopeGenerationError(f"{message}: malformed JSON")
     return payload
+
+
+def _timeout_error(message: str, error: httpx.TimeoutException) -> DashScopeGenerationError:
+    return DashScopeGenerationError(
+        f"{message}: {type(error).__name__}",
+        provider_code="timeout",
+    )
+
+
+def _transport_error(message: str, error: httpx.TransportError) -> DashScopeGenerationError:
+    return DashScopeGenerationError(
+        f"{message}: {type(error).__name__}",
+        provider_code="transport_error",
+    )
 
 
 def _raise_for_provider_failure(payload: Mapping[str, Any], message: str) -> None:

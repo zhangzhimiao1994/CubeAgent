@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import cast
@@ -18,6 +19,7 @@ from agent_hub.runtime.crew.adapter import (
     CrewLLMBridge,
     CrewObjectFactory,
     CrewTaskDefinition,
+    _requires_final_attachment_tool,
     _tool_definitions,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -177,6 +179,44 @@ class SuccessfulProjectZipCapabilities:
         return name == "project.generate_zip"
 
 
+class SlowDirectMultimediaCapabilities:
+    async def default_logical_model_for_multimedia(self, *, kind: str) -> str:
+        del kind
+        return "kilin-ima"
+
+    async def execute(  # type: ignore[no-untyped-def]
+        self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+    ):
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        await asyncio.sleep(1)
+        return {
+            "kind": "image",
+            "logical_model": "kilin-ima",
+            "status": "succeeded",
+            "summary": "Generated image artifact.",
+            "artifacts": (),
+            "presentation": "final_attachment",
+        }
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "generate_multimedia"
+
+
+class SensitiveFailingDirectMultimediaCapabilities:
+    async def default_logical_model_for_multimedia(self, *, kind: str) -> str:
+        del kind
+        return "kilin-ima"
+
+    async def execute(  # type: ignore[no-untyped-def]
+        self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+    ):
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        raise RuntimeError("provider rejected Authorization header")
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "generate_multimedia"
+
+
 class FastGeneration:
     async def execute(
         self,
@@ -229,6 +269,34 @@ def _one_step_plan(*, tools: tuple[str, ...]) -> DispatchPlan:
         ),
         allowed_tools=tools,
         total_token_budget=100,
+    )
+
+
+def _direct_multimedia_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="asset_generator",
+                role="Asset Generator",
+                goal="Generate image assets",
+                logical_model="deepseek-mutil",
+                allowed_tools=("generate_multimedia",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="asset_generator_step",
+                agent="asset_generator",
+                task="生成角色资产图和设定板",
+                tools=("generate_multimedia",),
+                final_synthesizer=True,
+                token_budget=100,
+                timeout_seconds=0.01,
+            ),
+        ),
+        allowed_tools=("generate_multimedia",),
+        total_token_budget=100,
+        total_timeout_seconds=1,
     )
 
 
@@ -351,6 +419,58 @@ def test_multimedia_tool_definition_exposes_strict_generation_contract() -> None
     assert isinstance(prompt, Mapping)
     assert prompt["type"] == "string"
     assert prompt["minLength"] == 1
+    artifact_count = properties["artifact_count"]
+    assert isinstance(artifact_count, Mapping)
+    assert artifact_count["type"] == "integer"
+    assert artifact_count["minimum"] == 1
+    assert artifact_count["maximum"] == 24
+    artifact_prompts = properties["artifact_prompts"]
+    assert isinstance(artifact_prompts, Mapping)
+    assert artifact_prompts["type"] == "array"
+    assert artifact_prompts["minItems"] == 1
+    assert artifact_prompts["maxItems"] == 24
+    artifact_labels = properties["artifact_labels"]
+    assert isinstance(artifact_labels, Mapping)
+    assert artifact_labels["type"] == "array"
+    assert artifact_labels["minItems"] == 1
+    assert artifact_labels["maxItems"] == 24
+
+
+def test_compose_video_tool_definition_exposes_strict_clip_contract() -> None:
+    tool = _tool_definitions(("compose_video",))[0]
+
+    assert tool.name == "compose_video"
+    assert "compose_video" in tool.description
+    assert "downloadable MP4" in tool.description
+    assert tool.parameters["type"] == "object"
+    assert tool.parameters["additionalProperties"] is False
+    required = tool.parameters["required"]
+    assert isinstance(required, tuple)
+    assert required == ("title", "clips")
+    properties = tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    assert set(properties) == {
+        "title",
+        "filename",
+        "aspect_ratio",
+        "image_duration_seconds",
+        "presentation",
+        "clips",
+    }
+    assert properties["aspect_ratio"] == {
+        "type": "string",
+        "enum": ("original", "16:9", "9:16"),
+        "description": "Output aspect ratio normalization.",
+    }
+    clips = properties["clips"]
+    assert isinstance(clips, Mapping)
+    assert clips["type"] == "array"
+    assert clips["minItems"] == 1
+    assert clips["maxItems"] == 32
+
+
+def test_compose_video_is_required_final_attachment_tool() -> None:
+    assert _requires_final_attachment_tool(("compose_video",)) is True
 
 
 async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
@@ -375,6 +495,52 @@ async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
     assert failed.payload["error_code"] == "capability.execution_failed"
 
 
+async def test_direct_multimedia_timeout_event_names_tool_and_asset_batch() -> None:
+    runtime = CrewDispatchRuntime(
+        TextOnlyGateway(),
+        _direct_multimedia_plan(),
+        capability_gateway=SlowDirectMultimediaCapabilities(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(CapabilityOutcomeUncertain, match="generate_multimedia timed out"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed.reason == (
+        "capability failed: generate_multimedia timed out while generating image assets "
+        "with kilin-ima"
+    )
+    assert failed.payload["error_code"] == "capability.provider_timeout"
+    assert failed.payload["capability_name"] == "generate_multimedia"
+    assert failed.payload["kind"] == "image"
+    assert failed.payload["logical_model"] == "kilin-ima"
+
+
+async def test_direct_multimedia_failure_keeps_safe_context_when_reason_is_redacted() -> None:
+    runtime = CrewDispatchRuntime(
+        TextOnlyGateway(),
+        _direct_multimedia_plan(),
+        capability_gateway=SensitiveFailingDirectMultimediaCapabilities(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(CapabilityOutcomeUncertain, match="RuntimeError"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed.reason == "capability failed: capability execution failed (RuntimeError)"
+    assert failed.payload["error_summary"] == failed.reason
+    assert failed.payload["capability_name"] == "generate_multimedia"
+    assert failed.payload["kind"] == "image"
+    assert failed.payload["logical_model"] == "kilin-ima"
+    assert failed.payload["artifact_count"] == 1
+
+
 async def test_final_attachment_tool_result_completes_without_extra_tool_rounds() -> None:
     gateway = RepeatingProjectZipGateway()
     runtime = CrewDispatchRuntime(
@@ -392,6 +558,37 @@ async def test_final_attachment_tool_result_completes_without_extra_tool_rounds(
         EventKind.TOOL_COMPLETED,
     ]
     assert len(gateway.requests) == 1
+
+
+async def test_step_prompt_includes_requested_plugin_context() -> None:
+    gateway = TextOnlyGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=()),
+        crew_factory=FastFactory(),
+    )
+    context = TaskContext(
+        run_id=RUN_ID,
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="Compare $plugin:runway and local video generation.",
+        token_budget=1000,
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    events = [event async for event in runtime.run(context)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 1
+    serialized = "\n".join(
+        str(message.content)
+        for request in gateway.requests
+        for message in request.messages
+    )
+    assert "requested_plugin_context" in serialized
+    assert "runway" in serialized
+    assert "higgsfield" in serialized
+    assert "not proof" in serialized
 
 
 @pytest.mark.parametrize(

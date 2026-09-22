@@ -192,7 +192,7 @@ def test_compaction_preserves_unresolved_approvals_and_current_constraints() -> 
     artifact = ContextCompactor().compact(
         ContextBuildInput(
             system_policy="system",
-            current_user_request="request",
+            current_user_request="当前用户明确要求：继续普通对话，不要创建计划。",
             unresolved_approvals=("approval-1",),
             current_constraints=("never publish without approval",),
             recent_transcript=("old detail",),
@@ -204,15 +204,17 @@ def test_compaction_preserves_unresolved_approvals_and_current_constraints() -> 
     assert artifact.version == 1
     text = artifact.content["text"]
     assert isinstance(text, str)
+    assert "CURRENT_USER_REQUEST: 当前用户明确要求：继续普通对话，不要创建计划。" in text
+    assert artifact.content["current_user_request"] == "当前用户明确要求：继续普通对话，不要创建计划。"
     assert "approval-1" in text
     assert "never publish without approval" in text
 
 
-def test_compaction_never_truncates_unresolved_approvals_or_constraints() -> None:
+def test_compaction_never_truncates_current_request_approvals_or_constraints() -> None:
     artifact = ContextCompactor().compact(
         ContextBuildInput(
             system_policy="system",
-            current_user_request="request",
+            current_user_request="current-request-critical",
             unresolved_approvals=("approval-critical",),
             current_constraints=("constraint-critical",),
             recent_transcript=("x" * 1000,),
@@ -221,6 +223,7 @@ def test_compaction_never_truncates_unresolved_approvals_or_constraints() -> Non
     )
     text = artifact.content["text"]
     assert isinstance(text, str)
+    assert "current-request-critical" in text
     assert "approval-critical" in text
     assert "constraint-critical" in text
 

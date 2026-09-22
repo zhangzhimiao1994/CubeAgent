@@ -47,3 +47,21 @@ def test_discussion_task_text_truncates_large_artifact_text_for_capacity_estimat
     assert "[truncated:" in task_text
     assert len(task_text.encode("utf-8")) < len(original_text.encode("utf-8"))
     assert artifact.content["text"] == original_text
+
+
+def test_discussion_task_text_includes_requested_plugin_context() -> None:
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DISCUSS,
+        request="比较 $plugin:runway 和本地视频生成效果。",
+        artifacts=(),
+        routing_decision={"requested_plugins": "runway,higgsfield"},
+    )
+
+    task_text = AutoGenDiscussionRuntime._task_text(context)
+
+    assert "REQUESTED_PLUGIN_CONTEXT" in task_text
+    assert "runway" in task_text
+    assert "higgsfield" in task_text
+    assert "Never claim a plugin was used" in task_text

@@ -7,6 +7,7 @@ import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { CollaborationPage } from "../pages/CollaborationPage";
 import { ConfigPage } from "../pages/ConfigPage";
+import { ContentStudioPage } from "../pages/ContentStudioPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
 import { MainAgentPage } from "../pages/MainAgentPage";
@@ -56,6 +57,7 @@ export function AppRoutes() {
         <Route path="multimedia" element={<Navigate to="/models" replace />} />
         <Route path="attachments" element={<AttachmentsPage />} />
         <Route path="collaboration" element={<CollaborationPage />} />
+        <Route path="content-studio" element={<ContentStudioPage />} />
         <Route path="agents" element={<Navigate to="/collaboration?section=roles" replace />} />
         <Route path="workflows" element={<Navigate to="/collaboration?section=workflows" replace />} />
         <Route path="schedules" element={<SchedulesPage />} />

@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -11,6 +11,7 @@ import pytest
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
 
+import agent_hub.app as app_module
 from agent_hub.api.routers.admin import (
     InMemoryAdminResourceService,
     MainAgentConfigResponse,
@@ -18,10 +19,15 @@ from agent_hub.api.routers.admin import (
     ModelDeploymentResponse,
 )
 from agent_hub.app import (
+    _apply_asset_visual_review_policy,
+    _asset_visual_review_prompt,
+    _ConfigBackedAssetVisualReviewer,
     _ConfigBackedMultimediaGenerationExecutor,
     _infer_main_agent_context_window_tokens,
     _MainAgentContextWindowGetter,
     _MainAgentModeRouter,
+    _parse_asset_visual_review_payload,
+    _visual_review_provider_priority,
     _web_ui_response,
     create_app,
 )
@@ -31,10 +37,15 @@ from agent_hub.channels.feishu.media_factory import build_feishu_media_service_f
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.channels.feishu.websocket import FeishuWebSocketClient
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.capacity import CapacityLease
-from agent_hub.models.gateway import CapacityController
+from agent_hub.models.capacity import CapacityLease, CapacityUnavailable
+from agent_hub.models.gateway import CapacityController, ModelGatewayError
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.multimodal.audio_providers import (
+    GeneratedAudioArtifact,
+    TextToAudioProviderRouter,
+)
 from agent_hub.multimodal.generation import MultimediaGenerationKind
 from agent_hub.multimodal.minimax import MiniMaxGeneratedVideo
 from agent_hub.multimodal.video_providers import TextToVideoProviderRouter
@@ -624,6 +635,71 @@ async def test_multimedia_executor_uses_minimax_video_client_for_hailuo_files(tm
 
 
 @pytest.mark.asyncio
+async def test_multimedia_executor_uses_minimax_audio_client_for_tts_files(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    audio_provider = FakeTextToAudioProvider(tmp_path / "provider-output.mp3")
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="minimax",
+                api_base="https://api.minimax.chat/v1",
+                api_protocol="openai_compatible",
+                upstream_model="speech-2.8-turbo",
+                logical_model="audio_primary",
+                capabilities=["audio_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="minimax-audio-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        audio_provider_router=TextToAudioProviderRouter((("minimax", audio_provider),)),
+    )
+
+    assert await executor.default_logical_model("audio") == "audio_primary"
+
+    result = await executor.generate(
+        kind=MultimediaGenerationKind.AUDIO,
+        logical_model="audio_primary",
+        prompt="这是一段科普旁白。",
+    )
+
+    assert result.deployment_id
+    assert result.text is not None
+    assert result.text.startswith("file://")
+    assert result.file_path == tmp_path / "media" / str(TENANT_ID) / "provider-output.mp3"
+    assert result.file_path.read_bytes() == b"audio"
+    assert result.mime_type == "audio/mpeg"
+    assert audio_provider.calls == [
+        {
+            "api_key": "sk-live",
+            "api_base": "https://api.minimax.chat/v1",
+            "model": "speech-2.8-turbo",
+            "prompt": "这是一段科普旁白。",
+            "output_dir": tmp_path / "media" / str(TENANT_ID),
+        }
+    ]
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
 async def test_multimedia_executor_uses_dashscope_client_for_kling_image_files(tmp_path: Path) -> None:
     transport = FakeTransport()
     dashscope_provider = FakeDashScopeMultimediaClient(tmp_path / "dashscope-image.png")
@@ -854,6 +930,18 @@ class ImmediateCapacity:
         del quota_scope_id, status_code, latency_seconds, succeeded
 
 
+class UnavailableCapacity(ImmediateCapacity):
+    async def acquire(
+        self,
+        candidates: Sequence[Deployment],
+        wait_timeout: float,
+        *,
+        estimated_tokens: int,
+    ) -> CapacityLease:
+        del candidates, wait_timeout, estimated_tokens
+        raise CapacityUnavailable("model capacity unavailable")
+
+
 class FakeTransport:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -874,6 +962,83 @@ class FakeTransport:
             ),
             usage=TokenUsage(prompt_tokens=10, completion_tokens=6, total_tokens=16),
         )
+
+
+class FakeVisionReviewTransport:
+    def __init__(self, response_text: str | None = None) -> None:
+        self.requests: list[ModelRequest] = []
+        self.deployments: list[Deployment] = []
+        self.response_text = response_text or (
+            '{"passed":true,"summary":"角色锁定资产符合要求",'
+            '"issues":[],"confidence":0.93}'
+        )
+
+    async def complete(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse:
+        assert api_key == "sk-live"
+        self.deployments.append(deployment)
+        self.requests.append(request)
+        return ModelResponse(
+            text=self.response_text,
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=8, total_tokens=28),
+        )
+
+
+class SchemaRejectingVisionReviewTransport(FakeVisionReviewTransport):
+    async def complete(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse:
+        if request.response_schema is not None:
+            self.deployments.append(deployment)
+            self.requests.append(request)
+            raise ModelTransportError(
+                "model transport failed",
+                status_code=400,
+                logical_models=(deployment.logical_model,),
+                deployments=(deployment.id,),
+            )
+        return await super().complete(deployment, request, api_key)
+
+
+def test_parse_asset_visual_review_payload_accepts_common_model_type_drift() -> None:
+    payload = _parse_asset_visual_review_payload(
+        '{"passed":"false","summary":"不是镜头资产","issues":"缺少景别和机位",'
+        '"confidence":"0.72"}'
+    )
+
+    assert payload == {
+        "passed": False,
+        "summary": "不是镜头资产",
+        "issues": ["缺少景别和机位"],
+        "confidence": 0.72,
+    }
+
+
+def test_visual_review_provider_priority_prefers_deepseek_then_qwen_then_minimax() -> None:
+    def deployment(logical_model: str, provider_model: str) -> Deployment:
+        return Deployment(
+            id=logical_model,
+            logical_model=logical_model,
+            provider_model=provider_model,
+            request_model=provider_model,
+            api_base="https://example.com/v1",
+            secret_ref="secret://test",
+            quota_scope_id=logical_model,
+        )
+
+    assert _visual_review_provider_priority(
+        deployment("deepseek-mutil", "deepseek/deepseek-v4-flash-vision-exp")
+    ) > _visual_review_provider_priority(deployment("qwen-vl", "qwen/qwen-vl-max"))
+    assert _visual_review_provider_priority(
+        deployment("qwen-vl", "qwen/qwen-vl-max")
+    ) > _visual_review_provider_priority(deployment("minimax", "minimax/MiniMax-M3"))
 
 
 class FakeTextToVideoProvider:
@@ -915,6 +1080,43 @@ class FakeTextToVideoProvider:
             task_id="task-1",
             file_id="file-1",
             mime_type="video/mp4",
+        )
+
+
+class FakeTextToAudioProvider:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.calls: list[dict[str, object]] = []
+
+    async def generate_text_to_audio(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        model: str,
+        prompt: str,
+        output_dir: Path,
+    ) -> GeneratedAudioArtifact:
+        self.calls.append(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "prompt": prompt,
+                "output_dir": output_dir,
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stored = output_dir / self.output_path.name
+        stored.write_bytes(b"audio")
+        return GeneratedAudioArtifact(
+            path=stored,
+            uri=stored.as_uri(),
+            provider="minimax",
+            model=model,
+            task_id="audio-task-1",
+            file_id=None,
+            mime_type="audio/mpeg",
         )
 
 
@@ -994,6 +1196,569 @@ class FakeDashScopeMultimediaClient:
             mime_type="video/mp4",
             kind="video",
         )
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_uses_image_url_with_non_messages_vision_model() -> None:
+    transport = FakeVisionReviewTransport()
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="anthropic",
+                api_base="https://relay.example.com/v1/messages",
+                api_protocol="openai_compatible",
+                upstream_model="claude-vision",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-messages",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-openai",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        assert len(deployments) == 1
+        assert deployments[0].quota_scope_id == "vision-openai"
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="角色锁定资产：男主",
+        prompt="生成男主 Character Model Sheet，不要电影剧照。",
+        filename="character.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is True
+    assert review.summary == "角色锁定资产符合要求"
+    assert review.confidence == 0.93
+    assert [deployment.quota_scope_id for deployment in transport.deployments] == [
+        "vision-openai"
+    ]
+    assert len(transport.requests) == 1
+    assert transport.requests[0].required_capabilities == frozenset(
+        {"vision", "structured_output"}
+    )
+    assert transport.requests[0].response_schema is not None
+    assert transport.requests[0].response_schema.name == "AssetVisualReview"
+    assert transport.requests[0].response_schema.schema["required"] == (
+        "passed",
+        "summary",
+        "issues",
+        "confidence",
+    )
+    review_prompt = "\n".join(str(message.content) for message in transport.requests[0].messages)
+    assert "干净、低噪声" in review_prompt
+    assert "无关背景、装饰、小物件" in review_prompt
+    assert "纯白/浅灰/透明感纯色背景" in review_prompt
+    assert "背景会污染后续人物锁定" in review_prompt
+    assert "剧本锚点" in review_prompt
+    assert "黑西装/战术服" in review_prompt
+    assert "黄色外卖箱、青玉断佩、银针、证件、蓝色电弧" in review_prompt
+    content = transport.requests[0].messages[0].content
+    assert isinstance(content, tuple)
+    assert content[1]["type"] == "image_url"
+    image_url = content[1]["image_url"]
+    assert isinstance(image_url, Mapping)
+    assert str(image_url["url"]).startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_rejects_non_scene_background_pollution() -> None:
+    transport = FakeVisionReviewTransport(
+        response_text=(
+            '{"passed":true,'
+            '"summary":"服装妆造资产覆盖服装和材质，但背景非纯色，顶部出现办公室天花板和窗户，底部出现木质桌面。",'
+            '"issues":["画面顶部出现办公室天花板与窗户背景，底部出现木质桌面"],'
+            '"confidence":0.72}'
+        )
+    )
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-openai",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        assert len(deployments) == 1
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="服装妆造资产",
+        prompt="生成服装妆造设定板，纯色背景。",
+        filename="costume.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is False
+    assert "背景非纯色" in review.summary
+    assert any("非场景类资产" in issue for issue in review.issues)
+
+
+def test_asset_visual_review_policy_ignores_negated_background_pollution() -> None:
+    passed, summary, issues = _apply_asset_visual_review_policy(
+        label="角色锁定资产：林渊",
+        passed=True,
+        summary=(
+            "图像为标准角色参考设定板。纯白/浅灰背景，"
+            "无场景、室内、街景或道具桌面污染；同一男性角色一致呈现三视图。"
+        ),
+        issues=(),
+    )
+
+    assert passed is True
+    assert "标准角色参考设定板" in summary
+    assert issues == ()
+
+
+def test_asset_visual_review_prompt_treats_script_characters_as_fictional() -> None:
+    prompt = _asset_visual_review_prompt(
+        label="角色锁定资产：秦岚",
+        prompt="生成秦岚 Character Model Sheet，27岁女，灵纹鉴定师，短发，墨绿色长风衣。",
+        filename="qinlan.png",
+    )
+
+    assert "脚本角色名默认都是虚构角色" in prompt
+    assert "不要按现实明星、公众人物或同名真人资料" in prompt
+    assert "用户明确要求真实人物" in prompt
+
+
+def test_asset_visual_review_prompt_requires_professional_design_sheet_modules() -> None:
+    prompt = _asset_visual_review_prompt(
+        label="角色锁定资产：苏清月",
+        prompt="生成苏清月 Character Model Sheet，白大褂，低马尾，银色胸针。",
+        filename="suqingyue.png",
+    )
+
+    for required in (
+        "主定妆大图",
+        "正/侧/背全身三视图",
+        "表情头部变化",
+        "服装拆解",
+        "剧情服装/状态变体",
+        "每个模块都必须对应角色锚点",
+        "栏目标题存在但内容明显不对应角色锚点",
+        "关键栏目错别字",
+        "随身物/职业道具",
+        "材质色卡",
+        "不得加入剧本或角色设定之外的随机道具",
+        "少量清晰中文标签",
+        "关键标签大量乱码",
+        "剧本锚点",
+        "换了人物身份/服装/画风",
+        "不得自造无关角色",
+        "空间视角",
+        "独立物件 lineup",
+        "姿态序列",
+        "形态分层",
+        "景别机位构图卡",
+        "情绪节奏点",
+    ):
+        assert required in prompt
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_falls_back_to_json_when_schema_is_rejected() -> None:
+    transport = SchemaRejectingVisionReviewTransport()
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-openai",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        assert len(deployments) == 1
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="角色锁定资产：男主",
+        prompt="生成男主 Character Model Sheet，不要电影剧照。",
+        filename="character.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is True
+    assert [request.response_schema is not None for request in transport.requests] == [
+        True,
+        False,
+    ]
+    assert transport.requests[1].required_capabilities == frozenset({"vision"})
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_uses_json_for_vision_model_without_structured_output() -> None:
+    transport = FakeVisionReviewTransport()
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="qwen",
+                api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                api_protocol="openai_compatible",
+                upstream_model="qwen-vl",
+                logical_model="vision_json",
+                capabilities=["vision"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-json",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        assert len(deployments) == 1
+        assert deployments[0].quota_scope_id == "vision-json"
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="角色锁定资产：女主",
+        prompt="生成女主 Character Model Sheet，不要混入其他角色。",
+        filename="heroine.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is True
+    assert review.logical_model == "vision_json"
+    assert [deployment.quota_scope_id for deployment in transport.deployments] == [
+        "vision-json"
+    ]
+    assert len(transport.requests) == 1
+    assert transport.requests[0].required_capabilities == frozenset({"vision"})
+    assert transport.requests[0].response_schema is None
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_falls_back_when_first_vision_deployment_has_no_capacity() -> None:
+    transport = FakeVisionReviewTransport()
+    capacity_scopes: list[str] = []
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="deepseek-vl",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-busy",
+                max_concurrency=3,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=3,
+                saturation_policy="queue_first_then_fallback",
+            ),
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_backup",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-backup",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        assert len(deployments) == 1
+        capacity_scopes.append(deployments[0].quota_scope_id)
+        if deployments[0].quota_scope_id == "vision-busy":
+            return UnavailableCapacity()
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="角色锁定资产：男主",
+        prompt="生成男主 Character Model Sheet，不要电影剧照。",
+        filename="character.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is True
+    assert capacity_scopes == ["vision-busy", "vision-backup"]
+    assert [deployment.quota_scope_id for deployment in transport.deployments] == [
+        "vision-backup"
+    ]
+    assert review.logical_model == "vision_backup"
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_retries_when_all_candidates_temporarily_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeVisionReviewTransport()
+    capacity_scopes: list[str] = []
+    backup_failures_remaining = 1
+    monkeypatch.setattr(app_module, "_ASSET_VISUAL_REVIEW_RETRY_BACKOFF_SECONDS", 0)
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="deepseek-vl",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-busy",
+                max_concurrency=3,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=3,
+                saturation_policy="queue_first_then_fallback",
+            ),
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_backup",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-backup",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        nonlocal backup_failures_remaining
+        assert len(deployments) == 1
+        capacity_scopes.append(deployments[0].quota_scope_id)
+        if deployments[0].quota_scope_id == "vision-busy":
+            return UnavailableCapacity()
+        if backup_failures_remaining > 0:
+            backup_failures_remaining -= 1
+            return UnavailableCapacity()
+        return ImmediateCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    review = await reviewer.review_image_asset(
+        tenant_id=TENANT_ID,
+        label="角色锁定资产：男主",
+        prompt="生成男主 Character Model Sheet，不要电影剧照。",
+        filename="character.png",
+        mime_type="image/png",
+        data=b"fake-png",
+    )
+
+    assert review.passed is True
+    assert capacity_scopes == [
+        "vision-busy",
+        "vision-backup",
+        "vision-busy",
+        "vision-backup",
+    ]
+    assert [deployment.quota_scope_id for deployment in transport.deployments] == [
+        "vision-backup"
+    ]
+    assert review.logical_model == "vision_backup"
+
+
+@pytest.mark.asyncio
+async def test_asset_visual_reviewer_reports_all_candidate_failures() -> None:
+    transport = FakeVisionReviewTransport()
+
+    first_id = uuid4()
+    second_id = uuid4()
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="deepseek-vl",
+                logical_model="vision_primary",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-busy",
+                max_concurrency=3,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=first_id,
+                effective_slots=3,
+                saturation_policy="queue_first_then_fallback",
+            ),
+            ModelDeploymentResponse(
+                provider="openai",
+                api_base="https://api.openai.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gpt-4.1",
+                logical_model="vision_backup",
+                capabilities=["vision", "structured_output"],
+                credential_ref="secret://main-agent",
+                quota_scope="vision-backup-busy",
+                max_concurrency=2,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=second_id,
+                effective_slots=2,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(deployments: tuple[Deployment, ...]) -> CapacityController:
+        del deployments
+        return UnavailableCapacity()
+
+    reviewer = _ConfigBackedAssetVisualReviewer(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    with pytest.raises(ModelGatewayError) as caught:
+        await reviewer.review_image_asset(
+            tenant_id=TENANT_ID,
+            label="角色锁定资产：男主",
+            prompt="生成男主 Character Model Sheet，不要电影剧照。",
+            filename="character.png",
+            mime_type="image/png",
+            data=b"fake-png",
+        )
+
+    assert "visual asset review failed for all candidates" in str(caught.value)
+    assert "vision_primary" in str(caught.value)
+    assert "vision_backup" in str(caught.value)
+    assert caught.value.logical_models == ("vision_primary", "vision_backup")
+    assert caught.value.deployments == (str(first_id), str(second_id))
+    assert transport.requests == []
 
 
 @pytest.mark.asyncio

@@ -125,8 +125,17 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     gateway_reason = safe_model_gateway_failure_reason(error)
     if gateway_reason is not None:
         return gateway_reason
+    if isinstance(error, TimeoutError):
+        return "operation timed out"
     reason = normalize_failure_reason(str(error))
     if not is_safe_failure_reason(reason):
+        error_type = type(error).__name__
+        if (
+            reason
+            and fallback == "capability execution failed"
+            and is_safe_failure_reason(error_type)
+        ):
+            return f"{fallback} ({error_type})"
         return fallback
     return reason[:MAX_FAILURE_REASON_LENGTH]
 
@@ -210,6 +219,30 @@ def runtime_failure_diagnostic_from_reason(
             error_code="runtime.model_usage_unverifiable",
             retryable=True,
             suggested_action="模型返回内容可用但 usage 账本不可验证；系统会优先使用保守估算，若仍失败请检查模型适配器 usage 字段、输出长度和上下文预算。",
+        )
+    elif lowered.startswith("capability failed:") and (
+        "rate limit" in lowered
+        or "too many requests" in lowered
+        or "requests rate limit exceeded" in lowered
+    ):
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="provider_rate_limit",
+            error_code="capability.provider_rate_limited",
+            retryable=True,
+            suggested_action="多媒体供应商限流；稍后重试，或降低图片/视频并发、拆分资产批次后重试。",
+        )
+    elif lowered.startswith("capability failed:") and (
+        "timeout" in lowered or "timed out" in lowered
+    ):
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="provider_timeout",
+            error_code="capability.provider_timeout",
+            retryable=True,
+            suggested_action="多媒体工具等待供应商结果超时；可稍后重试、缩小资产批次、降低并发或提高该工具等待窗口。",
         )
     elif lowered.startswith("capability failed:"):
         diagnostic = _base_diagnostic(

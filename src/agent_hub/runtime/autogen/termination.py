@@ -32,9 +32,11 @@ class CompositeDiscussionTermination(TerminationCondition):
     completion_marker: str = "[COMPLETE]"
     consensus_marker: str = "[CONSENSUS]"
     reason: str | None = field(default=None, init=False)
+    consensus_verdict: str | None = field(default=None, init=False)
     _started_at: float = field(default=0.0, init=False)
     _turns: int = field(default=0, init=False)
     _votes: set[str] = field(default_factory=set, init=False)
+    _negative_votes: set[str] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         self._started_at = self.monotonic()
@@ -55,6 +57,8 @@ class CompositeDiscussionTermination(TerminationCondition):
             text = message.to_text()
             if self.consensus_marker in text:
                 self._votes.add(message.source)
+                if is_negative_consensus_text(text):
+                    self._negative_votes.add(message.source)
         if self.cancelled():
             self.reason = "cancelled"
         elif self.monotonic() - self._started_at >= self.wall_time_seconds:
@@ -67,7 +71,11 @@ class CompositeDiscussionTermination(TerminationCondition):
         ):
             self.reason = "explicit_completion"
         elif len(self._votes) >= self.consensus_votes:
-            self.reason = "consensus"
+            if self._negative_votes:
+                self.reason = "negative_consensus"
+                self.consensus_verdict = "revise"
+            else:
+                self.reason = "consensus"
         elif self._turns >= self.max_turns:
             self.reason = "max_turns"
         if self.reason is None:
@@ -76,6 +84,34 @@ class CompositeDiscussionTermination(TerminationCondition):
 
     async def reset(self) -> None:
         self.reason = None
+        self.consensus_verdict = None
         self._turns = 0
         self._votes.clear()
+        self._negative_votes.clear()
         self._started_at = self.monotonic()
+
+
+def is_negative_consensus_text(text: str) -> bool:
+    if "[CONSENSUS]" not in text:
+        return False
+    lowered = text.casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "不通过",
+            "未通过",
+            "审查不合格",
+            "拒绝放行",
+            "不能放行",
+            "退回",
+            "返工",
+            "重新生成",
+            "重写",
+            "revise",
+            "revision required",
+            "reject",
+            "rejected",
+            "do not approve",
+            "not approved",
+        )
+    )

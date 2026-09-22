@@ -50,6 +50,29 @@ def test_resolution_request_allows_shared_link_multiline_task() -> None:
     assert request.task == "标题\nhttps://example.com/a?x=1&y=2\t备注"
 
 
+def test_resolution_request_normalizes_long_padded_user_task_for_decision_memo() -> None:
+    tail_instruction = "最终只输出讨论摘要和可执行建议，不要直接开计划。"
+    request = ResolutionRequest(
+        task="\n" + ("需要讨论的长材料。" * 500) + tail_instruction + "\n",
+        disagreement_kind=DisagreementKind.STRATEGY,
+        positions=(position("analyst", "option-a"), position("critic", "option-b")),
+    )
+
+    assert request.task == request.task.strip()
+    assert len(request.task) <= 2_000
+    assert "[truncated for discussion decision; middle omitted]" in request.task
+    assert request.task.endswith(tail_instruction)
+
+
+def test_resolution_request_rejects_hidden_control_even_beyond_decision_limit() -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        ResolutionRequest(
+            task=("需要讨论的长材料。" * 500) + "\u200b",
+            disagreement_kind=DisagreementKind.STRATEGY,
+            positions=(position("analyst", "option-a"), position("critic", "option-b")),
+        )
+
+
 @pytest.mark.parametrize("hidden_character", ["\x00", "\x1b", "\u200b", "\u202e"])
 def test_resolution_request_rejects_hidden_or_dangerous_control_task(
     hidden_character: str,

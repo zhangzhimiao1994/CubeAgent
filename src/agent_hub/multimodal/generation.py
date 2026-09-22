@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -266,6 +267,9 @@ class MultimediaGenerationExecutor:
                 logical_model=job.logical_model,
                 prompt=job.prompt,
             )
+        except asyncio.CancelledError:
+            self._job_store.fail(job_id, error="multimedia generation cancelled")
+            raise
         except Exception as error:
             self._job_store.fail(job_id, error=str(error))
             raise

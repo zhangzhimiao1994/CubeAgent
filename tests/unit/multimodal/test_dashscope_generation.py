@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from agent_hub.multimodal.dashscope import (
+    DashScopeGenerationError,
     DashScopeMultimediaGenerationClient,
     is_dashscope_multimedia_deployment,
 )
@@ -91,6 +92,84 @@ async def test_dashscope_image_client_submits_polls_downloads_and_stores_file(tm
         "/api/v1/tasks/task-image-1",
         "/out.png",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dashscope_image_client_uses_image_specific_poll_limit(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    task_polls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal task_polls
+        if request.url.path == "/api/v1/services/aigc/image-generation/generation":
+            return httpx.Response(200, json={"output": {"task_id": "task-image-1"}})
+        if request.url.path == "/api/v1/tasks/task-image-1":
+            task_polls += 1
+            return httpx.Response(
+                200,
+                json={"output": {"task_id": "task-image-1", "task_status": "PENDING"}},
+            )
+        return httpx.Response(404)
+
+    client = DashScopeMultimediaGenerationClient(
+        transport=httpx.MockTransport(handler),
+        poll_interval_seconds=0,
+        max_polls=99,
+        image_max_polls=2,
+    )
+
+    with pytest.raises(Exception, match="polling timed out"):
+        await client.generate_text_to_image(
+            api_key="sk-live",
+            api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="kling/kling-v3-omni-image-generation",
+            prompt="a blue cube",
+            output_dir=tmp_path,
+        )
+
+    assert task_polls == 2
+
+
+@pytest.mark.asyncio
+async def test_dashscope_image_client_wraps_read_timeout(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    client = DashScopeMultimediaGenerationClient(
+        transport=httpx.MockTransport(handler),
+        poll_interval_seconds=0,
+    )
+
+    with pytest.raises(DashScopeGenerationError, match="image submit timed out"):
+        await client.generate_text_to_image(
+            api_key="sk-live",
+            api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="kling/kling-v3-omni-image-generation",
+            prompt="a blue cube",
+            output_dir=tmp_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_dashscope_image_client_wraps_remote_protocol_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            "Server disconnected without sending a response.",
+            request=request,
+        )
+
+    client = DashScopeMultimediaGenerationClient(
+        transport=httpx.MockTransport(handler),
+        poll_interval_seconds=0,
+    )
+
+    with pytest.raises(DashScopeGenerationError, match="image submit transport failed"):
+        await client.generate_text_to_image(
+            api_key="sk-live",
+            api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            model="kling/kling-v3-omni-image-generation",
+            prompt="a blue cube",
+            output_dir=tmp_path,
+        )
 
 
 @pytest.mark.asyncio

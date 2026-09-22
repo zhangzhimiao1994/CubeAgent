@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import tarfile
+import unicodedata
 import zipfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,7 +18,7 @@ from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.api.dependencies import require_permission
@@ -32,6 +33,8 @@ router = APIRouter(
     tags=["runs"],
     responses=error_responses(401, 403, 404, 405, 409, 413, 422, 500, 503),
 )
+
+MAX_RUN_MESSAGE_BYTES = 65_536
 
 ARCHIVE_EXTENSIONS = (
     ".tar.gz",
@@ -77,6 +80,8 @@ class RunServiceProtocol(Protocol):
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        skip_schedule_proposal: bool = False,
+        channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -113,6 +118,28 @@ class RunServiceProtocol(Protocol):
         feedback: str,
     ) -> SubmittedRun: ...
 
+    async def approve_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
+    async def reject_artifact_review(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+        feedback: str,
+        review_items: tuple[dict[str, str], ...] = (),
+    ) -> SubmittedRun: ...
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
@@ -138,8 +165,27 @@ class CreateRunRequest(BaseModel):
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_skills: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_plugins: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    requested_files: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
+    skip_schedule_proposal: bool = False
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message must be nonblank")
+        if len(value.encode("utf-8")) > MAX_RUN_MESSAGE_BYTES:
+            raise ValueError("message must be bounded")
+        if unicodedata.normalize("NFC", value) != value:
+            raise ValueError("message must use normalized Unicode")
+        for character in value:
+            category = unicodedata.category(character)
+            if category == "Cf" or (category == "Cc" and character not in "\n\t"):
+                raise ValueError("message contains unsafe control characters")
+        return value
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -147,6 +193,48 @@ class CreateRunRequest(BaseModel):
         if isinstance(value, list):
             return tuple(value)
         return value
+
+    @field_validator("requested_skills", "requested_plugins", "requested_files", mode="before")
+    @classmethod
+    def coerce_requested_capabilities(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("requested_skills", "requested_plugins")
+    @classmethod
+    def validate_requested_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            cleaned = item.strip()
+            if not cleaned or cleaned in seen or len(cleaned) > 100:
+                continue
+            if re.fullmatch(r"[\w\-:.\/@\u4e00-\u9fff]+", cleaned) is None:
+                raise ValueError("requested capabilities must be safe identifiers")
+            seen.add(cleaned)
+            result.append(cleaned)
+        return tuple(result)
+
+    @field_validator("requested_files")
+    @classmethod
+    def validate_requested_files(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            cleaned = item.strip().replace("\\", "/")
+            if not cleaned or cleaned in seen or len(cleaned) > 240:
+                continue
+            if (
+                cleaned.startswith("/")
+                or re.match(r"^[a-zA-Z]:/", cleaned)
+                or any(part == ".." for part in cleaned.split("/"))
+                or "\x00" in cleaned
+            ):
+                raise ValueError("requested files must be safe relative paths")
+            seen.add(cleaned)
+            result.append(cleaned)
+        return tuple(result)
 
     @field_validator("attachment_ids")
     @classmethod
@@ -175,6 +263,35 @@ class ReviseTemporaryAgentRequest(BaseModel):
     decision_token: str = Field(min_length=32, max_length=160)
     version: int = Field(ge=1)
     feedback: str = Field(min_length=1, max_length=2000)
+
+
+class ApproveArtifactReviewRequest(BaseModel):
+    version: int = Field(ge=1)
+
+
+class RejectArtifactReviewItemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=160)
+    feedback: str = Field(min_length=1, max_length=2000)
+
+    def to_payload(self) -> dict[str, str]:
+        return {"id": self.id, "feedback": self.feedback}
+
+
+class RejectArtifactReviewRequest(BaseModel):
+    version: int = Field(ge=1)
+    feedback: str | None = Field(default=None, min_length=1, max_length=2000)
+    rejected_items: tuple[RejectArtifactReviewItemRequest, ...] = Field(
+        default=(),
+        max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def feedback_or_items(self) -> RejectArtifactReviewRequest:
+        if self.feedback is None and not self.rejected_items:
+            raise ValueError("artifact review rejection requires feedback or rejected_items")
+        return self
 
 
 class SubmittedRunResponse(BaseModel):
@@ -341,6 +458,10 @@ async def _record_run_submit_audit(
         "direct_model": body.direct_model,
         "vibe_coding": body.vibe_coding,
         "attachment_count": len(body.attachment_ids),
+        "requested_skills": list(body.requested_skills),
+        "requested_plugins": list(body.requested_plugins),
+        "requested_files": list(body.requested_files),
+        "skip_schedule_proposal": body.skip_schedule_proposal,
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
     }
@@ -350,6 +471,19 @@ async def _record_run_submit_audit(
         resource=str(submitted.id),
         details=details,
     )
+
+
+def _requested_capability_payload(body: CreateRunRequest) -> dict[str, str] | None:
+    payload: dict[str, str] = {}
+    if body.requested_skills:
+        payload["requested_skills"] = ",".join(body.requested_skills)
+    if body.requested_plugins:
+        payload["requested_plugins"] = ",".join(body.requested_plugins)
+    if body.requested_files:
+        payload["requested_files"] = ",".join(body.requested_files)
+    if body.skip_schedule_proposal:
+        payload["skip_schedule_proposal"] = "true"
+    return payload or None
 
 
 def _attachment_store_dir(request: Request) -> Path:
@@ -757,22 +891,32 @@ async def create_run(
             "vibe_coding_disabled",
             "Vibe Coding is disabled in system settings",
         )
-    submitted = await service.submit(
-        tenant_id=principal.tenant_id,
-        actor_id=principal.user_id,
-        message=body.message,
-        mode=body.mode,
-        agent_ids=body.agent_ids,
-        workflow_id=body.workflow_id,
-        allow_workflow_adjustment=body.allow_workflow_adjustment,
-        conversation_id=body.conversation_id,
-        reference_conversation_id=body.reference_conversation_id,
-        attachment_ids=body.attachment_ids,
-        direct_model=body.direct_model,
-        vibe_coding=body.vibe_coding,
-        skip_evolution_proposal=body.skip_evolution_proposal,
-        idempotency_key=idempotency_key,
-    )
+    try:
+        submitted = await service.submit(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            message=body.message,
+            mode=body.mode,
+            agent_ids=body.agent_ids,
+            workflow_id=body.workflow_id,
+            allow_workflow_adjustment=body.allow_workflow_adjustment,
+            conversation_id=body.conversation_id,
+            reference_conversation_id=body.reference_conversation_id,
+            attachment_ids=body.attachment_ids,
+            direct_model=body.direct_model,
+            vibe_coding=body.vibe_coding,
+            skip_evolution_proposal=body.skip_evolution_proposal,
+            skip_schedule_proposal=body.skip_schedule_proposal,
+            channel_context=_requested_capability_payload(body),
+            idempotency_key=idempotency_key,
+        )
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
     await _record_run_submit_audit(request, principal, body, submitted)
     return SubmittedRunResponse.from_submitted(submitted)
 
@@ -866,6 +1010,76 @@ async def revise_temporary_agent(
             decision_token=body.decision_token,
             version=body.version,
             feedback=body.feedback,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/artifact-reviews/{approval_id}/approve",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def approve_artifact_review(
+    run_id: UUID,
+    approval_id: str,
+    body: ApproveArtifactReviewRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:resume"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.approve_artifact_review(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/artifact-reviews/{approval_id}/reject",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reject_artifact_review(
+    run_id: UUID,
+    approval_id: str,
+    body: RejectArtifactReviewRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:resume"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.reject_artifact_review(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            version=body.version,
+            feedback=body.feedback or "",
+            review_items=tuple(item.to_payload() for item in body.rejected_items),
         )
     except RunNotFound as error:
         raise _run_not_found() from error

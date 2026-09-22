@@ -1,0 +1,17 @@
+{
+  "manifest": "content_studio.pack.v1",
+  "pack_type": "channel",
+  "name": "ai_frontier",
+  "version": "1.0.0",
+  "schema_version": "1.0",
+  "compatible_core": ">=0.1.0,<1.0.0",
+  "settings": {
+    "persona": "calm AI frontier explainer",
+    "audience": "AI practitioners and curious builders",
+    "banned_phrases": [
+      "guaranteed profit",
+      "free forever",
+      "absolute leader"
+    ]
+  }
+}

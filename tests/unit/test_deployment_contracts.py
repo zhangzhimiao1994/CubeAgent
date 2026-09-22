@@ -17,6 +17,7 @@ def test_generated_secrets_use_agent_hub_prefixed_application_environment() -> N
     assert "AGENT_HUB_MASTER_KEY=" in secrets
     assert "AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=" in secrets
     assert "AGENT_HUB_RUNTIME_TOKEN_BUDGET=" in secrets
+    assert "AGENT_HUB_WORKSPACE_READ_ROOTS=" in secrets
     assert "normalize_secret_file_format" in secrets
     assert "ensure_numeric_secret_default" in secrets
     assert "AGENT_HUB_SECRET_KEY=" not in secrets
@@ -199,6 +200,7 @@ def test_compose_env_example_uses_prefixed_application_environment() -> None:
     assert "AGENT_HUB_LITELLM_HEALTH_URL=http://litellm:4000/health/liveliness" in example
     assert "AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=300" in example
     assert "AGENT_HUB_RUNTIME_TOKEN_BUDGET=1000000" in example
+    assert "AGENT_HUB_WORKSPACE_READ_ROOTS=[]" in example
     assert "\nDATABASE_URL=" not in f"\n{example}"
     assert "\nJWT_SIGNING_KEY=" not in f"\n{example}"
     assert "${POSTGRES_PASSWORD}" not in example

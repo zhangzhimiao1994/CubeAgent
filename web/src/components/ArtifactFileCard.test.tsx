@@ -81,6 +81,17 @@ describe("ArtifactFileCard", () => {
       title: "生成图片",
       filename: "poster.png",
       mime_type: "image/png",
+      visual_review: {
+        passed: true,
+        summary: "符合角色锁定资产要求",
+        issues: [],
+        confidence: 0.91,
+      },
+      production_metadata: {
+        character_id: "CHAR_SQY_001",
+        look_id: "LOOK_001",
+        production_category: "character_identity",
+      },
       download_url:
         "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/44444444-4444-4444-8444-444444444444/download",
     };
@@ -106,8 +117,14 @@ describe("ArtifactFileCard", () => {
 
     render(<ArtifactFileCard artifact={imageArtifact} />);
 
-    const preview = await screen.findByRole("img", { name: "poster.png" });
+    const preview = await screen.findByRole("img", { name: "生成图片" });
     expect(preview.getAttribute("src")).toBe("blob:image-preview");
+    expect(screen.getByText("生成图片")).not.toBeNull();
+    expect(screen.getByText("poster.png")).not.toBeNull();
+    expect(screen.getByText("类别 character_identity")).not.toBeNull();
+    expect(screen.getByText("Character CHAR_SQY_001")).not.toBeNull();
+    expect(screen.getByText("Look LOOK_001")).not.toBeNull();
+    expect(screen.getByText("视觉审核通过：符合角色锁定资产要求")).not.toBeNull();
     expect(screen.getByRole("button", { name: /下载 poster\.png/ }).textContent).toBe("下载图片");
   });
 });

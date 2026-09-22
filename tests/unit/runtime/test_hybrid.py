@@ -18,7 +18,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.direct import DirectRuntime
-from agent_hub.runtime.hybrid import HybridRuntime
+from agent_hub.runtime.hybrid import HybridPlan, HybridRuntime, HybridUpgrade
 
 
 class MultiArtifactRuntime:
@@ -120,6 +120,93 @@ class FailingRuntime:
             sequence=1,
             run_id=context.run_id,
             reason=self._reason,
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise AssertionError(f"not used: {checkpoint.id}")
+
+    async def cancel(self) -> None:
+        return None
+
+
+class CompletedReasonRuntime(MultiArtifactRuntime):
+    def __init__(self, mode: TaskMode, outputs: tuple[Artifact, ...], reason: str) -> None:
+        super().__init__(mode, outputs)
+        self._reason = reason
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        sequence = 1
+        for output in self.outputs:
+            yield RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=sequence,
+                run_id=context.run_id,
+                artifact=output,
+            )
+            sequence += 1
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=sequence,
+            run_id=context.run_id,
+            reason=self._reason,
+        )
+
+
+class DiscussionSummaryRuntime(MultiArtifactRuntime):
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        yield RunEvent(
+            kind="discussion.completed",
+            sequence=1,
+            run_id=context.run_id,
+            payload={
+                "participants": ("moderator", "skeptic"),
+                "summary": "主持人摘要：保留短剧结构，补充角色动机。",
+                "reason": "sufficient_discussion",
+            },
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="explicit_completion",
+        )
+
+
+class SequencedCompletedReasonRuntime:
+    def __init__(
+        self,
+        mode: TaskMode,
+        attempts: tuple[tuple[tuple[Artifact, ...], str], ...],
+    ) -> None:
+        self.mode = mode
+        self._attempts = attempts
+        self.contexts: list[TaskContext] = []
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        index = len(self.contexts)
+        self.contexts.append(context)
+        if index >= len(self._attempts):
+            raise AssertionError(f"{self.mode.value} ran too many times")
+        outputs, reason = self._attempts[index]
+        sequence = 1
+        for output in outputs:
+            yield RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=sequence,
+                run_id=context.run_id,
+                artifact=output,
+            )
+            sequence += 1
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=sequence,
+            run_id=context.run_id,
+            reason=reason,
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -330,6 +417,228 @@ async def test_hybrid_runtime_synthesizes_when_discussion_gateway_fails_after_di
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_emits_readable_discussion_summary_when_discussion_gateway_fails() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    final_output = artifact("main", "answer")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        FailingRuntime(
+            TaskMode.DISCUSS,
+            "model gateway failed: model transport failed (logical_models=deepseek; deployments=deepseek_1)",
+        ),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并讨论审查。",
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+
+    assert completed.actor is None
+    assert "讨论阶段未能完成" in cast(str, completed.payload["summary"])
+    assert completed.payload["reason"] == (
+        "hybrid discuss failed: model gateway failed: model transport failed "
+        "(logical_models=deepseek; deployments=deepseek_1)"
+    )
+    assert completed.payload["fallback_policy"] == "continue_to_synthesis"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_forwards_discussion_completed_summary() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    final_output = artifact("main", "answer")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        DiscussionSummaryRuntime(TaskMode.DISCUSS, ()),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并讨论审查。",
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.kind == "discussion.completed")
+
+    assert completed.payload["summary"] == "主持人摘要：保留短剧结构，补充角色动机。"
+    assert completed.payload["participants"] == ("moderator", "skeptic")
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == final_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_does_not_synthesize_after_negative_discussion_consensus() -> None:
+    dispatch_output = artifact("planner", "dispatch result")
+    discussion_output = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 不通过——拒绝放行，需要重新生成。",
+    )
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        CompletedReasonRuntime(TaskMode.DISCUSS, (discussion_output,), "negative_consensus"),
+        UnusedRuntime(TaskMode.DIRECT, "synthesis should not run"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并审查。",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == discussion_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "hybrid discuss failed: discussion negative consensus"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_reruns_dispatch_once_after_negative_discussion_consensus() -> None:
+    user_reference = artifact("user", "角色设定：白衣剑修。")
+    rejected_draft = artifact("planner", "残缺剧本：只有第一场。")
+    negative_review = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 不通过——现有交付物为残缺品，退回重新生成。",
+        sources=(str(rejected_draft.id),),
+    )
+    revised_draft = artifact("planner", "完整剧本：第一场、第二场、第三场。")
+    approved_review = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 通过——可以放行。",
+        sources=(str(revised_draft.id),),
+    )
+    final_output = artifact("main", "最终成片方案。")
+    dispatch = SequencedCompletedReasonRuntime(
+        TaskMode.DISPATCH,
+        (((rejected_draft,), "explicit_completion"), ((revised_draft,), "explicit_completion")),
+    )
+    discussion = SequencedCompletedReasonRuntime(
+        TaskMode.DISCUSS,
+        (((negative_review,), "negative_consensus"), ((approved_review,), "explicit_completion")),
+    )
+    synthesis = RecordingArtifactRuntime(TaskMode.DIRECT, final_output)
+    runtime = HybridRuntime(
+        dispatch,
+        discussion,
+        synthesis,
+        plan=HybridPlan(upgrade=HybridUpgrade.DIRECT_TO_DISPATCH),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并审查。",
+                artifacts=(user_reference,),
+            )
+        )
+    ]
+
+    assert len(dispatch.contexts) == 2
+    assert dispatch.contexts[0].artifacts == (user_reference,)
+    assert dispatch.contexts[1].artifacts == (user_reference, negative_review)
+    assert len(discussion.contexts) == 2
+    assert discussion.contexts[1].artifacts == (
+        user_reference,
+        negative_review,
+        revised_draft,
+    )
+    assert synthesis.contexts[0].artifacts == (
+        user_reference,
+        negative_review,
+        revised_draft,
+        approved_review,
+    )
+    assert rejected_draft not in synthesis.contexts[0].artifacts
+    assert any(
+        event.kind is EventKind.STEP_RETRYING
+        and event.step_id == "hybrid_negative_consensus_revision"
+        and event.reason == "negative consensus requested regeneration"
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_fails_after_negative_discussion_revision_budget() -> None:
+    first_draft = artifact("planner", "残缺剧本：只有第一场。")
+    first_review = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 不通过——退回重新生成。",
+        sources=(str(first_draft.id),),
+    )
+    second_draft = artifact("planner", "仍然残缺：只有人物表。")
+    second_review = artifact(
+        "skeptic",
+        "# Skeptic 审查结论\n\n## [CONSENSUS] 不通过——仍拒绝放行。",
+        sources=(str(second_draft.id),),
+    )
+    dispatch = SequencedCompletedReasonRuntime(
+        TaskMode.DISPATCH,
+        (((first_draft,), "explicit_completion"), ((second_draft,), "explicit_completion")),
+    )
+    discussion = SequencedCompletedReasonRuntime(
+        TaskMode.DISCUSS,
+        (((first_review,), "negative_consensus"), ((second_review,), "negative_consensus")),
+    )
+    runtime = HybridRuntime(
+        dispatch,
+        discussion,
+        UnusedRuntime(TaskMode.DIRECT, "synthesis should not run"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="生成剧本并审查。",
+            )
+        )
+    ]
+
+    assert len(dispatch.contexts) == 2
+    assert len(discussion.contexts) == 2
+    assert sum(event.kind is EventKind.STEP_RETRYING for event in events) == 1
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "hybrid discuss failed: discussion negative consensus"
 
 
 @pytest.mark.asyncio

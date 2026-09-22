@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -9,19 +11,32 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.tools.calculator import Calculator
 from agent_hub.capabilities.tools.workspace_read import WorkspaceReader
+from agent_hub.content_studio import (
+    AsyncContentStudioService,
+    AsyncInMemoryContentProjectStore,
+    ClaimStatus,
+    ProjectStatus,
+)
+from agent_hub.content_studio.packs import load_pack_registry
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
     ALLOWED_GENERATED_FILE_MIME_TYPES,
     DOCX_MIME_TYPE,
+    JPEG_MIME_TYPE,
+    MP4_MIME_TYPE,
+    PNG_MIME_TYPE,
     PPTX_MIME_TYPE,
+    WEBP_MIME_TYPE,
     ZIP_MIME_TYPE,
     GeneratedFileStore,
     safe_generated_filename,
@@ -32,18 +47,41 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationKind,
 )
 from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.production import production_metadata_for_label
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
+from agent_hub.video.composer import (
+    VideoClipInput,
+    VideoComposer,
+    VideoComposeRequest,
+    VideoCompositionError,
+)
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
 _PROJECT_ZIP_TOOL = "project.generate_zip"
 _MULTIMEDIA_TOOL = "generate_multimedia"
+_COMPOSE_VIDEO_TOOL = "compose_video"
+_CONTENT_STUDIO_TOOL = "content_studio"
 _MULTIMEDIA_ARTIFACT_TTL = timedelta(hours=24)
 _MAX_PROJECT_FILES = 64
 _MAX_PROJECT_FILE_BYTES = 256_000
 _MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
+_MAX_VIDEO_CLIPS = 32
+_MAX_MULTIMEDIA_ARTIFACT_COUNT = 24
+_MAX_VISUAL_ASSET_GENERATION_ATTEMPTS = 2
+_MULTIMEDIA_IMAGE_JOB_TIMEOUT_SECONDS = 600
+_MULTIMEDIA_VIDEO_JOB_TIMEOUT_SECONDS = 1_200
+_MULTIMEDIA_AUDIO_JOB_TIMEOUT_SECONDS = 420
+_MULTIMEDIA_IMAGE_PROVIDER_RETRY_ATTEMPTS = 2
+_MULTIMEDIA_IMAGE_PROVIDER_RETRY_BACKOFF_SECONDS = 15
+_VIDEO_CLIP_EXTENSIONS = {
+    MP4_MIME_TYPE: (".mp4",),
+    PNG_MIME_TYPE: (".png",),
+    JPEG_MIME_TYPE: (".jpg", ".jpeg"),
+    WEBP_MIME_TYPE: (".webp",),
+}
 _DOTTED_BUILT_INS = frozenset({_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL})
 _REPLAY_SAFE = frozenset({
     "calculator",
@@ -54,7 +92,9 @@ _REPLAY_SAFE = frozenset({
     _PPTX_TOOL,
     _PROJECT_ZIP_TOOL,
     _MULTIMEDIA_TOOL,
+    _COMPOSE_VIDEO_TOOL,
 })
+_VIDEO_CLIP_MIME_TYPES = frozenset({MP4_MIME_TYPE, PNG_MIME_TYPE, JPEG_MIME_TYPE, WEBP_MIME_TYPE})
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -84,6 +124,44 @@ class RuntimeMultimediaGenerationExecutor(Protocol):
     ) -> MultimediaGenerationJob: ...
 
 
+class RuntimeVideoComposer(Protocol):
+    def compose(self, request: VideoComposeRequest, output_dir: Path) -> Path: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeAssetVisualReview:
+    passed: bool
+    summary: str
+    issues: tuple[str, ...] = ()
+    confidence: float | None = None
+    logical_model: str | None = None
+    deployment_id: str | None = None
+
+
+class RuntimeAssetVisualReviewer(Protocol):
+    async def review_image_asset(
+        self,
+        *,
+        tenant_id: UUID,
+        label: str,
+        prompt: str,
+        filename: str,
+        mime_type: str,
+        data: bytes,
+        image_url: str | None = None,
+    ) -> RuntimeAssetVisualReview: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _MultimediaPromptExecution:
+    prompt_index: int
+    media_results: tuple[Mapping[str, JsonValue], ...]
+    accepted_jobs: tuple[MultimediaGenerationJob, ...]
+    attempted_jobs: tuple[MultimediaGenerationJob, ...]
+    review_failed_results: tuple[Mapping[str, JsonValue], ...]
+    first_file_metadata: dict[str, JsonValue] | None = None
+
+
 class RuntimeCapabilityGateway:
     """Production capability executor for non-dangerous built-ins and approved skills."""
 
@@ -96,6 +174,11 @@ class RuntimeCapabilityGateway:
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
         multimedia_generation_executor: RuntimeMultimediaGenerationExecutor | None = None,
+        asset_visual_reviewer: RuntimeAssetVisualReviewer | None = None,
+        video_composer: RuntimeVideoComposer | None = None,
+        content_studio_service: AsyncContentStudioService | None = None,
+        content_studio_execution_mode: str = "production",
+        content_studio_owner_user_id: UUID | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -105,6 +188,17 @@ class RuntimeCapabilityGateway:
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
         self._multimedia_generation_executor = multimedia_generation_executor
+        self._asset_visual_reviewer = asset_visual_reviewer
+        self._video_composer = video_composer or VideoComposer()
+        if content_studio_execution_mode not in {"demo", "production"}:
+            raise ValueError("content_studio_execution_mode must be demo or production")
+        self._content_studio = content_studio_service or AsyncContentStudioService(
+            registry=load_pack_registry(),
+            store=AsyncInMemoryContentProjectStore(),
+            execution_mode=content_studio_execution_mode,
+        )
+        self._content_studio_execution_mode = content_studio_execution_mode
+        self._content_studio_owner_user_id = content_studio_owner_user_id
 
     def is_replay_safe(self, name: str) -> bool:
         return name in _REPLAY_SAFE
@@ -112,6 +206,10 @@ class RuntimeCapabilityGateway:
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         if name == _MULTIMEDIA_TOOL:
             return self._multimedia_generation_executor is not None
+        if name == _COMPOSE_VIDEO_TOOL:
+            return True
+        if name == _CONTENT_STUDIO_TOOL:
+            return True
         if name in _REPLAY_SAFE:
             return True
         if _SAFE_CAPABILITY_NAME.fullmatch(name) is None:
@@ -145,6 +243,10 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if name == _MULTIMEDIA_TOOL:
             return await self._execute_generate_multimedia(tenant_id, run_id, actor, arguments)
+        if name == _COMPOSE_VIDEO_TOOL:
+            return await self._execute_compose_video(tenant_id, run_id, arguments)
+        if name == _CONTENT_STUDIO_TOOL:
+            return await self._execute_content_studio(tenant_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -186,6 +288,189 @@ class RuntimeCapabilityGateway:
             "summary": "No additional runtime context is available for this query.",
             "truncated": False,
         }
+
+    async def _execute_content_studio(
+        self,
+        tenant_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        operation = _required_string(arguments, "operation").strip()
+        owner_user_id = self._content_studio_owner_user_id
+        if owner_user_id is None:
+            raise RuntimeCapabilityError(
+                "content_studio runtime owner principal is not configured; use the Content Studio workspace for project operations"
+            )
+        with _content_studio_service_scope(
+            self._content_studio,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+        ):
+            return await self._execute_scoped_content_studio(
+                tenant_id=tenant_id,
+                owner_user_id=owner_user_id,
+                operation=operation,
+                arguments=arguments,
+            )
+
+    async def _execute_scoped_content_studio(
+        self,
+        *,
+        tenant_id: UUID,
+        owner_user_id: UUID,
+        operation: str,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        if operation == "create_content_project":
+            raw_sources = arguments.get("source_urls", ())
+            if raw_sources is None:
+                raw_sources = ()
+            if not isinstance(raw_sources, (list, tuple)) or any(
+                type(item) is not str or not item.strip() for item in raw_sources
+            ):
+                raise RuntimeCapabilityError("source_urls must be a list of strings")
+            project = await _call_content_studio_service(
+                self._content_studio.create_content_project,
+                title=_required_string(arguments, "title"),
+                topic=_required_string(arguments, "topic"),
+                source_urls=tuple(str(item).strip() for item in raw_sources),
+                domain=_optional_string(arguments, "domain") or "aigc",
+                format=_optional_string(arguments, "format") or "explainer",
+                platform=_optional_string(arguments, "platform") or "douyin",
+                channel=_optional_string(arguments, "channel") or "ai_frontier",
+                style=_optional_string(arguments, "style") or "fast_minimal",
+                tenant_id=str(tenant_id),
+                owner_user_id=str(owner_user_id),
+                execution_mode=self._content_studio_execution_mode,
+            )
+            return _content_project_payload(project)
+        project_id = _required_string(arguments, "project_id")
+        project = await self._content_studio.get_content_project(project_id)
+        _validate_content_project_ownership(
+            project,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+        )
+        if operation == "get_content_project":
+            return _content_project_payload(project)
+        if operation == "run_content_project":
+            until = ProjectStatus(_optional_string(arguments, "until") or ProjectStatus.QC_REVIEW.value)
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.run_content_project,
+                    project_id=project_id,
+                    until=until,
+                )
+            )
+        if operation == "revise_script":
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.revise_script,
+                    project_id=project_id,
+                    instruction=_required_string(arguments, "instruction"),
+                )
+            )
+        if operation == "revise_storyboard":
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.revise_storyboard,
+                    project_id=project_id,
+                    instruction=_required_string(arguments, "instruction"),
+                )
+            )
+        if operation == "regenerate_asset":
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.regenerate_asset,
+                    project_id=project_id,
+                    asset_id=_required_string(arguments, "asset_id"),
+                    instruction=_required_string(arguments, "instruction"),
+                )
+            )
+        if operation == "regenerate_voice":
+            regenerate_voice = getattr(self._content_studio, "regenerate_voice", None)
+            if not callable(regenerate_voice):
+                raise RuntimeCapabilityError("content_studio regenerate_voice is unavailable")
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    regenerate_voice,
+                    project_id=project_id,
+                    instruction=_required_string(arguments, "instruction"),
+                )
+            )
+        if operation == "render_preview":
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.render_preview,
+                    project_id=project_id,
+                )
+            )
+        if operation == "approve_script":
+            self._require_content_studio_trusted_human_approval()
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.approve_script,
+                    project_id=project_id,
+                )
+            )
+        if operation == "approve_rights":
+            self._require_content_studio_trusted_human_approval()
+            approve_rights = getattr(self._content_studio, "approve_rights", None)
+            if not callable(approve_rights):
+                raise RuntimeCapabilityError("content_studio approve_rights is unavailable")
+            raw_asset_ids = arguments.get("asset_ids")
+            if not isinstance(raw_asset_ids, (list, tuple)) or any(
+                type(item) is not str or not item.strip() for item in raw_asset_ids
+            ):
+                raise RuntimeCapabilityError("asset_ids must be a list of strings")
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    approve_rights,
+                    project_id=project_id,
+                    asset_ids=tuple(str(item).strip() for item in raw_asset_ids),
+                    note=_required_string(arguments, "note"),
+                )
+            )
+        if operation == "approve_final":
+            self._require_content_studio_trusted_human_approval()
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.approve_final,
+                    project_id=project_id,
+                )
+            )
+        if operation == "retry_stage":
+            stage = ProjectStatus(_required_string(arguments, "stage"))
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.retry_stage,
+                    project_id=project_id,
+                    stage=stage,
+                )
+            )
+        if operation == "replace_claim_status":
+            raw_evidence_ids = arguments.get("evidence_ids", ())
+            if raw_evidence_ids is None:
+                raw_evidence_ids = ()
+            if not isinstance(raw_evidence_ids, (list, tuple)) or any(
+                type(item) is not str or not item.strip() for item in raw_evidence_ids
+            ):
+                raise RuntimeCapabilityError("evidence_ids must be a list of strings")
+            return _content_project_payload(
+                await _call_content_studio_service(
+                    self._content_studio.replace_claim_status,
+                    project_id=project_id,
+                    claim_id=_required_string(arguments, "claim_id"),
+                    status=ClaimStatus(_required_string(arguments, "status")),
+                    note=_required_string(arguments, "note"),
+                    evidence_ids=tuple(str(item).strip() for item in raw_evidence_ids),
+                )
+            )
+        raise RuntimeCapabilityError("content_studio operation is invalid")
+
+    def _require_content_studio_trusted_human_approval(self) -> None:
+        raise RuntimeCapabilityError(
+            "content_studio approvals require trusted workspace permission context"
+        )
 
     def _execute_workspace_read(self, arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
         if self._workspace_root is None:
@@ -338,46 +623,386 @@ class RuntimeCapabilityGateway:
         logical_model = _required_string(arguments, "logical_model").strip()
         prompt_field = "generation_prompt" if "generation_prompt" in arguments else "prompt"
         prompt = _required_string(arguments, prompt_field).strip()
-        job = executor.submit(kind=kind, logical_model=logical_model, prompt=prompt)
-        completed = await executor.run_job(job.id, executor_id=actor)
-        media_results: list[Mapping[str, JsonValue]] = []
-        first_file_metadata: dict[str, JsonValue] | None = None
-        expires_at = (
-            completed.expires_at.isoformat() if completed.expires_at is not None else None
+        prompts = _multimedia_generation_prompts(arguments, fallback_prompt=prompt)
+        labels = _multimedia_artifact_labels(
+            arguments,
+            expected_count=len(prompts),
+            prompts=prompts,
         )
-        for index, artifact in enumerate(completed.artifacts):
-            file_metadata = _stored_multimedia_file_metadata(
-                self._generated_file_store,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                artifact=artifact,
-                expires_at=expires_at,
-            )
-            if file_metadata is not None and first_file_metadata is None:
-                first_file_metadata = file_metadata
-            media_results.append(
-                _multimedia_artifact_result(
-                    artifact,
-                    job_id=completed.id,
-                    artifact_index=index,
-                    expires_at=expires_at,
-                    file_metadata=file_metadata,
+        preserved_results = _preserved_multimedia_artifacts(
+            arguments,
+            kind=kind,
+            generated_count=len(prompts),
+        )
+        semaphore = asyncio.Semaphore(_multimedia_parallelism(kind, len(prompts)))
+        execution_tasks = tuple(
+            asyncio.create_task(
+                self._execute_multimedia_prompt(
+                    executor=executor,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    actor=actor,
+                    kind=kind,
+                    logical_model=logical_model,
+                    prompt_index=prompt_index,
+                    item_prompt=item_prompt,
+                    prompt_label=labels[prompt_index] if labels is not None else None,
+                    semaphore=semaphore,
                 )
             )
+            for prompt_index, item_prompt in enumerate(prompts)
+        )
+        _done, pending = await asyncio.wait(
+            execution_tasks,
+            timeout=_multimedia_batch_timeout_seconds(kind, len(prompts), labels=labels),
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        timed_out_tasks = set(pending)
+        if pending:
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(self._consume_background_multimedia_execution_result)
+        executions: list[_MultimediaPromptExecution] = []
+        for prompt_index, task in enumerate(execution_tasks):
+            if task in timed_out_tasks or task.cancelled():
+                executions.append(
+                    _failed_multimedia_prompt_execution(
+                        kind=kind,
+                        prompt_index=prompt_index,
+                        prompt_label=labels[prompt_index] if labels is not None else None,
+                        item_prompt=prompts[prompt_index],
+                        error=RuntimeCapabilityError(
+                            f"{kind.value} generation timed out for "
+                            f"{labels[prompt_index] if labels is not None else '媒体资产'}"
+                        ),
+                    )
+                )
+                continue
+            exception = task.exception()
+            if exception is not None:
+                executions.append(
+                    _failed_multimedia_prompt_execution(
+                        kind=kind,
+                        prompt_index=prompt_index,
+                        prompt_label=labels[prompt_index] if labels is not None else None,
+                        item_prompt=prompts[prompt_index],
+                        error=exception,
+                    )
+                )
+                continue
+            executions.append(task.result())
+        media_results: list[Mapping[str, JsonValue]] = list(preserved_results)
+        first_file_metadata: dict[str, JsonValue] | None = None
+        accepted_jobs: list[MultimediaGenerationJob] = []
+        attempted_jobs: list[MultimediaGenerationJob] = []
+        review_failed_results: list[Mapping[str, JsonValue]] = []
+        for execution in sorted(executions, key=lambda item: item.prompt_index):
+            media_results.extend(execution.media_results)
+            accepted_jobs.extend(execution.accepted_jobs)
+            attempted_jobs.extend(execution.attempted_jobs)
+            review_failed_results.extend(execution.review_failed_results)
+            if first_file_metadata is None and execution.first_file_metadata is not None:
+                first_file_metadata = execution.first_file_metadata
+        first_completed = (
+            accepted_jobs[0]
+            if accepted_jobs
+            else attempted_jobs[0]
+            if attempted_jobs
+            else None
+        )
+        artifact_total = max(1, len(media_results))
+        preserved_count = len(preserved_results)
+        generated_count = max(0, artifact_total - preserved_count)
+        summary = (
+            f"Generated {kind.value} artifact with {logical_model}."
+            if artifact_total == 1
+            else f"Generated {artifact_total} {kind.value} artifacts with {logical_model}."
+        )
+        if preserved_count:
+            summary = (
+                f"Generated {generated_count} new {kind.value} artifacts and reused "
+                f"{preserved_count} approved {kind.value} artifacts with {logical_model}."
+            )
         result: dict[str, JsonValue] = {
-            "job_id": completed.id,
-            "kind": completed.kind.value,
-            "logical_model": completed.logical_model,
-            "status": completed.status.value,
-            "executor_id": completed.executor_id,
-            "summary": f"Generated {completed.kind.value} artifact with {completed.logical_model}.",
+            "job_id": first_completed.id if first_completed is not None else "unavailable",
+            "kind": first_completed.kind.value if first_completed is not None else kind.value,
+            "logical_model": (
+                first_completed.logical_model if first_completed is not None else logical_model
+            ),
+            "status": (
+                first_completed.status.value if first_completed is not None else "failed"
+            ),
+            "executor_id": first_completed.executor_id if first_completed is not None else actor,
+            "summary": summary,
             "artifacts": tuple(media_results),
             "presentation": "final_attachment",
         }
+        if preserved_count:
+            result["preserved_artifact_count"] = preserved_count
+            result["generated_artifact_count"] = generated_count
+        if review_failed_results:
+            result["review_status"] = "needs_user_revision"
+            result["review_failed_artifact_count"] = len(review_failed_results)
+            if preserved_count:
+                result["summary"] = (
+                    f"Generated {generated_count} new {kind.value} artifacts and reused "
+                    f"{preserved_count} approved {kind.value} artifacts with {logical_model}; "
+                    f"{len(review_failed_results)} require user review/regeneration."
+                )
+            else:
+                result["summary"] = (
+                    f"Generated {artifact_total} {kind.value} artifacts with {logical_model}; "
+                    f"{len(review_failed_results)} require user review/regeneration."
+                )
+        if len(accepted_jobs) > 1:
+            result["job_ids"] = tuple(job.id for job in accepted_jobs)
+        if len(attempted_jobs) > len(accepted_jobs):
+            result["attempted_job_ids"] = tuple(job.id for job in attempted_jobs)
         if first_file_metadata is not None:
             result["artifact_id"] = first_file_metadata["artifact_id"]
             result["file"] = first_file_metadata
             result["metadata"] = first_file_metadata
+        return result
+
+    async def _execute_multimedia_prompt(
+        self,
+        *,
+        executor: RuntimeMultimediaGenerationExecutor,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt_index: int,
+        item_prompt: str,
+        prompt_label: str | None,
+        semaphore: asyncio.Semaphore,
+    ) -> _MultimediaPromptExecution:
+        media_results: list[Mapping[str, JsonValue]] = []
+        first_file_metadata: dict[str, JsonValue] | None = None
+        accepted_jobs: list[MultimediaGenerationJob] = []
+        attempted_jobs: list[MultimediaGenerationJob] = []
+        review_failed_results: list[Mapping[str, JsonValue]] = []
+        async with semaphore:
+            attempt_prompt = item_prompt
+            for attempt_index in range(_MAX_VISUAL_ASSET_GENERATION_ATTEMPTS):
+                provider_attempt = 1
+                while True:
+                    job = executor.submit(kind=kind, logical_model=logical_model, prompt=attempt_prompt)
+                    try:
+                        completed = await self._run_multimedia_job_with_hard_timeout(
+                            executor,
+                            job_id=job.id,
+                            executor_id=actor,
+                            timeout_seconds=_multimedia_prompt_timeout_seconds(
+                                kind,
+                                prompt_label,
+                            ),
+                        )
+                        break
+                    except TimeoutError:
+                        raise RuntimeCapabilityError(
+                            f"{kind.value} generation timed out for {prompt_label or '媒体资产'}"
+                        ) from None
+                    except Exception as exc:
+                        if (
+                            provider_attempt >= _MULTIMEDIA_IMAGE_PROVIDER_RETRY_ATTEMPTS
+                            or not _is_retryable_multimedia_provider_error(kind, exc)
+                        ):
+                            raise
+                        await asyncio.sleep(
+                            _multimedia_provider_retry_backoff_seconds(provider_attempt)
+                        )
+                        provider_attempt += 1
+                attempted_jobs.append(completed)
+                expires_at = (
+                    completed.expires_at.isoformat() if completed.expires_at is not None else None
+                )
+                attempt_results: list[Mapping[str, JsonValue]] = []
+                attempt_first_file_metadata: dict[str, JsonValue] | None = None
+                failed_review: RuntimeAssetVisualReview | None = None
+                failed_result: Mapping[str, JsonValue] | None = None
+                for index, artifact in enumerate(completed.artifacts):
+                    file_metadata = _stored_multimedia_file_metadata(
+                        self._generated_file_store,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        artifact=artifact,
+                        expires_at=expires_at,
+                    )
+                    if file_metadata is not None and attempt_first_file_metadata is None:
+                        attempt_first_file_metadata = file_metadata
+                    try:
+                        visual_review = await self._review_multimedia_image_asset(
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            kind=kind,
+                            label=prompt_label,
+                            prompt=attempt_prompt,
+                            artifact=artifact,
+                            file_metadata=file_metadata,
+                        )
+                    except RuntimeCapabilityError as exc:
+                        visual_review = _visual_review_unavailable(
+                            label=prompt_label,
+                            error=exc,
+                        )
+                    result_item = _multimedia_artifact_result(
+                        artifact,
+                        job_id=completed.id,
+                        artifact_index=index,
+                        expires_at=expires_at,
+                        file_metadata=file_metadata,
+                        label=_multimedia_result_label(
+                            prompt_label,
+                            artifact_index=index,
+                            artifact_count=len(completed.artifacts),
+                        ),
+                        generation_prompt=attempt_prompt,
+                        visual_review=visual_review,
+                    )
+                    if visual_review is not None and not visual_review.passed:
+                        failed_review = visual_review
+                        failed_result = result_item
+                        break
+                    attempt_results.append(result_item)
+                if failed_review is None:
+                    media_results.extend(attempt_results)
+                    accepted_jobs.append(completed)
+                    if first_file_metadata is None and attempt_first_file_metadata is not None:
+                        first_file_metadata = attempt_first_file_metadata
+                    break
+                if _visual_review_is_unavailable(failed_review):
+                    if failed_result is not None:
+                        review_failed_results.append(failed_result)
+                        media_results.append(failed_result)
+                        if first_file_metadata is None and attempt_first_file_metadata is not None:
+                            first_file_metadata = attempt_first_file_metadata
+                        break
+                    raise RuntimeCapabilityError(
+                        "visual asset review unavailable for "
+                        f"{prompt_label}: {_visual_review_failure_reason(failed_review)}"
+                    )
+                if attempt_index + 1 >= _MAX_VISUAL_ASSET_GENERATION_ATTEMPTS:
+                    if failed_result is not None:
+                        review_failed_results.append(failed_result)
+                        media_results.append(failed_result)
+                        if first_file_metadata is None and attempt_first_file_metadata is not None:
+                            first_file_metadata = attempt_first_file_metadata
+                        break
+                    raise RuntimeCapabilityError(
+                        "visual asset review failed after "
+                        f"{_MAX_VISUAL_ASSET_GENERATION_ATTEMPTS} attempts for "
+                        f"{prompt_label}: {_visual_review_failure_reason(failed_review)}"
+                    )
+                attempt_prompt = _visual_asset_retry_prompt(
+                    item_prompt,
+                    label=prompt_label,
+                    review=failed_review,
+                    next_attempt=attempt_index + 2,
+                )
+        return _MultimediaPromptExecution(
+            prompt_index=prompt_index,
+            media_results=tuple(media_results),
+            accepted_jobs=tuple(accepted_jobs),
+            attempted_jobs=tuple(attempted_jobs),
+            review_failed_results=tuple(review_failed_results),
+            first_file_metadata=first_file_metadata,
+        )
+
+    async def _run_multimedia_job_with_hard_timeout(
+        self,
+        executor: RuntimeMultimediaGenerationExecutor,
+        *,
+        job_id: str,
+        executor_id: str,
+        timeout_seconds: int,
+    ) -> MultimediaGenerationJob:
+        task: asyncio.Task[MultimediaGenerationJob] = asyncio.create_task(
+            executor.run_job(job_id, executor_id=executor_id)
+        )
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(self._consume_background_multimedia_job_result)
+            raise
+        if task in done:
+            return task.result()
+        task.cancel()
+        task.add_done_callback(self._consume_background_multimedia_job_result)
+        raise TimeoutError
+
+    def _consume_background_multimedia_job_result(
+        self,
+        task: asyncio.Task[MultimediaGenerationJob],
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - background callback must consume provider failures.
+            return
+
+    def _consume_background_multimedia_execution_result(
+        self,
+        future: asyncio.Future[_MultimediaPromptExecution],
+    ) -> None:
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - background callback must consume provider failures.
+            return
+
+    async def _execute_compose_video(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        filename = _filename(arguments, title=title, extension=".mp4")
+        clips = _video_clip_inputs(arguments, store=store, tenant_id=tenant_id, run_id=run_id)
+        request = VideoComposeRequest(
+            title=title,
+            clips=clips,
+            output_filename=filename,
+            aspect_ratio=_optional_string(arguments, "aspect_ratio") or "original",
+            image_duration_seconds=_optional_int(
+                arguments,
+                "image_duration_seconds",
+                default=3,
+            ),
+        )
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-video-") as temporary_dir:
+            output_dir = Path(temporary_dir)
+            try:
+                output = await asyncio.to_thread(self._video_composer.compose, request, output_dir)
+            except VideoCompositionError as error:
+                raise RuntimeCapabilityError(str(error)) from None
+            try:
+                data = output.read_bytes()
+            except OSError:
+                raise RuntimeCapabilityError("composed video output is unavailable") from None
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=MP4_MIME_TYPE,
+                data=data,
+            )
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Composed video artifact {metadata.filename}.",
+            )
+        )
+        result["presentation"] = _generated_file_presentation(arguments, default="final_attachment")
         return result
 
     def _require_generated_file_store(self) -> GeneratedFileStore:
@@ -403,6 +1028,63 @@ class RuntimeCapabilityGateway:
         except ValueError:
             raise RuntimeCapabilityError("kind must be image, video, or audio") from None
         return await executor.default_logical_model_for_multimedia(kind=generation_kind)
+
+    async def _review_multimedia_image_asset(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        kind: MultimediaGenerationKind,
+        label: str | None,
+        prompt: str,
+        artifact: MultimediaArtifact,
+        file_metadata: Mapping[str, JsonValue] | None,
+    ) -> RuntimeAssetVisualReview | None:
+        if self._asset_visual_reviewer is None:
+            return None
+        if kind is not MultimediaGenerationKind.IMAGE or not _requires_visual_asset_review(label):
+            return None
+        if (
+            file_metadata is None
+            or self._generated_file_store is None
+            or artifact.filename is None
+            or artifact.mime_type not in {PNG_MIME_TYPE, JPEG_MIME_TYPE, WEBP_MIME_TYPE}
+        ):
+            raise RuntimeCapabilityError("visual asset review requires a stored image file")
+        storage_key = file_metadata.get("storage_key")
+        artifact_id = file_metadata.get("artifact_id")
+        if type(storage_key) is not str or type(artifact_id) is not str:
+            raise RuntimeCapabilityError("visual asset review requires generated file metadata")
+        try:
+            path = self._generated_file_store.resolve_for(
+                tenant_id,
+                run_id,
+                UUID(artifact_id),
+                storage_key,
+            )
+        except (ValueError, FileNotFoundError):
+            raise RuntimeCapabilityError("visual asset review image file is unavailable") from None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise RuntimeCapabilityError("visual asset review image file is unavailable") from None
+        try:
+            review = await self._asset_visual_reviewer.review_image_asset(
+                tenant_id=tenant_id,
+                label=label.strip() if label else "图片资产",
+                prompt=prompt,
+                filename=artifact.filename,
+                mime_type=artifact.mime_type,
+                data=data,
+                image_url=_public_multimedia_artifact_url(artifact.uri),
+            )
+        except RuntimeCapabilityError:
+            raise
+        except Exception as exc:
+            raise RuntimeCapabilityError(
+                f"visual asset review failed for {label}: {exc}"
+            ) from exc
+        return review
 
     async def _execute_skill(
         self,
@@ -493,6 +1175,20 @@ def _optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str
     return value
 
 
+def _optional_int(
+    arguments: Mapping[str, JsonValue],
+    field_name: str,
+    *,
+    default: int,
+) -> int:
+    value = arguments.get(field_name)
+    if value is None:
+        return default
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
+
+
 def _optional_mapping_list(
     arguments: Mapping[str, JsonValue],
     field_name: str,
@@ -510,6 +1206,493 @@ def _optional_mapping_list(
     return items
 
 
+def _video_clip_inputs(
+    arguments: Mapping[str, JsonValue],
+    *,
+    store: GeneratedFileStore,
+    tenant_id: UUID,
+    run_id: UUID,
+) -> tuple[VideoClipInput, ...]:
+    value = arguments.get("clips")
+    if not isinstance(value, list | tuple) or not value or len(value) > _MAX_VIDEO_CLIPS:
+        raise RuntimeCapabilityError("clips must contain 1 to 32 entries")
+    clips: list[VideoClipInput] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise RuntimeCapabilityError("clips items must be objects")
+        storage_key = _clip_required_string(item, "storage_key")
+        mime_type = _clip_required_string(item, "mime_type")
+        if mime_type not in _VIDEO_CLIP_MIME_TYPES:
+            raise RuntimeCapabilityError("unsupported clip MIME type")
+        _validate_clip_storage_filename(storage_key, mime_type)
+        path = _resolve_generated_clip_path(
+            store,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            storage_key=storage_key,
+        )
+        clips.append(
+            VideoClipInput(
+                storage_key=storage_key,
+                path=path,
+                mime_type=mime_type,
+                duration_seconds=_clip_optional_int(item, "duration_seconds"),
+                filename=_clip_optional_string(item, "filename"),
+            )
+        )
+    return tuple(clips)
+
+
+def _validate_clip_storage_filename(storage_key: str, mime_type: str) -> None:
+    filename = PurePosixPath(storage_key).name.casefold()
+    expected_extensions = _VIDEO_CLIP_EXTENSIONS.get(mime_type, ())
+    if not expected_extensions or not filename.endswith(expected_extensions):
+        raise RuntimeCapabilityError("mime_type does not match clip filename")
+
+
+def _resolve_generated_clip_path(
+    store: GeneratedFileStore,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    storage_key: str,
+) -> Path:
+    try:
+        parts = PurePosixPath(storage_key).parts
+        if len(parts) != 4:
+            raise ValueError
+        stored_tenant_id = UUID(parts[0])
+        stored_run_id = UUID(parts[1])
+        artifact_id = UUID(parts[2])
+        if stored_tenant_id != tenant_id or stored_run_id != run_id:
+            raise ValueError
+        return store.resolve_for(tenant_id, run_id, artifact_id, storage_key)
+    except (FileNotFoundError, ValueError):
+        raise RuntimeCapabilityError("clip storage_key is invalid or unavailable") from None
+
+
+def _clip_required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:
+    value = arguments.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
+def _clip_optional_int(arguments: Mapping[str, JsonValue], field_name: str) -> int | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise RuntimeCapabilityError(f"{field_name} must be an integer")
+    return value
+
+
+def _multimedia_generation_prompts(
+    arguments: Mapping[str, JsonValue],
+    *,
+    fallback_prompt: str,
+) -> tuple[str, ...]:
+    raw_prompts = arguments.get("artifact_prompts")
+    raw_count = arguments.get("artifact_count")
+    if raw_prompts is not None:
+        if not isinstance(raw_prompts, list | tuple):
+            raise RuntimeCapabilityError("artifact_prompts must be a list")
+        prompts = tuple(_nonblank_prompt(item, "artifact_prompts item") for item in raw_prompts)
+        if not 1 <= len(prompts) <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+            raise RuntimeCapabilityError(
+                f"artifact_prompts must contain 1 to {_MAX_MULTIMEDIA_ARTIFACT_COUNT} entries"
+            )
+        if raw_count is not None and raw_count != len(prompts):
+            raise RuntimeCapabilityError("artifact_count must match artifact_prompts length")
+        return prompts
+    count = _optional_int(arguments, "artifact_count", default=1)
+    if not 1 <= count <= _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+        raise RuntimeCapabilityError(
+            f"artifact_count must be between 1 and {_MAX_MULTIMEDIA_ARTIFACT_COUNT}"
+        )
+    if count == 1:
+        return (fallback_prompt,)
+    return tuple(
+        f"{fallback_prompt}\n\n输出第 {index}/{count} 个独立产物。"
+        for index in range(1, count + 1)
+    )
+
+
+def _multimedia_artifact_labels(
+    arguments: Mapping[str, JsonValue],
+    *,
+    expected_count: int,
+    prompts: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    raw_labels = arguments.get("artifact_labels")
+    if raw_labels is None:
+        return _inferred_multimedia_artifact_labels(prompts)
+    if not isinstance(raw_labels, list | tuple):
+        raise RuntimeCapabilityError("artifact_labels must be a list")
+    labels = tuple(_nonblank_prompt(item, "artifact_labels item") for item in raw_labels)
+    if len(labels) != expected_count:
+        raise RuntimeCapabilityError("artifact_labels must match artifact_prompts length")
+    return labels
+
+
+def _inferred_multimedia_artifact_labels(prompts: tuple[str, ...]) -> tuple[str, ...] | None:
+    labels: list[str | None] = []
+    for prompt in prompts:
+        labels.append(_inferred_multimedia_artifact_label(prompt))
+    if not any(label is not None for label in labels):
+        return None
+    return tuple(label if label is not None else "图片资产" for label in labels)
+
+
+def _preserved_multimedia_artifacts(
+    arguments: Mapping[str, JsonValue],
+    *,
+    kind: MultimediaGenerationKind,
+    generated_count: int,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    raw_items = arguments.get("preserved_artifacts")
+    if raw_items is None:
+        return ()
+    if not isinstance(raw_items, list | tuple):
+        raise RuntimeCapabilityError("preserved_artifacts must be a list")
+    if len(raw_items) + generated_count > _MAX_MULTIMEDIA_ARTIFACT_COUNT:
+        raise RuntimeCapabilityError(
+            f"preserved_artifacts plus artifact_prompts must contain at most "
+            f"{_MAX_MULTIMEDIA_ARTIFACT_COUNT} entries"
+        )
+    preserved: list[Mapping[str, JsonValue]] = []
+    for index, raw_item in enumerate(raw_items, start=1):
+        if not isinstance(raw_item, Mapping):
+            raise RuntimeCapabilityError("preserved_artifacts item must be an object")
+        item_kind = raw_item.get("kind")
+        if isinstance(item_kind, str) and item_kind.strip() and item_kind != kind.value:
+            raise RuntimeCapabilityError("preserved_artifacts item kind must match kind")
+        label = raw_item.get("label") or raw_item.get("title") or raw_item.get("filename")
+        if not isinstance(label, str) or not label.strip():
+            raise RuntimeCapabilityError("preserved_artifacts item must include a label")
+        cleaned: dict[str, JsonValue] = {}
+        for key, value in raw_item.items():
+            if isinstance(key, str) and _is_json_value(value):
+                cleaned[key] = value
+        cleaned["kind"] = kind.value
+        cleaned.setdefault("label", label.strip())
+        cleaned.setdefault("title", label.strip())
+        cleaned.setdefault("preserved_from_previous_attempt", True)
+        cleaned.setdefault("preserved_artifact_index", index)
+        preserved.append(cleaned)
+    return tuple(preserved)
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, str | int | float | bool):
+        return True
+    if isinstance(value, tuple | list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _inferred_multimedia_artifact_label(prompt: str) -> str | None:
+    normalized = prompt.casefold()
+    semantic_candidates: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "角色锁定资产",
+            (
+                "角色参考设定",
+                "角色参考图",
+                "角色设定板",
+                "定妆",
+                "三视",
+                "character model sheet",
+                "character sheet",
+            ),
+        ),
+        (
+            "服装妆造资产",
+            (
+                "服装妆造",
+                "服装设定板",
+                "妆造设定板",
+                "配饰",
+                "妆发",
+                "costume sheet",
+                "wardrobe sheet",
+            ),
+        ),
+        (
+            "场景资产",
+            (
+                "场景设定板",
+                "主要地点",
+                "关键空间",
+                "空间层次",
+                "背景元素",
+                "environment sheet",
+                "scene sheet",
+            ),
+        ),
+        (
+            "道具资产",
+            (
+                "道具设定板",
+                "道具图",
+                "剧情关键物",
+                "随身物",
+                "法器细节",
+                "物件细节",
+                "prop sheet",
+                "props sheet",
+                "key props",
+            ),
+        ),
+        (
+            "动作资产",
+            (
+                "动作姿态参考板",
+                "动作参考板",
+                "姿态参考板",
+                "动作分解",
+                "姿态线",
+                "pose sheet",
+                "action sheet",
+            ),
+        ),
+        (
+            "特效资产",
+            (
+                "特效设定板",
+                "法术设定",
+                "能量形态",
+                "光效",
+                "转场特效",
+                "vfx sheet",
+                "effect sheet",
+            ),
+        ),
+        (
+            "镜头资产",
+            (
+                "镜头语言设定板",
+                "景别",
+                "机位",
+                "镜头运动",
+                "构图参考",
+                "camera sheet",
+                "shot language",
+            ),
+        ),
+        (
+            "表演节奏与风格锁定资产",
+            (
+                "表演节奏",
+                "风格锁定",
+                "关键表情",
+                "眼神",
+                "肢体状态",
+                "声音节奏",
+                "performance sheet",
+                "style lock",
+            ),
+        ),
+    )
+    for label, terms in semantic_candidates:
+        if any(term.casefold() in normalized for term in terms):
+            return label
+    candidates = (
+        "角色锁定资产",
+        "角色资产",
+        "服装妆造资产",
+        "场景资产",
+        "道具资产",
+        "动作资产",
+        "特效资产",
+        "镜头资产",
+        "表演节奏与风格锁定资产",
+        "分镜图",
+        "character model sheet",
+        "asset sheet",
+        "asset pack",
+        "storyboard",
+    )
+    for candidate in candidates:
+        if candidate.casefold() in normalized:
+            return candidate
+    if any(term in normalized for term in ("资产", "锁定", "设定表", "设定板", "参考板", "asset")):
+        return "图片资产"
+    return None
+
+
+def _multimedia_job_timeout_seconds(kind: MultimediaGenerationKind) -> int:
+    if kind is MultimediaGenerationKind.IMAGE:
+        return _MULTIMEDIA_IMAGE_JOB_TIMEOUT_SECONDS
+    if kind is MultimediaGenerationKind.VIDEO:
+        return _MULTIMEDIA_VIDEO_JOB_TIMEOUT_SECONDS
+    if kind is MultimediaGenerationKind.AUDIO:
+        return _MULTIMEDIA_AUDIO_JOB_TIMEOUT_SECONDS
+    raise RuntimeCapabilityError("kind must be image, video, or audio")
+
+
+def _multimedia_prompt_timeout_seconds(
+    kind: MultimediaGenerationKind,
+    prompt_label: str | None,
+) -> int:
+    base_timeout = _multimedia_job_timeout_seconds(kind)
+    if kind is MultimediaGenerationKind.IMAGE and prompt_label is not None:
+        normalized = prompt_label.casefold()
+        if "角色锁定资产" in normalized or "character model sheet" in normalized:
+            return max(base_timeout, 1_200)
+        if "表演节奏" in normalized or "风格锁定" in normalized:
+            return max(base_timeout, 1_200)
+    return base_timeout
+
+
+def _multimedia_batch_timeout_seconds(
+    kind: MultimediaGenerationKind,
+    prompt_count: int,
+    *,
+    labels: tuple[str, ...] | None = None,
+) -> int:
+    per_job_timeout = _multimedia_job_timeout_seconds(kind)
+    if kind is MultimediaGenerationKind.IMAGE:
+        if labels:
+            per_job_timeout = max(
+                _multimedia_prompt_timeout_seconds(kind, label)
+                for label in labels
+            )
+        wave_count = math.ceil(max(1, prompt_count) / _multimedia_parallelism(kind, prompt_count))
+        return per_job_timeout * wave_count
+    return per_job_timeout * max(1, prompt_count)
+
+
+def _is_retryable_multimedia_provider_error(
+    kind: MultimediaGenerationKind,
+    error: Exception,
+) -> bool:
+    if kind is not MultimediaGenerationKind.IMAGE:
+        return False
+    lowered = f"{type(error).__module__}.{type(error).__name__}: {error}".casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "rate limit",
+            "requests rate limit exceeded",
+            "too many requests",
+            "throttl",
+            "resource_exhausted",
+            "temporarily unavailable",
+            "service unavailable",
+            "provider overloaded",
+            "upstream overloaded",
+            "task query failed",
+            "readtimeout",
+            "read timeout",
+            "timed out",
+            "timeout",
+            "remoteprotocolerror",
+            "server disconnected",
+            "connection reset",
+            "connection aborted",
+            "transport failed",
+        )
+    )
+
+
+def _multimedia_provider_retry_backoff_seconds(attempt_index: int) -> float:
+    return _MULTIMEDIA_IMAGE_PROVIDER_RETRY_BACKOFF_SECONDS * max(1, attempt_index)
+
+
+def _first_failed_task(
+    tasks: set[asyncio.Task[_MultimediaPromptExecution]],
+) -> asyncio.Task[_MultimediaPromptExecution] | None:
+    for task in tasks:
+        if task.cancelled():
+            continue
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            continue
+        if exception is not None:
+            return task
+    return None
+
+
+def _failed_multimedia_prompt_execution(
+    *,
+    kind: MultimediaGenerationKind,
+    prompt_index: int,
+    prompt_label: str | None,
+    item_prompt: str,
+    error: BaseException,
+) -> _MultimediaPromptExecution:
+    label = prompt_label or f"{kind.value}资产 {prompt_index + 1}"
+    error_text = " ".join(str(error).split())[:500] or type(error).__name__
+    review = RuntimeAssetVisualReview(
+        passed=False,
+        summary=f"{label} 生成失败，需单项重试。",
+        issues=(error_text,),
+        confidence=0.0,
+    )
+    item: dict[str, JsonValue] = {
+        "kind": kind.value,
+        "label": label,
+        "title": label,
+        "status": "failed",
+        "generation_prompt": item_prompt,
+        "visual_review": _visual_review_payload(review),
+        "generation_error": error_text,
+    }
+    production_metadata = production_metadata_for_label(label, item_prompt)
+    if production_metadata:
+        item["production_metadata"] = production_metadata
+    return _MultimediaPromptExecution(
+        prompt_index=prompt_index,
+        media_results=(item,),
+        accepted_jobs=(),
+        attempted_jobs=(),
+        review_failed_results=(item,),
+        first_file_metadata=None,
+    )
+
+
+def _multimedia_parallelism(kind: MultimediaGenerationKind, prompt_count: int) -> int:
+    if prompt_count <= 1:
+        return 1
+    if kind is MultimediaGenerationKind.IMAGE:
+        return min(9, prompt_count)
+    if kind in {MultimediaGenerationKind.VIDEO, MultimediaGenerationKind.AUDIO}:
+        return 1
+    raise RuntimeCapabilityError("kind must be image, video, or audio")
+
+
+def _multimedia_result_label(
+    label: str | None,
+    *,
+    artifact_index: int,
+    artifact_count: int,
+) -> str | None:
+    if label is None:
+        return None
+    if artifact_count <= 1:
+        return label
+    return f"{label} {artifact_index + 1}"
+
+
+def _nonblank_prompt(value: object, field_name: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must be a nonblank string")
+    return value.strip()
+
+
 def _multimedia_kind(arguments: Mapping[str, JsonValue]) -> MultimediaGenerationKind:
     value = _required_string(arguments, "kind").strip()
     try:
@@ -525,14 +1708,24 @@ def _multimedia_artifact_result(
     artifact_index: int,
     expires_at: str | None = None,
     file_metadata: Mapping[str, JsonValue] | None = None,
+    label: str | None = None,
+    generation_prompt: str | None = None,
+    visual_review: RuntimeAssetVisualReview | None = None,
 ) -> Mapping[str, JsonValue]:
+    production_metadata = (
+        production_metadata_for_label(label, generation_prompt)
+        if label is not None and generation_prompt is not None
+        else {}
+    )
     if file_metadata is not None:
-        return {
+        result: dict[str, JsonValue] = {
             "kind": artifact.kind.value,
             "uri": artifact.uri,
             "text": artifact.text,
             "logical_model": artifact.logical_model,
             "deployment_id": artifact.deployment_id,
+            "artifact_id": file_metadata["artifact_id"],
+            "storage_key": file_metadata["storage_key"],
             "filename": file_metadata["filename"],
             "mime_type": file_metadata["mime_type"],
             "size_bytes": file_metadata["size_bytes"],
@@ -541,6 +1734,16 @@ def _multimedia_artifact_result(
             "expires_at": expires_at,
             "file": dict(file_metadata),
         }
+        if label is not None:
+            result["label"] = label
+            result["title"] = label
+        if generation_prompt is not None:
+            result["generation_prompt"] = generation_prompt
+        if production_metadata:
+            result["production_metadata"] = production_metadata
+        if visual_review is not None:
+            result["visual_review"] = _visual_review_payload(visual_review)
+        return result
     download_url: str | None = None
     size_bytes: int | None = None
     digest: str | None = None
@@ -564,7 +1767,7 @@ def _multimedia_artifact_result(
         except (OSError, ValueError):
             filename = None
             mime_type = None
-    return {
+    result = {
         "kind": artifact.kind.value,
         "uri": artifact.uri,
         "text": artifact.text,
@@ -577,6 +1780,110 @@ def _multimedia_artifact_result(
         "download_url": download_url,
         "expires_at": expires_at,
     }
+    if label is not None:
+        result["label"] = label
+        result["title"] = label
+    if generation_prompt is not None:
+        result["generation_prompt"] = generation_prompt
+    if production_metadata:
+        result["production_metadata"] = production_metadata
+    if visual_review is not None:
+        result["visual_review"] = _visual_review_payload(visual_review)
+    return result
+
+
+def _requires_visual_asset_review(label: str | None) -> bool:
+    if label is None:
+        return False
+    normalized = label.casefold()
+    return any(
+        term in normalized
+        for term in (
+            "资产",
+            "锁定",
+            "设定",
+            "角色",
+            "场景",
+            "道具",
+            "动作",
+            "特效",
+            "分镜",
+            "asset",
+            "storyboard",
+            "character",
+            "scene",
+            "prop",
+            "effect",
+        )
+    )
+
+
+def _visual_review_failure_reason(review: RuntimeAssetVisualReview) -> str:
+    issues = "；".join(review.issues)
+    return review.summary if not issues else f"{review.summary}：{issues}"
+
+
+def _visual_review_unavailable(
+    *,
+    label: str | None,
+    error: Exception,
+) -> RuntimeAssetVisualReview:
+    label_text = label.strip() if label else "图片资产"
+    reason = str(error).strip() or type(error).__name__
+    return RuntimeAssetVisualReview(
+        passed=False,
+        summary=f"{label_text} 视觉审核执行失败",
+        issues=(reason[:1000],),
+        confidence=0.0,
+    )
+
+
+def _visual_review_is_unavailable(review: RuntimeAssetVisualReview) -> bool:
+    return review.confidence == 0.0 and "视觉审核执行失败" in review.summary
+
+
+def _public_multimedia_artifact_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if re.match(r"^https?://", candidate, flags=re.IGNORECASE) is None:
+        return None
+    return candidate
+
+
+def _visual_asset_retry_prompt(
+    original_prompt: str,
+    *,
+    label: str | None,
+    review: RuntimeAssetVisualReview,
+    next_attempt: int,
+) -> str:
+    label_text = label.strip() if label else "图片资产"
+    reason = _visual_review_failure_reason(review)
+    return (
+        f"{original_prompt}\n\n"
+        f"视觉审核未通过，正在第 {next_attempt} 次重新生成同一项资产：{label_text}。\n"
+        f"上一版问题：{reason}\n"
+        "请修正上述问题后重新生成合格资产图；不要输出电影剧照、宣传海报、随机写真、"
+        "混合角色图片或与该资产类别无关的画面。"
+    )
+
+
+def _visual_review_payload(review: RuntimeAssetVisualReview) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "passed": review.passed,
+        "summary": review.summary,
+        "issues": tuple(review.issues),
+    }
+    if review.confidence is not None:
+        payload["confidence"] = review.confidence
+    if review.logical_model is not None:
+        payload["logical_model"] = review.logical_model
+    if review.deployment_id is not None:
+        payload["deployment_id"] = review.deployment_id
+    return payload
 
 
 def _stored_multimedia_file_metadata(
@@ -707,6 +2014,104 @@ def _file_result(
         "metadata": public_metadata,
         "summary": summary,
     }
+
+
+def _content_project_payload(project: object) -> Mapping[str, JsonValue]:
+    value = _jsonify_content_value(project)
+    if not isinstance(value, Mapping):
+        raise RuntimeCapabilityError("content_studio result is invalid")
+    return value
+
+
+async def _call_content_studio_service(method: object, **kwargs: object) -> object:
+    if not callable(method):
+        raise RuntimeCapabilityError("content_studio operation is unavailable")
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        filtered_kwargs = kwargs
+    else:
+        accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        filtered_kwargs = kwargs if accepts_var_kwargs else {
+            key: value for key, value in kwargs.items() if key in signature.parameters
+        }
+    result = method(**filtered_kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _content_studio_service_scope(
+    service: object,
+    *,
+    tenant_id: UUID,
+    owner_user_id: UUID,
+) -> contextlib.AbstractContextManager[object]:
+    store = getattr(service, "_store", None)
+    scoped_to = getattr(store, "scoped_to", None)
+    if callable(scoped_to):
+        return cast(
+            contextlib.AbstractContextManager[object],
+            scoped_to(tenant_id=tenant_id, owner_user_id=owner_user_id),
+        )
+    return contextlib.nullcontext()
+
+
+def _validate_content_project_ownership(
+    project: object,
+    *,
+    tenant_id: UUID,
+    owner_user_id: UUID,
+) -> None:
+    project_tenant_id = _content_project_identity_field(project, "tenant_id")
+    project_owner_user_id = _content_project_identity_field(project, "owner_user_id")
+    if project_tenant_id and project_tenant_id != str(tenant_id):
+        raise RuntimeCapabilityError("content_studio project ownership mismatch")
+    if project_owner_user_id and project_owner_user_id != str(owner_user_id):
+        raise RuntimeCapabilityError("content_studio project ownership mismatch")
+
+
+def _content_project_identity_field(project: object, field: str) -> str:
+    if isinstance(project, Mapping):
+        value = project.get(field)
+    else:
+        value = getattr(project, field, None)
+    if value is None or value == "":
+        return ""
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, str):
+        try:
+            return str(UUID(value))
+        except ValueError:
+            return value
+    raise RuntimeCapabilityError("content_studio project ownership mismatch")
+
+
+def _jsonify_content_value(value: object) -> JsonValue:
+    if isinstance(value, Enum):
+        return str(value.value)
+    if isinstance(value, UUID):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            str(key): _jsonify_content_value(item)
+            for key, item in asdict(value).items()
+        }
+    if value is None or type(value) in {bool, int, str}:
+        return cast(JsonValue, value)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise RuntimeCapabilityError("content_studio result is invalid")
+        return value
+    if isinstance(value, tuple | list | frozenset | set):
+        return tuple(_jsonify_content_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return {str(key): _jsonify_content_value(item) for key, item in value.items()}
+    raise RuntimeCapabilityError("content_studio result is invalid")
 
 
 def _execution_id(actor: str, skill_id: str, idempotency_key: str) -> str:
