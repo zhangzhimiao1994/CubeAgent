@@ -22,6 +22,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _direct_multimedia_generation_prompt,
     _normalize_tool_call_arguments,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -732,6 +733,56 @@ async def test_multimedia_generator_directly_executes_media_tool_without_text_mo
     )
     assert created.payload["logical_model"] == "media_primary"
     assert completed.payload["logical_model"] == "media_primary"
+
+
+def test_direct_multimedia_prompt_hardens_short_drama_character_assets() -> None:
+    prompt = _direct_multimedia_generation_prompt(
+        TaskContext(
+            run_id=RUN_ID,
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request=(
+                "根据剧本生成男女主和配角的角色资产图，要求角色身份锁定、"
+                "不同场景可以换装，再继续生成分镜图和视频片段。"
+            ),
+        ),
+        DispatchStep(
+            id="multimedia_generator_step",
+            agent="multimedia_generator",
+            task="User task: 生成角色定妆资产图、分镜图、视频片段",
+            tools=("generate_multimedia",),
+            final_synthesizer=True,
+        ),
+        (),
+    )
+
+    assert "Character Identity + Look / Costume + Pose + Scene + Shot Prompt" in prompt
+    assert "人物资产图必须使用纯白或透明背景" in prompt
+    assert "禁止在图片内生成中文标签、乱码、伪 UI 文本或错误栏目字" in prompt
+    assert "不得把多个角色混在同一张人物身份资产图里" in prompt
+    assert "视觉审核未通过时只重试失败资产" in prompt
+
+
+def test_direct_multimedia_prompt_does_not_overconstrain_ordinary_images() -> None:
+    prompt = _direct_multimedia_generation_prompt(
+        TaskContext(
+            run_id=RUN_ID,
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="请生成一张赛博朋克产品海报。",
+        ),
+        DispatchStep(
+            id="multimedia_generator_step",
+            agent="multimedia_generator",
+            task="User task: 生成产品海报",
+            tools=("generate_multimedia",),
+            final_synthesizer=True,
+        ),
+        (),
+    )
+
+    assert "AI 短剧资产/分镜/视频生产硬约束" not in prompt
+    assert "Character Identity + Look / Costume + Pose + Scene + Shot Prompt" not in prompt
 
 
 @pytest.mark.parametrize(

@@ -847,6 +847,11 @@ def _direct_multimedia_generation_prompt(
     parts = [context.request.strip(), f"执行任务：{step.task.strip()}"]
     if source_previews:
         parts.append("参考上游产物：\n" + "\n".join(source_previews))
+    guidance = _direct_multimedia_production_guidance(
+        f"{context.request}\n{step.task}\n" + "\n".join(source_previews)
+    )
+    if guidance:
+        parts.append(guidance)
     prompt = "\n\n".join(part for part in parts if part)
     prompt = unicodedata.normalize("NFC", prompt)
     prompt = "".join(
@@ -855,6 +860,56 @@ def _direct_multimedia_generation_prompt(
     )
     prompt = _CONTROL_CHARS.sub(" ", prompt)
     return _truncate_prompt_text(prompt.strip(), max_bytes=_DIRECT_MULTIMEDIA_PROMPT_BYTES)
+
+
+def _direct_multimedia_production_guidance(text: str) -> str:
+    normalized = text.casefold()
+    if not _looks_like_short_drama_asset_pipeline(normalized):
+        return ""
+    return (
+        "AI 短剧资产/分镜/视频生产硬约束：\n"
+        "- 按 Character Identity + Look / Costume + Pose + Scene + Shot Prompt 组合生成。"
+        "不要把人物身份和服装绑定为同一个资产。\n"
+        "- 每个 Character ID 必须单独生成一张人物身份资产图；不得把多个角色混在同一张人物身份资产图里。"
+        "如剧本包含男女主、反派、配角或群像，按剧本逐一拆分，不得只生成一张合照。\n"
+        "- 人物资产图必须使用纯白或透明背景，不要出现房间、街道、山水、道具桌、分镜背景或剧情场景，"
+        "避免背景污染后续图生视频锁定。\n"
+        "- Identity Lock 优先级最高：保持参考角色完全一致的脸型、五官比例、眼睛间距、鼻型、嘴型、"
+        "下颌线、肤色、年龄特征、发际线、基础发型和身体比例；换装只改变 Look / Costume。\n"
+        "- Look / Costume 只描述服装、鞋履、首饰、包、帽子、材质、颜色和穿着方式，"
+        "不得重新设计脸、发型、肤色、年龄或身材身份。\n"
+        "- 角色资产图应包含干净的正脸、左右 45 度、侧脸、半身、全身、必要表情和关键服装/配饰参考；"
+        "表情、服装、道具、特效、动作、场景、镜头节奏等资产应分开表达，不要塞成一张混乱拼贴。\n"
+        "- 禁止在图片内生成中文标签、乱码、伪 UI 文本或错误栏目字；需要标签时只在结构化文字说明里输出，"
+        "不要让模型把文字画进图里。\n"
+        "- 分镜图必须画面干净，只表达该镜头需要的人物、动作、构图、景别、场景和关键视觉信息；"
+        "不要把所有角色设定、道具清单和提示词都画进同一张分镜图。\n"
+        "- 视频片段应基于已通过审核的 Identity、Look、资产图和分镜图生成；生成后需要抽帧检查人物一致性、"
+        "错字、黑帧、冻结、裁切、字幕遮挡、特效和动作是否符合分镜。\n"
+        "- 视觉审核未通过时只重试失败资产、失败分镜或失败视频片段，保留已通过项目，避免整包重复生成。"
+    )
+
+
+def _looks_like_short_drama_asset_pipeline(normalized: str) -> bool:
+    if not any(keyword in normalized for keyword in ("短剧", "剧本", "故事", "story", "script")):
+        return False
+    return any(
+        keyword in normalized
+        for keyword in (
+            "角色",
+            "人物",
+            "character",
+            "identity",
+            "look",
+            "costume",
+            "资产",
+            "定妆",
+            "分镜",
+            "storyboard",
+            "视频片段",
+            "shot",
+        )
+    )
 
 
 def _direct_runtime_completion(
