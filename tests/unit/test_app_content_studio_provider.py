@@ -109,6 +109,32 @@ async def test_content_studio_tts_input_is_only_approved_narration(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_content_studio_blocks_tts_when_script_contains_task_prompt(tmp_path: Path) -> None:
+    audio = tmp_path / "voice.wav"
+    _write_demo_signal_wav(audio, seconds=1)
+    multimedia = FakeAudioMultimedia(audio)
+    provider = _ConfigBackedContentStudioProductionProvider(
+        list_models=lambda: (),
+        secret_service=object(),
+        tenant_id=uuid4(),
+        redis_client=object(),
+        multimedia_generation_executor=multimedia,
+        output_dir=tmp_path,
+    )
+    project = _voice_ready_project(
+        narration=(
+            "做一条约60秒的AIGC抖音科普视频，主题是2026年前后AI Agent、多模态生成和企业落地的主要变化。",
+        ),
+    )
+
+    voiced = await provider._ensure_voice(project)
+
+    assert voiced.status is ProjectStatus.FAILED_BLOCKED
+    assert multimedia.prompts == []
+    assert any(event.kind == "blocked" and event.stage == "voice_generation_failed" for event in voiced.events)
+
+
+@pytest.mark.asyncio
 async def test_content_studio_voice_keeps_demo_blocker_without_audio_generation(tmp_path: Path) -> None:
     provider = _ConfigBackedContentStudioProductionProvider(
         list_models=lambda: (),
@@ -240,6 +266,70 @@ def test_render_request_splits_still_assets_into_short_visual_beats(tmp_path: Pa
     assert (
         request.timeline.visuals[-1].start_ms + request.timeline.visuals[-1].duration_ms
         == project.timeline.duration_ms
+    )
+
+
+def test_timeline_uses_real_tts_duration_when_audio_file_is_available(tmp_path: Path) -> None:
+    audio = tmp_path / "voice.wav"
+    _write_demo_signal_wav(audio, seconds=3)
+    provider = _ConfigBackedContentStudioProductionProvider(
+        list_models=lambda: (),
+        secret_service=object(),
+        tenant_id=uuid4(),
+        redis_client=object(),
+        output_dir=tmp_path,
+    )
+    project = replace(
+        _voice_ready_project(),
+        voice_track=VoiceTrack(
+            audio_artifact_id=str(audio),
+            timestamp_level="sentence",
+            pronunciation_report=(),
+            mime_type="audio/wav",
+            source="caller_tts",
+        ),
+    )
+
+    timeline_ready = provider._ensure_timeline(project)
+
+    assert timeline_ready.timeline is not None
+    assert timeline_ready.timeline.duration_ms == 3_000
+
+
+def test_render_request_subtitle_timing_follows_narration_weight(tmp_path: Path) -> None:
+    project = _voice_ready_project(
+        narration=(
+            "AIGC 正在接进真实工作流。",
+            "这意味着同一个任务里，模型不只是回答问题，还要读资料、调工具、产出结果，并留下可检查的证据。",
+        )
+    )
+    project = replace(
+        project,
+        voice_track=VoiceTrack(
+            audio_artifact_id=str(tmp_path / "voice.wav"),
+            timestamp_level="sentence",
+            pronunciation_report=(),
+        ),
+        timeline=Timeline(
+            width=1080,
+            height=1920,
+            duration_ms=12_000,
+            tracks={
+                "narration": ("voice",),
+                "primary_visual": tuple(asset.asset_id for asset in project.asset_manifest.assets),
+                "subtitle": project.script.subtitle_lines if project.script else (),
+            },
+        ),
+    )
+
+    request = _render_request_from_project(project)
+
+    assert len(request.timeline.subtitles) == 2
+    assert request.timeline.subtitles[1].duration_ms > request.timeline.subtitles[0].duration_ms
+    assert request.timeline.subtitles[0].start_ms == 0
+    assert (
+        request.timeline.subtitles[-1].start_ms + request.timeline.subtitles[-1].duration_ms
+        == 12_000
     )
 
 

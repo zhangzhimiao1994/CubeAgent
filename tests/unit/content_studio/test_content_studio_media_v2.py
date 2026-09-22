@@ -111,7 +111,7 @@ def test_still_image_visuals_use_motion_filter_instead_of_static_hold(tmp_path: 
     assert "fps=30" in filters
 
 
-def test_qc_warns_when_still_visual_cadence_is_too_slow(tmp_path: Path) -> None:
+def test_qc_fails_when_still_visual_cadence_is_too_slow(tmp_path: Path) -> None:
     image, audio = _media_files(tmp_path)
     adapter = ContentStudioMediaAdapter(
         runner=FakeMediaRunner(duration="6.000000"),
@@ -122,8 +122,9 @@ def test_qc_warns_when_still_visual_cadence_is_too_slow(tmp_path: Path) -> None:
     preview = adapter.render_preview(_request(image=image, audio=audio, duration_ms=6000), tmp_path / "out")
 
     cadence = preview.qc.check("visual_change_cadence")
-    assert cadence.status == "warning"
+    assert cadence.status == "failed"
     assert "VIS001" in cadence.details
+    assert preview.qc.technical_passed is False
 
 
 def test_final_render_requires_matching_approval(tmp_path: Path) -> None:

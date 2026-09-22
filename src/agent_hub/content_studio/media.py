@@ -1401,8 +1401,8 @@ def _visual_change_cadence_check(timeline: MediaTimeline) -> MediaQCCheck:
     if slow_stills:
         return MediaQCCheck(
             "visual_change_cadence",
-            "warning",
-            "静态图片视觉节奏超过 5 秒，可能呈现 PPT 感: " + ", ".join(slow_stills),
+            "failed",
+            "静态图片视觉节奏超过 5 秒，会呈现图片拉长/PPT 感: " + ", ".join(slow_stills),
         )
     return MediaQCCheck("visual_change_cadence", "passed", "静态图片视觉节奏符合 3-5 秒变化要求。")
 

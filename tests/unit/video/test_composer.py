@@ -93,6 +93,7 @@ def test_composer_normalizes_segments_and_concatenates(
     assert "-loop" in calls[0]
     assert "-t" in calls[0]
     assert "2" in calls[0]
+    assert any("crop=1080:1920" in arg and "n/60" in arg for arg in calls[0])
     assert "-c:v" in calls[0]
     assert "libx264" in calls[0]
     assert "-movflags" in calls[0]

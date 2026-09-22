@@ -146,7 +146,7 @@ class VideoComposer:
                 str(duration),
                 "-i",
                 str(clip.path),
-                *self._video_filter_args(request.aspect_ratio),
+                *self._image_motion_filter_args(request.aspect_ratio, duration),
                 "-r",
                 "30",
                 "-c:v",
@@ -207,6 +207,20 @@ class VideoComposer:
             ),
         ]
 
+    def _image_motion_filter_args(self, aspect_ratio: str, duration_seconds: int) -> list[str]:
+        width, height = _canvas_size(aspect_ratio)
+        frames = max(1, duration_seconds * 30)
+        scaled_width = round(width * 1.08)
+        scaled_height = round(height * 1.08)
+        return [
+            "-vf",
+            (
+                f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}:x='(iw-ow)*n/{frames}':y='(ih-oh)/2',"
+                "setsar=1"
+            ),
+        ]
+
     def _run(self, command: list[str], *, timeout: int) -> None:
         try:
             subprocess.run(
@@ -238,6 +252,14 @@ def _validate_clip_files(clips: tuple[VideoClipInput, ...]) -> None:
     for clip in clips:
         if not clip.path.is_file():
             raise VideoCompositionError("clip source file does not exist")
+
+
+def _canvas_size(aspect_ratio: str) -> tuple[int, int]:
+    if aspect_ratio == "9:16":
+        return (1080, 1920)
+    if aspect_ratio == "16:9":
+        return (1920, 1080)
+    return (1280, 720)
 
 
 def _validate_clip_mime_type(mime_type: str) -> None:

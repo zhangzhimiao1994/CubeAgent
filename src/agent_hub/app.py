@@ -9,6 +9,8 @@ import logging
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import wave
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -1213,7 +1215,9 @@ class _ConfigBackedContentStudioProductionProvider:
             return _content_studio_blocked(project, "timeline_inputs_missing", "voice, assets, and script are required before timeline")
         width = _content_studio_int_setting(project, "width")
         height = _content_studio_int_setting(project, "height")
-        duration_ms = _content_studio_int_setting(project, "target_seconds") * 1000
+        duration_ms = _content_studio_voice_duration_ms(project.voice_track) or (
+            _content_studio_int_setting(project, "target_seconds") * 1000
+        )
         timeline = Timeline(
             width=width,
             height=height,
@@ -1778,13 +1782,12 @@ def _render_request_from_project(project: ContentProject) -> RenderRequest:
             )
             start += beat_duration
     subtitles: list[SubtitleCue] = []
-    line_duration = max(1000, duration_ms // max(1, len(project.script.subtitle_lines)))
+    subtitle_durations = _content_studio_subtitle_durations(project.script.subtitle_lines, duration_ms)
     start = 0
     claim_ids_by_line = tuple(
         segment.claim_ids for segment in project.script.segments
     ) or ((),)
-    for index, line in enumerate(project.script.subtitle_lines, start=1):
-        current_duration = duration_ms - start if index == len(project.script.subtitle_lines) else line_duration
+    for index, (line, current_duration) in enumerate(zip(project.script.subtitle_lines, subtitle_durations, strict=False), start=1):
         subtitles.append(
             SubtitleCue(
                 cue_id=f"SUB{index:03d}",
@@ -1837,7 +1840,93 @@ def _content_studio_voice_prompt(project: ContentProject) -> str:
     narration = narration.strip()
     if not narration:
         raise ValueError("script narration is empty")
+    if _content_studio_narration_looks_like_task_prompt(narration):
+        raise ValueError("script narration appears to contain task instructions instead of spoken copy")
     return narration[:4000]
+
+
+def _content_studio_narration_looks_like_task_prompt(narration: str) -> bool:
+    head = narration[:260]
+    prompt_markers = (
+        "做一条约",
+        "生成一条",
+        "请生成",
+        "请为",
+        "要求研究",
+        "要求：",
+        "输出格式",
+        "subtitle_lines",
+        "script_segments",
+        "```json",
+    )
+    return any(marker in head for marker in prompt_markers) and any(
+        media_marker in head for media_marker in ("视频", "抖音", "脚本", "主题", "AIGC")
+    )
+
+
+def _content_studio_voice_duration_ms(voice_track: VoiceTrack) -> int | None:
+    path = Path(voice_track.audio_artifact_id)
+    if not path.is_file():
+        return None
+    if voice_track.mime_type == "audio/wav" or path.suffix.casefold() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as wav:
+                frame_rate = wav.getframerate()
+                if frame_rate <= 0:
+                    return None
+                return max(1000, round(wav.getnframes() / frame_rate * 1000))
+        except (wave.Error, OSError, EOFError):
+            return None
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        result = subprocess.run(
+            (
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    try:
+        duration_seconds = float(result.stdout.strip())
+    except ValueError:
+        return None
+    if duration_seconds <= 0:
+        return None
+    return max(1000, round(duration_seconds * 1000))
+
+
+def _content_studio_subtitle_durations(lines: Sequence[str], duration_ms: int) -> tuple[int, ...]:
+    if not lines:
+        return ()
+    if len(lines) == 1:
+        return (duration_ms,)
+    weights = tuple(max(1, len(line.strip())) for line in lines)
+    total = sum(weights)
+    durations: list[int] = []
+    previous_boundary = 0
+    cumulative = 0
+    for index, weight in enumerate(weights, start=1):
+        cumulative += weight
+        boundary = duration_ms if index == len(weights) else round(duration_ms * cumulative / total)
+        current = max(1, boundary - previous_boundary)
+        durations.append(current)
+        previous_boundary = previous_boundary + current
+    if sum(durations) != duration_ms:
+        durations[-1] += duration_ms - sum(durations)
+    return tuple(durations)
 
 
 def _content_studio_visual_beats(duration_ms: int, mime_type: str) -> tuple[int, ...]:
