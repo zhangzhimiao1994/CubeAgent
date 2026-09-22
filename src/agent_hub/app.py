@@ -1159,10 +1159,11 @@ class _ConfigBackedContentStudioProductionProvider:
             logical_model = await self._multimedia.default_logical_model(MultimediaGenerationKind.AUDIO.value)
             if logical_model:
                 try:
+                    voice_text = _content_studio_voice_prompt(project)
                     result = await self._multimedia.generate(
                         kind=MultimediaGenerationKind.AUDIO,
                         logical_model=logical_model,
-                        prompt=_content_studio_voice_prompt(project),
+                        prompt=voice_text,
                     )
                 except (ModelGatewayError, RuntimeError, ValueError) as error:
                     return _content_studio_blocked(project, "voice_generation_failed", str(error))
@@ -1760,16 +1761,22 @@ def _render_request_from_project(project: ContentProject) -> RenderRequest:
         if not raw_path:
             raise ValueError(f"asset has no local file path: {asset.asset_id}")
         current_duration = duration_ms - start if index == len(assets) - 1 else clip_duration
-        visuals.append(
-            VisualClip(
-                clip_id=asset.asset_id,
-                path=Path(raw_path),
-                mime_type=str(asset.technical_params.get("mime", "image/png")),
-                start_ms=start,
-                duration_ms=current_duration,
+        path = Path(raw_path)
+        mime_type = str(asset.technical_params.get("mime", "image/png"))
+        for beat_index, beat_duration in enumerate(
+            _content_studio_visual_beats(current_duration, mime_type),
+            start=1,
+        ):
+            visuals.append(
+                VisualClip(
+                    clip_id=asset.asset_id if beat_index == 1 else f"{asset.asset_id}-B{beat_index:02d}",
+                    path=path,
+                    mime_type=mime_type,
+                    start_ms=start,
+                    duration_ms=beat_duration,
+                )
             )
-        )
-        start += current_duration
+            start += beat_duration
     subtitles: list[SubtitleCue] = []
     line_duration = max(1000, duration_ms // max(1, len(project.script.subtitle_lines)))
     start = 0
@@ -1823,15 +1830,24 @@ def _render_request_from_project(project: ContentProject) -> RenderRequest:
 
 def _content_studio_voice_prompt(project: ContentProject) -> str:
     if project.script is None:
-        return project.topic
+        raise ValueError("approved script narration is required before TTS")
     narration = "\n".join(segment.text for segment in project.script.segments if segment.text.strip())
     if not narration.strip():
         narration = "\n".join(line for line in project.script.subtitle_lines if line.strip())
-    return (
-        "请为一条抖音竖屏科普视频生成自然、清晰、口语化的中文旁白音频。"
-        "语速适中，适合普通用户理解；不要播报 Claim ID；英文缩写 AIGC 读作 A-I-G-C。\n\n"
-        f"标题：{project.title}\n主题：{project.topic}\n旁白：\n{narration[:4000]}"
-    )
+    narration = narration.strip()
+    if not narration:
+        raise ValueError("script narration is empty")
+    return narration[:4000]
+
+
+def _content_studio_visual_beats(duration_ms: int, mime_type: str) -> tuple[int, ...]:
+    if not mime_type.startswith("image/"):
+        return (duration_ms,)
+    max_beat_ms = 5_000
+    beat_count = max(1, math.ceil(duration_ms / max_beat_ms))
+    base = duration_ms // beat_count
+    remainder = duration_ms % beat_count
+    return tuple(base + (1 if index < remainder else 0) for index in range(beat_count))
 
 
 def _audio_mime_type_for_path(path: Path) -> str:

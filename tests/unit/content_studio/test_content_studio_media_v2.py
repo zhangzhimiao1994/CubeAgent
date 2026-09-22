@@ -88,6 +88,44 @@ def test_preview_render_returns_local_mp4_metadata_without_final(tmp_path: Path)
     assert "-c:a aac" in joined
 
 
+def test_still_image_visuals_use_motion_filter_instead_of_static_hold(tmp_path: Path) -> None:
+    image, audio = _media_files(tmp_path)
+    runner = FakeMediaRunner()
+    adapter = ContentStudioMediaAdapter(runner=runner, ffmpeg_binary="ffmpeg", ffprobe_binary="ffprobe")
+
+    adapter.render_preview(_request(image=image, audio=audio, duration_ms=6000), tmp_path / "out")
+
+    visual_commands = [
+        command
+        for command in runner.commands
+        if Path(command[-1]).name.startswith("visual-0")
+    ]
+    assert visual_commands
+    assert all(command.index("-t") > command.index("-vf") for command in visual_commands)
+    filters = " ".join(
+        command[command.index("-vf") + 1]
+        for command in visual_commands
+        if "-vf" in command
+    )
+    assert "zoompan=" in filters
+    assert "fps=30" in filters
+
+
+def test_qc_warns_when_still_visual_cadence_is_too_slow(tmp_path: Path) -> None:
+    image, audio = _media_files(tmp_path)
+    adapter = ContentStudioMediaAdapter(
+        runner=FakeMediaRunner(duration="6.000000"),
+        ffmpeg_binary="ffmpeg",
+        ffprobe_binary="ffprobe",
+    )
+
+    preview = adapter.render_preview(_request(image=image, audio=audio, duration_ms=6000), tmp_path / "out")
+
+    cadence = preview.qc.check("visual_change_cadence")
+    assert cadence.status == "warning"
+    assert "VIS001" in cadence.details
+
+
 def test_final_render_requires_matching_approval(tmp_path: Path) -> None:
     image, audio = _media_files(tmp_path)
     runner = FakeMediaRunner()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -1029,6 +1030,7 @@ class ContentStudioMediaAdapter:
             _v2_subtitle_layout_check(request.timeline),
             _subtitle_text_review_check(request.timeline.subtitles),
             _claim_coverage_check(request.timeline.claims, request.timeline.subtitles),
+            _visual_change_cadence_check(request.timeline),
             frame_check,
             self._black_frame_check(artifact.path, request.timeout_seconds),
             self._silence_check(artifact.path, request.timeout_seconds),
@@ -1187,14 +1189,18 @@ def _v2_visual_command(ffmpeg: str, request: RenderRequest, clip: VisualClip, ou
     duration = f"{clip.duration_ms / 1000:.3f}"
     prefix = (ffmpeg, "-y")
     if clip.mime_type == "video/mp4":
-        input_args: tuple[str, ...] = ("-i", str(clip.path), "-t", duration)
+        input_args: tuple[str, ...] = ("-i", str(clip.path))
+        visual_filter = _v2_canvas_filter(request.timeline)
     else:
-        input_args = ("-loop", "1", "-t", duration, "-i", str(clip.path))
+        input_args = ("-loop", "1", "-i", str(clip.path))
+        visual_filter = _v2_image_motion_filter(request.timeline, clip)
     return (
         *prefix,
         *input_args,
         "-vf",
-        _v2_canvas_filter(request.timeline),
+        visual_filter,
+        "-t",
+        duration,
         "-r",
         str(FPS),
         "-an",
@@ -1214,6 +1220,20 @@ def _v2_canvas_filter(timeline: MediaTimeline) -> str:
     return (
         f"scale={timeline.width}:{timeline.height}:force_original_aspect_ratio=decrease,"
         f"pad={timeline.width}:{timeline.height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
+
+
+def _v2_image_motion_filter(timeline: MediaTimeline, clip: VisualClip) -> str:
+    frame_count = max(1, math.ceil(clip.duration_ms * FPS / 1000))
+    return (
+        f"scale={timeline.width}:{timeline.height}:force_original_aspect_ratio=increase,"
+        f"crop={timeline.width}:{timeline.height},"
+        "zoompan="
+        "z='min(zoom+0.0008,1.08)':"
+        "x='iw/2-(iw/zoom/2)':"
+        "y='ih/2-(ih/zoom/2)':"
+        f"d={frame_count}:s={timeline.width}x{timeline.height}:fps={FPS},"
+        "setsar=1"
     )
 
 
@@ -1370,6 +1390,21 @@ def _v2_demo_signal_check(audio: Sequence[AudioClip]) -> MediaQCCheck:
     if any(item.source == "demo_signal" for item in audio):
         return MediaQCCheck("demo_signal", "warning", "音频为测试 demo signal，不代表真实人声/TTS。")
     return MediaQCCheck("demo_signal", "passed", "音频由调用方提供。")
+
+
+def _visual_change_cadence_check(timeline: MediaTimeline) -> MediaQCCheck:
+    slow_stills = [
+        clip.clip_id
+        for clip in timeline.visuals
+        if clip.mime_type.startswith("image/") and clip.duration_ms > 5_000
+    ]
+    if slow_stills:
+        return MediaQCCheck(
+            "visual_change_cadence",
+            "warning",
+            "静态图片视觉节奏超过 5 秒，可能呈现 PPT 感: " + ", ".join(slow_stills),
+        )
+    return MediaQCCheck("visual_change_cadence", "passed", "静态图片视觉节奏符合 3-5 秒变化要求。")
 
 
 __all__ = [
