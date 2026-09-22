@@ -76,6 +76,9 @@ _MULTIMEDIA_VIDEO_JOB_TIMEOUT_SECONDS = 1_200
 _MULTIMEDIA_AUDIO_JOB_TIMEOUT_SECONDS = 420
 _MULTIMEDIA_IMAGE_PROVIDER_RETRY_ATTEMPTS = 2
 _MULTIMEDIA_IMAGE_PROVIDER_RETRY_BACKOFF_SECONDS = 15
+_MULTIMEDIA_IMAGE_PROVIDER_PROMPT_BYTES = 2_400
+_MULTIMEDIA_VIDEO_PROVIDER_PROMPT_BYTES = 6_000
+_MULTIMEDIA_AUDIO_PROVIDER_PROMPT_BYTES = 3_000
 _VIDEO_CLIP_EXTENSIONS = {
     MP4_MIME_TYPE: (".mp4",),
     PNG_MIME_TYPE: (".png",),
@@ -634,6 +637,10 @@ class RuntimeCapabilityGateway:
             kind=kind,
             generated_count=len(prompts),
         )
+        prompts = tuple(
+            _bounded_multimedia_provider_prompt(kind, item_prompt)
+            for item_prompt in prompts
+        )
         semaphore = asyncio.Semaphore(_multimedia_parallelism(kind, len(prompts)))
         execution_tasks = tuple(
             asyncio.create_task(
@@ -788,7 +795,12 @@ class RuntimeCapabilityGateway:
             for attempt_index in range(_MAX_VISUAL_ASSET_GENERATION_ATTEMPTS):
                 provider_attempt = 1
                 while True:
-                    job = executor.submit(kind=kind, logical_model=logical_model, prompt=attempt_prompt)
+                    provider_prompt = _bounded_multimedia_provider_prompt(kind, attempt_prompt)
+                    job = executor.submit(
+                        kind=kind,
+                        logical_model=logical_model,
+                        prompt=provider_prompt,
+                    )
                     try:
                         completed = await self._run_multimedia_job_with_hard_timeout(
                             executor,
@@ -838,7 +850,7 @@ class RuntimeCapabilityGateway:
                             run_id=run_id,
                             kind=kind,
                             label=prompt_label,
-                            prompt=attempt_prompt,
+                            prompt=provider_prompt,
                             artifact=artifact,
                             file_metadata=file_metadata,
                         )
@@ -858,7 +870,7 @@ class RuntimeCapabilityGateway:
                             artifact_index=index,
                             artifact_count=len(completed.artifacts),
                         ),
-                        generation_prompt=attempt_prompt,
+                        generation_prompt=provider_prompt,
                         visual_review=visual_review,
                     )
                     if visual_review is not None and not visual_review.passed:
@@ -1325,6 +1337,57 @@ def _multimedia_generation_prompts(
         f"{fallback_prompt}\n\n输出第 {index}/{count} 个独立产物。"
         for index in range(1, count + 1)
     )
+
+
+def _bounded_multimedia_provider_prompt(
+    kind: MultimediaGenerationKind,
+    prompt: str,
+) -> str:
+    max_bytes = {
+        MultimediaGenerationKind.IMAGE: _MULTIMEDIA_IMAGE_PROVIDER_PROMPT_BYTES,
+        MultimediaGenerationKind.VIDEO: _MULTIMEDIA_VIDEO_PROVIDER_PROMPT_BYTES,
+        MultimediaGenerationKind.AUDIO: _MULTIMEDIA_AUDIO_PROVIDER_PROMPT_BYTES,
+    }[kind]
+    prompt = prompt.strip()
+    if len(prompt.encode("utf-8")) <= max_bytes:
+        return prompt
+    marker = "\n\n[过长上下文已压缩，保留核心生成要求和关键约束]\n\n"
+    marker_bytes = len(marker.encode("utf-8"))
+    tail_budget = max(240, (max_bytes - marker_bytes) // 3)
+    head_budget = max(240, max_bytes - marker_bytes - tail_budget)
+    return (
+        _truncate_utf8_head(prompt, max_bytes=head_budget)
+        + marker
+        + _truncate_utf8_tail(prompt, max_bytes=tail_budget)
+    ).strip()
+
+
+def _truncate_utf8_head(value: str, *, max_bytes: int) -> str:
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    total = 0
+    chars: list[str] = []
+    for character in value:
+        size = len(character.encode("utf-8"))
+        if total + size > max_bytes:
+            break
+        chars.append(character)
+        total += size
+    return "".join(chars).rstrip()
+
+
+def _truncate_utf8_tail(value: str, *, max_bytes: int) -> str:
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    total = 0
+    chars: list[str] = []
+    for character in reversed(value):
+        size = len(character.encode("utf-8"))
+        if total + size > max_bytes:
+            break
+        chars.append(character)
+        total += size
+    return "".join(reversed(chars)).lstrip()
 
 
 def _multimedia_artifact_labels(

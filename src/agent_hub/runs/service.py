@@ -1198,8 +1198,12 @@ class RunService:
                     tenant_id=tenant_id,
                     run_id=run_id,
                 )
+                checkpoint_artifacts = _checkpoint_registry_artifacts(
+                    checkpoint,
+                    current_run_artifacts=current_run_artifacts,
+                )
                 artifacts = _dedupe_artifacts(
-                    current_run_artifacts,
+                    checkpoint_artifacts,
                     conversation_artifacts,
                     _checkpoint_lineage_input_artifacts(
                         checkpoint,
@@ -2763,6 +2767,22 @@ def _checkpoint_lineage_input_artifacts(
             )
         )
     return tuple(artifacts)
+
+
+def _checkpoint_registry_artifacts(
+    checkpoint: RuntimeCheckpoint,
+    *,
+    current_run_artifacts: tuple[Artifact, ...],
+) -> tuple[Artifact, ...]:
+    registry = checkpoint.state.get("artifact_registry")
+    if not isinstance(registry, Mapping):
+        return ()
+    required_ids = {str(artifact_id) for artifact_id in registry if isinstance(artifact_id, str)}
+    if not required_ids:
+        return ()
+    return tuple(
+        artifact for artifact in current_run_artifacts if str(artifact.id) in required_ids
+    )
 
 
 def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:

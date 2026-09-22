@@ -1689,6 +1689,24 @@ def test_visual_asset_retry_prompt_adds_character_identity_guardrails() -> None:
     assert "优先使用无文字图标、色块、箭头和结构化留白" in prompt
 
 
+def test_multimedia_provider_prompt_is_bounded_for_image_models() -> None:
+    prompt = (
+        "角色锁定资产：林渊。必须白底、无背景、同一张脸。"
+        + "连续性与质检约束：" * 600
+        + "尾部关键要求：不得出现街景、剧照、乱码。"
+    )
+
+    bounded = runtime_module._bounded_multimedia_provider_prompt(
+        MultimediaGenerationKind.IMAGE,
+        prompt,
+    )
+
+    assert len(bounded.encode("utf-8")) <= runtime_module._MULTIMEDIA_IMAGE_PROVIDER_PROMPT_BYTES
+    assert "过长上下文已压缩" in bounded
+    assert bounded.startswith("角色锁定资产：林渊")
+    assert "不得出现街景、剧照、乱码" in bounded
+
+
 async def test_runtime_gateway_multimedia_labels_must_match_artifact_prompts(
     tmp_path: Path,
 ) -> None:

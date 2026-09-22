@@ -123,6 +123,7 @@ class ArtifactReviewResumeRuntime:
         )
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        context = TaskContext.from_payload(context.to_payload())
         self.calls += 1
         self.context_artifact_ids.append(tuple(str(artifact.id) for artifact in context.artifacts))
         if context.checkpoint is not None:
@@ -576,6 +577,79 @@ async def test_artifact_review_rejection_hydrates_persisted_run_artifacts(
     assert runtime.calls == 2
     assert str(runtime.review_artifact.id) in runtime.context_artifact_ids[1]
     assert any(event["kind"] == "step.retrying" for event in events)
+    assert not any(event["kind"] == "runtime.failed" for event in events)
+
+
+async def test_artifact_review_rejection_limits_context_to_checkpoint_registry(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    runtime = ArtifactReviewResumeRuntime()
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=RecordingQueue([]),
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="只生成 Character Model Sheet 形式的角色参考设定表图片，不要生成视频",
+        mode=TaskMode.DISPATCH,
+        idempotency_key="artifact-review-reject-prunes-history-artifacts",
+    )
+    waiting = await service.execute(submitted.id)
+    waiting_record = await repository.get(tenant_id, submitted.id)
+    assert waiting_record.routing_decision is not None
+
+    async with run_session_factory() as session, session.begin():
+        for index in range(12):
+            artifact = Artifact(
+                id=uuid4(),
+                type="tool_result",
+                producer="asset_generator",
+                content={
+                    "result": {
+                        "artifacts": tuple(
+                            {
+                                "index": item,
+                                "label": f"历史资产 {index}-{item}",
+                                "storage_key": f"tenant/run/history/{index}/{item}.png",
+                            }
+                            for item in range(120)
+                        )
+                    }
+                },
+            )
+            session.add(
+                RunArtifactRow(
+                    id=artifact.id,
+                    tenant_id=tenant_id,
+                    run_id=submitted.id,
+                    type=artifact.type,
+                    producer=artifact.producer,
+                    content_sha256=artifact.content_sha256,
+                    payload=artifact.to_payload(),
+                )
+            )
+
+    rejected = await service.reject_artifact_review(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=submitted.id,
+        approval_id=cast(str, waiting_record.routing_decision["approval_id"]),
+        version=waiting.version,
+        feedback="只返修不合格的人物资产，历史产物不要重新注入上下文。",
+    )
+    rerun = await service.execute(rejected.id)
+    events = await service.events(tenant_id, submitted.id)
+
+    assert rerun.status is RunStatus.WAITING_APPROVAL
+    assert runtime.calls == 2
+    assert str(runtime.review_artifact.id) in runtime.context_artifact_ids[1]
+    assert len(runtime.context_artifact_ids[1]) == 1
     assert not any(event["kind"] == "runtime.failed" for event in events)
 
 
