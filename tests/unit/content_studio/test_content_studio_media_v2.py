@@ -154,6 +154,37 @@ def test_qc_fails_when_long_video_is_only_static_image_stack(tmp_path: Path) -> 
     assert preview.qc.technical_passed is False
 
 
+def test_motion_required_request_materializes_image_visuals_before_qc(tmp_path: Path) -> None:
+    image, audio = _media_files(tmp_path)
+    runner = FakeMediaRunner(duration="12.000000")
+    adapter = ContentStudioMediaAdapter(runner=runner, ffmpeg_binary="ffmpeg", ffprobe_binary="ffprobe")
+
+    preview = adapter.render_preview(
+        _request(
+            image=image,
+            audio=audio,
+            duration_ms=12_000,
+            visuals=tuple(
+                VisualClip(f"VIS{index:03d}", image, "image/png", (index - 1) * 3000, 3000)
+                for index in range(1, 5)
+            ),
+            motion_required=True,
+        ),
+        tmp_path / "out",
+    )
+
+    motion_commands = [
+        command
+        for command in runner.commands
+        if Path(command[-1]).parent.name == "motion-visuals"
+    ]
+    assert len(motion_commands) == 4
+    assert all("zoompan=" in command[command.index("-vf") + 1] for command in motion_commands)
+    assert preview.qc.check("motion_design").status == "passed"
+    assert preview.qc.check("visual_change_cadence").status == "passed"
+    assert preview.qc.technical_passed is True
+
+
 def test_final_render_requires_matching_approval(tmp_path: Path) -> None:
     image, audio = _media_files(tmp_path)
     runner = FakeMediaRunner()
@@ -403,6 +434,7 @@ def _request(
     visuals: tuple[VisualClip, ...] | None = None,
     audio_tracks: tuple[AudioClip, ...] | None = None,
     subtitles: tuple[SubtitleCue, ...] | None = None,
+    motion_required: bool = False,
 ) -> RenderRequest:
     return RenderRequest(
         title="Content Studio Demo",
@@ -431,6 +463,7 @@ def _request(
             ),
             claims=(ClaimReference("CLAIM001", "被字幕覆盖的事实点"),),
         ),
+        motion_required=motion_required,
     )
 
 

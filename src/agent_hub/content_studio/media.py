@@ -15,7 +15,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4 as _uuid4
@@ -771,6 +771,7 @@ class RenderRequest:
     output_basename: str
     timeline: MediaTimeline
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    motion_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -855,8 +856,8 @@ class ContentStudioMediaAdapter:
         self._preview_sha256s: set[str] = set()
 
     def render_preview(self, request: RenderRequest, output_dir: Path) -> PreviewRenderResult:
-        artifact = self._render_stage(request, output_dir, stage="preview", crf="28")
-        qc = self._qc(request, artifact)
+        artifact, rendered_request = self._render_stage(request, output_dir, stage="preview", crf="28")
+        qc = self._qc(rendered_request, artifact)
         self._preview_sha256s.add(artifact.sha256)
         return PreviewRenderResult(preview=artifact, qc=qc)
 
@@ -874,8 +875,8 @@ class ContentStudioMediaAdapter:
             or approval.preview_sha256 not in self._preview_sha256s
         ):
             raise ContentStudioMediaError("final render requires an approved preview")
-        artifact = self._render_stage(request, output_dir, stage="final", crf="20")
-        return FinalRenderResult(final=artifact, qc=self._qc(request, artifact))
+        artifact, rendered_request = self._render_stage(request, output_dir, stage="final", crf="20")
+        return FinalRenderResult(final=artifact, qc=self._qc(rendered_request, artifact))
 
     def _render_stage(
         self,
@@ -884,7 +885,7 @@ class ContentStudioMediaAdapter:
         *,
         stage: str,
         crf: str,
-    ) -> MediaArtifact:
+    ) -> tuple[MediaArtifact, RenderRequest]:
         _v2_validate_request(request)
         ffmpeg = self._resolve_binary(self._ffmpeg_binary, "ffmpeg")
         ffprobe = self._resolve_binary(self._ffprobe_binary, "ffprobe")
@@ -892,11 +893,44 @@ class ContentStudioMediaAdapter:
         render_id = _uuid4().hex[:12]
         work_dir = output_dir / f"content-studio-work-{render_id}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        subtitles = _v2_write_ass_subtitles(request.timeline, work_dir / "subtitles.ass")
-        visual = self._render_visual_track(ffmpeg, request, work_dir)
-        output = output_dir / f"{safe_generated_filename(request.output_basename)}-{render_id}-{stage}.mp4"
-        self._mux(ffmpeg, request, visual, subtitles, output, crf=crf)
-        return self._artifact_for(ffprobe, output, request.timeout_seconds)
+        rendered_request = self._materialize_motion_request(ffmpeg, request, work_dir)
+        subtitles = _v2_write_ass_subtitles(rendered_request.timeline, work_dir / "subtitles.ass")
+        visual = self._render_visual_track(ffmpeg, rendered_request, work_dir)
+        output = output_dir / f"{safe_generated_filename(rendered_request.output_basename)}-{render_id}-{stage}.mp4"
+        self._mux(ffmpeg, rendered_request, visual, subtitles, output, crf=crf)
+        return self._artifact_for(ffprobe, output, rendered_request.timeout_seconds), rendered_request
+
+    def _materialize_motion_request(self, ffmpeg: str, request: RenderRequest, work_dir: Path) -> RenderRequest:
+        if not request.motion_required:
+            return request
+        if not any(clip.mime_type.startswith("image/") for clip in request.timeline.visuals):
+            return request
+
+        motion_dir = work_dir / "motion-visuals"
+        motion_dir.mkdir(parents=True, exist_ok=True)
+        rendered_visuals: list[VisualClip] = []
+        for index, clip in enumerate(request.timeline.visuals):
+            if not clip.mime_type.startswith("image/"):
+                rendered_visuals.append(clip)
+                continue
+            output = motion_dir / f"{index:03d}-{safe_generated_filename(clip.clip_id)}.mp4"
+            self._runner.run(
+                _v2_visual_command(ffmpeg, request, clip, output),
+                timeout_seconds=request.timeout_seconds,
+            )
+            rendered_visuals.append(
+                VisualClip(
+                    clip_id=clip.clip_id,
+                    path=output,
+                    mime_type=MP4_MIME_TYPE,
+                    start_ms=clip.start_ms,
+                    duration_ms=clip.duration_ms,
+                )
+            )
+        return replace(
+            request,
+            timeline=replace(request.timeline, visuals=tuple(rendered_visuals)),
+        )
 
     def _render_visual_track(self, ffmpeg: str, request: RenderRequest, work_dir: Path) -> Path:
         if not self._uses_external_runner:

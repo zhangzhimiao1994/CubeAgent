@@ -1880,6 +1880,7 @@ def _render_request_from_project(project: ContentProject) -> RenderRequest:
             subtitles=tuple(subtitles),
             claims=claims,
         ),
+        motion_required=project.packs.style.name == "code_flow_pipeline",
     )
 
 
